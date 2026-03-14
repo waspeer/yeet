@@ -6,8 +6,12 @@
   "bin": {
     "yeet": "./dist/index.js"
   },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc",
+    "prepare": "tsc",
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit"
   },
