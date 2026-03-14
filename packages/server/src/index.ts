@@ -4,7 +4,7 @@ import { Hono } from 'hono';
 import argon2 from 'argon2';
 import cron from 'node-cron';
 import { storage } from './storage-instance.js';
-import { downloadPage, notFoundPage } from './template.js';
+import { downloadPage, notFoundPage, landingPage } from './template.js';
 
 const app = new Hono();
 
@@ -28,6 +28,9 @@ async function deleteExpiredAndRespond404(id: string): Promise<Response> {
 // ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
+
+// GET / — landing page
+app.get('/', (c) => c.html(landingPage()));
 
 // GET /:id and GET /:id/:filename — serve download page
 app.get('/:id/:filename?', async (c) => {

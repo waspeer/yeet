@@ -91,6 +91,12 @@ export function downloadPage(opts: {
   return layout(`yeet \u2014 ${escHtml(filename)}`, body);
 }
 
+export function landingPage(): string {
+  const body = `
+    <div class="icon">&#129418;</div>`;
+  return layout('yeet', body);
+}
+
 export function notFoundPage(): string {
   const body = `
     <div class="icon">&#9888;</div>
