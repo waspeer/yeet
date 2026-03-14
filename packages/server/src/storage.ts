@@ -2,6 +2,7 @@ import { Buffer } from 'node:buffer';
 
 export interface UploadMeta {
   filename: string;
+  file_size?: number;
   uploaded_at: string;
   expires_at: string;
   password_hash?: string;

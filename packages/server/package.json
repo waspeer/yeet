@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@hono/node-server": "^1.19.11",
     "argon2": "^0.41.1",
     "hono": "^4.0.0",
     "node-cron": "^3.0.0"
