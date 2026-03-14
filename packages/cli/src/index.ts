@@ -29,8 +29,15 @@ interface UploadArgs {
 function parseArgs(argv: string[]): UploadArgs {
   const args = argv.slice(2);
 
+  const usage = `Usage: yeet upload <filepath> [--expires <duration>] [--password <string>]`;
+
+  if (args[0] === '--help' || args[0] === '-h' || args.length === 0) {
+    process.stdout.write(usage + '\n');
+    process.exit(0);
+  }
+
   if (args[0] !== 'upload') {
-    die(`Usage: yeet upload <filepath> [--expires <duration>] [--password <string>]`);
+    die(usage);
   }
 
   let filepath: string | undefined;
