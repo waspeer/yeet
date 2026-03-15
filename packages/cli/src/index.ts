@@ -12,7 +12,7 @@ import argon2 from 'argon2';
 // ---------------------------------------------------------------------------
 
 const RCLONE_REMOTE = process.env.YEET_RCLONE_REMOTE ?? 'storagebox';
-const UPLOADS_PATH = process.env.YEET_UPLOADS_PATH ?? '/uploads';
+const UPLOADS_PATH = process.env.YEET_UPLOADS_PATH ?? 'uploads';
 const DOMAIN = process.env.YEET_DOMAIN ?? 'https://dl.example.com';
 const DEFAULT_EXPIRES_DAYS = Number(process.env.YEET_DEFAULT_EXPIRES_DAYS ?? '30');
 
@@ -21,23 +21,40 @@ const DEFAULT_EXPIRES_DAYS = Number(process.env.YEET_DEFAULT_EXPIRES_DAYS ?? '30
 // ---------------------------------------------------------------------------
 
 interface UploadArgs {
+  command: 'upload';
   filepath: string;
   expires: number; // days
   password: string | undefined;
 }
 
-function parseArgs(argv: string[]): UploadArgs {
+interface ListArgs {
+  command: 'list';
+}
+
+type Args = UploadArgs | ListArgs;
+
+const USAGE = `Usage: yeet <command>
+
+Commands:
+  upload <filepath> [--expires <duration>] [--password <string>]
+  list              Show all uploaded files`;
+
+function parseArgs(argv: string[]): Args {
   const args = argv.slice(2);
 
-  const usage = `Usage: yeet upload <filepath> [--expires <duration>] [--password <string>]`;
-
   if (args[0] === '--help' || args[0] === '-h' || args.length === 0) {
-    process.stdout.write(usage + '\n');
+    process.stdout.write(USAGE + '\n');
     process.exit(0);
   }
 
-  if (args[0] !== 'upload') {
-    die(usage);
+  const command = args[0];
+
+  if (command === 'list') {
+    return { command: 'list' };
+  }
+
+  if (command !== 'upload') {
+    die(USAGE);
   }
 
   let filepath: string | undefined;
@@ -62,7 +79,7 @@ function parseArgs(argv: string[]): UploadArgs {
   }
 
   if (!filepath) die('Usage: yeet upload <filepath> [--expires <duration>] [--password <string>]');
-  return { filepath, expires, password };
+  return { command: 'upload', filepath, expires, password };
 }
 
 function parseDuration(s: string): number {
@@ -98,12 +115,115 @@ function checkRclone(): void {
 }
 
 // ---------------------------------------------------------------------------
-// Main
+// ANSI formatting
 // ---------------------------------------------------------------------------
 
-async function main() {
-  const args = parseArgs(process.argv);
+const isTTY = process.stdout.isTTY;
 
+function bold(s: string): string { return isTTY ? `\x1b[1m${s}\x1b[22m` : s; }
+function dim(s: string): string { return isTTY ? `\x1b[2m${s}\x1b[22m` : s; }
+function cyan(s: string): string { return isTTY ? `\x1b[36m${s}\x1b[39m` : s; }
+function yellow(s: string): string { return isTTY ? `\x1b[33m${s}\x1b[39m` : s; }
+
+// ---------------------------------------------------------------------------
+// Formatting helpers
+// ---------------------------------------------------------------------------
+
+function formatSize(bytes: number): string {
+  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
+  if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`;
+  if (bytes >= 1e3) return `${(bytes / 1e3).toFixed(1)} KB`;
+  return `${bytes} B`;
+}
+
+function formatDate(iso: string): string {
+  return iso.slice(0, 10);
+}
+
+// ---------------------------------------------------------------------------
+// List command
+// ---------------------------------------------------------------------------
+
+interface UploadMeta {
+  filename: string;
+  file_size: number;
+  uploaded_at: string;
+  expires_at: string;
+  password_hash?: string;
+}
+
+async function listFiles(): Promise<void> {
+  checkRclone();
+
+  const remote = `${RCLONE_REMOTE}:${UPLOADS_PATH}`;
+
+  // Get all upload directories
+  let dirsJson: string;
+  try {
+    dirsJson = execFileSync('rclone', ['lsjson', remote, '--dirs-only'], { encoding: 'utf-8' });
+  } catch {
+    die('Failed to list uploads. Check your rclone configuration and connectivity.');
+  }
+
+  const dirs = JSON.parse(dirsJson) as { Path: string; Name: string }[];
+
+  if (dirs.length === 0) {
+    process.stdout.write('No files found.\n');
+    return;
+  }
+
+  // Read metadata for each upload
+  const entries: { id: string; meta: UploadMeta }[] = [];
+
+  for (const dir of dirs) {
+    const metaPath = `${remote}/${dir.Path}/.meta.json`;
+    try {
+      const raw = execFileSync('rclone', ['cat', metaPath], { encoding: 'utf-8' });
+      const meta = JSON.parse(raw) as UploadMeta;
+      entries.push({ id: dir.Path, meta });
+    } catch {
+      process.stderr.write(`Warning: could not read metadata for ${dir.Path}, skipping\n`);
+    }
+  }
+
+  // Sort newest first
+  entries.sort((a, b) => new Date(b.meta.uploaded_at).getTime() - new Date(a.meta.uploaded_at).getTime());
+
+  const now = new Date();
+  let active = 0;
+  let expired = 0;
+
+  for (const { id, meta } of entries) {
+    const isExpired = new Date(meta.expires_at) < now;
+    if (isExpired) expired++;
+    else active++;
+
+    const wrap = isExpired ? dim : (s: string) => s;
+
+    const namePart = bold(meta.filename);
+    const sizePart = dim(formatSize(meta.file_size));
+    const lockPart = meta.password_hash ? ` ${yellow('\u{1F512}')}` : '';
+    const line1 = `  ${namePart} \u00B7 ${sizePart}${lockPart}`;
+
+    const uploadedPart = `Uploaded ${formatDate(meta.uploaded_at)}`;
+    const expiryLabel = isExpired ? 'Expired' : 'Expires';
+    const expiryPart = `${expiryLabel} ${formatDate(meta.expires_at)}`;
+    const line2 = `  ${dim(`${uploadedPart} \u00B7 ${expiryPart}`)}`;
+
+    const url = `${DOMAIN}/${id}/${encodeURIComponent(meta.filename)}`;
+    const line3 = `  ${cyan(url)}`;
+
+    process.stdout.write(wrap(`${line1}\n${line2}\n${line3}`) + '\n\n');
+  }
+
+  process.stdout.write(dim(`${entries.length} files (${active} active, ${expired} expired)`) + '\n');
+}
+
+// ---------------------------------------------------------------------------
+// Upload command
+// ---------------------------------------------------------------------------
+
+async function upload(args: UploadArgs): Promise<void> {
   // Validate file
   if (!existsSync(args.filepath)) {
     die(`File not found: ${args.filepath}`);
@@ -155,6 +275,20 @@ async function main() {
 
   const url = `${DOMAIN}/${id}/${encodeURIComponent(filename)}`;
   process.stdout.write(url + '\n');
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+async function main() {
+  const args = parseArgs(process.argv);
+
+  if (args.command === 'list') {
+    await listFiles();
+  } else {
+    await upload(args);
+  }
 }
 
 main().catch((err: unknown) => {
