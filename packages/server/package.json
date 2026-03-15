@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "tsc && node --input-type=module --eval \"import * as esbuild from 'esbuild'; await esbuild.build({ entryPoints: ['src/client.tsx'], bundle: true, outfile: 'dist/client.js', format: 'esm', jsx: 'automatic', jsxImportSource: 'solid-js/h', minify: true })\"",
+    "build": "tsc && node build.mjs",
     "dev": "tsc --watch",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit"
@@ -21,6 +21,7 @@
     "@types/node": "^22.0.0",
     "@types/node-cron": "^3.0.0",
     "esbuild": "^0.27.4",
+    "esbuild-plugin-solid": "^0.6.0",
     "typescript": "^5.7.0"
   }
 }
