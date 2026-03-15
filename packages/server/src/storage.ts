@@ -1,4 +1,4 @@
-import { Buffer } from 'node:buffer';
+import { Buffer } from "node:buffer";
 
 export interface UploadMeta {
   filename: string;
@@ -24,14 +24,14 @@ export interface StorageClientConfig {
 function parseUploadIds(xml: string, uploadsPath: string): string[] {
   const hrefPattern = /<[^>]*href[^>]*>([^<]+)<\/[^>]*href>/gi;
   const ids: string[] = [];
-  const prefix = uploadsPath.replace(/\/$/, '') + '/';
+  const prefix = uploadsPath.replace(/\/$/, "") + "/";
 
   for (const match of xml.matchAll(hrefPattern)) {
     const href = decodeURIComponent(match[1].trim());
     if (!href.startsWith(prefix)) continue;
-    const rest = href.slice(prefix.length).replace(/\/$/, '');
+    const rest = href.slice(prefix.length).replace(/\/$/, "");
     // A valid upload ID is a single non-empty path segment (no slashes)
-    if (rest && !rest.includes('/')) {
+    if (rest && !rest.includes("/")) {
       ids.push(rest);
     }
   }
@@ -46,10 +46,10 @@ export class StorageClient {
   private readonly uploadsPath: string;
 
   constructor(config: StorageClientConfig) {
-    const credentials = Buffer.from(`${config.username}:${config.password}`).toString('base64');
+    const credentials = Buffer.from(`${config.username}:${config.password}`).toString("base64");
     this.authHeader = `Basic ${credentials}`;
-    this.baseUrl = config.baseUrl.replace(/\/$/, '');
-    this.uploadsPath = config.uploadsPath.replace(/\/$/, '');
+    this.baseUrl = config.baseUrl.replace(/\/$/, "");
+    this.uploadsPath = config.uploadsPath.replace(/\/$/, "");
   }
 
   private url(path: string): string {
@@ -65,7 +65,7 @@ export class StorageClient {
     const res = await fetch(this.url(`${this.uploadsPath}/${id}/.meta.json`), {
       headers: { Authorization: this.authHeader },
     });
-    if (!res.ok) throw this.webdavError('GET', res.status);
+    if (!res.ok) throw this.webdavError("GET", res.status);
     return res.json() as Promise<UploadMeta>;
   }
 
@@ -74,26 +74,25 @@ export class StorageClient {
    * stream it directly to the HTTP client without buffering.
    */
   async streamFile(id: string, filename: string): Promise<Response> {
-    const res = await fetch(
-      this.url(`${this.uploadsPath}/${id}/${encodeURIComponent(filename)}`),
-      { headers: { Authorization: this.authHeader } },
-    );
-    if (!res.ok) throw this.webdavError('GET', res.status);
+    const res = await fetch(this.url(`${this.uploadsPath}/${id}/${encodeURIComponent(filename)}`), {
+      headers: { Authorization: this.authHeader },
+    });
+    if (!res.ok) throw this.webdavError("GET", res.status);
     return res;
   }
 
   /** List all upload IDs by doing a depth-1 PROPFIND on the uploads directory. */
   async listUploadIds(): Promise<string[]> {
     const res = await fetch(this.url(`${this.uploadsPath}/`), {
-      method: 'PROPFIND',
+      method: "PROPFIND",
       headers: {
         Authorization: this.authHeader,
-        Depth: '1',
-        'Content-Type': 'application/xml',
+        Depth: "1",
+        "Content-Type": "application/xml",
       },
       body: '<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop><D:resourcetype/></D:prop></D:propfind>',
     });
-    if (!res.ok) throw this.webdavError('PROPFIND', res.status);
+    if (!res.ok) throw this.webdavError("PROPFIND", res.status);
     const xml = await res.text();
     return parseUploadIds(xml, this.uploadsPath);
   }
@@ -101,13 +100,13 @@ export class StorageClient {
   /** Delete the entire upload directory (file + sidecar) for the given ID. */
   async deleteUpload(id: string): Promise<void> {
     const res = await fetch(this.url(`${this.uploadsPath}/${id}/`), {
-      method: 'DELETE',
+      method: "DELETE",
       headers: {
         Authorization: this.authHeader,
-        Depth: 'infinity',
+        Depth: "infinity",
       },
     });
     // 404 is acceptable — already gone
-    if (!res.ok && res.status !== 404) throw this.webdavError('DELETE', res.status);
+    if (!res.ok && res.status !== 404) throw this.webdavError("DELETE", res.status);
   }
 }

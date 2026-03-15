@@ -1,4 +1,4 @@
-/** @jsxImportSource solid-js/h */
+/** @jsxImportSource solid-js */
 import { render } from "solid-js/web";
 import { Shader, Swirl, Dither } from "shaders/solid";
 

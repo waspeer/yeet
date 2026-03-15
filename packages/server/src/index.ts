@@ -1,16 +1,16 @@
 // Entry point — server implementation lives here
-import { serve } from '@hono/node-server';
-import { Hono } from 'hono';
-import argon2 from 'argon2';
-import cron from 'node-cron';
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
-import { storage } from './storage-instance.js';
-import { downloadPage, notFoundPage, landingPage } from './template.js';
+import { serve } from "@hono/node-server";
+import { Hono } from "hono";
+import argon2 from "argon2";
+import cron from "node-cron";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import { storage } from "./storage-instance.js";
+import { downloadPage, notFoundPage, landingPage } from "./template.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const clientJs = readFileSync(join(__dirname, 'client.js'));
+const clientJs = readFileSync(join(__dirname, "client.js"));
 
 const app = new Hono();
 
@@ -27,7 +27,7 @@ async function deleteExpiredAndRespond404(id: string): Promise<Response> {
   storage.deleteUpload(id).catch(() => {});
   return new Response(notFoundPage(), {
     status: 404,
-    headers: { 'Content-Type': 'text/html; charset=utf-8' },
+    headers: { "Content-Type": "text/html; charset=utf-8" },
   });
 }
 
@@ -36,17 +36,17 @@ async function deleteExpiredAndRespond404(id: string): Promise<Response> {
 // ---------------------------------------------------------------------------
 
 // GET /client.js — client-side shader bundle
-app.get('/client.js', (c) => {
-  c.header('Content-Type', 'application/javascript');
-  c.header('Cache-Control', 'public, max-age=31536000, immutable');
+app.get("/client.js", (c) => {
+  c.header("Content-Type", "application/javascript");
+  c.header("Cache-Control", "public, max-age=31536000, immutable");
   return c.body(clientJs);
 });
 
 // GET / — landing page
-app.get('/', (c) => c.html(landingPage()));
+app.get("/", (c) => c.html(landingPage()));
 
 // GET /:id and GET /:id/:filename — serve download page
-app.get('/:id/:filename?', async (c) => {
+app.get("/:id/:filename?", async (c) => {
   const { id } = c.req.param();
 
   let meta;
@@ -57,9 +57,9 @@ app.get('/:id/:filename?', async (c) => {
   }
 
   if (isExpired(meta.expires_at)) {
-    return new Response(await deleteExpiredAndRespond404(id).then(r => r.text()), {
+    return new Response(await deleteExpiredAndRespond404(id).then((r) => r.text()), {
       status: 404,
-      headers: { 'Content-Type': 'text/html; charset=utf-8' },
+      headers: { "Content-Type": "text/html; charset=utf-8" },
     });
   }
 
@@ -74,7 +74,7 @@ app.get('/:id/:filename?', async (c) => {
 });
 
 // POST /:id/download — verify password and stream file
-app.post('/:id/download', async (c) => {
+app.post("/:id/download", async (c) => {
   const { id } = c.req.param();
 
   let meta;
@@ -85,15 +85,15 @@ app.post('/:id/download', async (c) => {
   }
 
   if (isExpired(meta.expires_at)) {
-    return new Response(await deleteExpiredAndRespond404(id).then(r => r.text()), {
+    return new Response(await deleteExpiredAndRespond404(id).then((r) => r.text()), {
       status: 404,
-      headers: { 'Content-Type': 'text/html; charset=utf-8' },
+      headers: { "Content-Type": "text/html; charset=utf-8" },
     });
   }
 
   if (meta.password_hash) {
     const body = await c.req.parseBody();
-    const password = typeof body['password'] === 'string' ? body['password'] : '';
+    const password = typeof body["password"] === "string" ? body["password"] : "";
     const valid = await argon2.verify(meta.password_hash, password);
     if (!valid) {
       return c.html(
@@ -114,10 +114,10 @@ app.post('/:id/download', async (c) => {
   return new Response(upstream.body, {
     status: upstream.status,
     headers: {
-      'Content-Type': upstream.headers.get('Content-Type') ?? 'application/octet-stream',
-      'Content-Disposition': `attachment; filename="${encodeURIComponent(meta.filename)}"`,
-      ...(upstream.headers.get('Content-Length')
-        ? { 'Content-Length': upstream.headers.get('Content-Length')! }
+      "Content-Type": upstream.headers.get("Content-Type") ?? "application/octet-stream",
+      "Content-Disposition": `attachment; filename="${encodeURIComponent(meta.filename)}"`,
+      ...(upstream.headers.get("Content-Length")
+        ? { "Content-Length": upstream.headers.get("Content-Length")! }
         : {}),
     },
   });
@@ -132,7 +132,7 @@ async function runCleanup(): Promise<void> {
   try {
     ids = await storage.listUploadIds();
   } catch (err) {
-    console.error('[cleanup] Failed to list upload IDs:', err);
+    console.error("[cleanup] Failed to list upload IDs:", err);
     return;
   }
 
@@ -154,8 +154,8 @@ async function runCleanup(): Promise<void> {
   if (deleted > 0) console.log(`[cleanup] Deleted ${deleted} expired upload(s)`);
 }
 
-cron.schedule('0 3 * * *', () => {
-  runCleanup().catch((err) => console.error('[cleanup] Error:', err));
+cron.schedule("0 3 * * *", () => {
+  runCleanup().catch((err) => console.error("[cleanup] Error:", err));
 });
 
 // ---------------------------------------------------------------------------

@@ -8,4 +8,15 @@ node_modules/
 
 # Build output
 dist/
+*.tgz
+
+# Editor / tooling
+.claude/
+.vscode/
+
+# Workflow
+openspec/
+skills-lock.json
+
+# Secrets
 packages/server/.env

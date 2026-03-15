@@ -1,4 +1,4 @@
-import { StorageClient } from './storage.js';
+import { StorageClient } from "./storage.js";
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -7,8 +7,8 @@ function requireEnv(name: string): string {
 }
 
 export const storage = new StorageClient({
-  baseUrl: requireEnv('WEBDAV_BASE_URL'),
-  username: requireEnv('WEBDAV_USERNAME'),
-  password: requireEnv('WEBDAV_PASSWORD'),
-  uploadsPath: requireEnv('WEBDAV_UPLOADS_PATH'),
+  baseUrl: requireEnv("WEBDAV_BASE_URL"),
+  username: requireEnv("WEBDAV_USERNAME"),
+  password: requireEnv("WEBDAV_PASSWORD"),
+  uploadsPath: requireEnv("WEBDAV_UPLOADS_PATH"),
 });
