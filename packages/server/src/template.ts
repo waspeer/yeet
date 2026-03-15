@@ -1,7 +1,8 @@
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes < 1024 * 1024 * 1024)
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
@@ -10,15 +11,15 @@ function formatExpiry(expiresAt: string): string {
   const now = new Date();
   const diffMs = date.getTime() - now.getTime();
   const diffDays = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
-  if (diffDays <= 0) return 'expired';
-  if (diffDays === 1) return 'in 1 day';
+  if (diffDays <= 0) return "expired";
+  if (diffDays === 1) return "in 1 day";
   if (diffDays < 7) return `in ${diffDays} days`;
-  return `on ${date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}`;
+  return `on ${date.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}`;
 }
 
 const CSS = `
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:#888;font-family:Geneva,"Lucida Grande",sans-serif;font-size:12px;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:16px}
+body{background:#222;font-family:Geneva,"Lucida Grande",sans-serif;font-size:12px;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:16px}
 #shader-bg{position:fixed;inset:0;z-index:0}
 .win{background:#fff;border:2px solid #000;box-shadow:3px 3px 0 #000;width:380px;max-width:100%;position:relative;z-index:1}
 .title-bar{background:repeating-linear-gradient(#fff 0px,#fff 1px,#000 1px,#000 2px);border-bottom:2px solid #000;display:flex;align-items:center;padding:3px 6px;gap:6px;height:22px}
@@ -73,7 +74,7 @@ export function downloadPage(opts: {
 
   const actionBlock = hasPassword
     ? `<form method="POST" action="download">
-        ${passwordError ? '<div class="error">Incorrect password. Please try again.</div>' : ''}
+        ${passwordError ? '<div class="error">Incorrect password. Please try again.</div>' : ""}
         <label for="pw">Password required</label>
         <input type="password" id="pw" name="password" autofocus placeholder="Enter password">
         <div class="center"><button type="submit" class="primary">Download</button></div>
@@ -97,7 +98,7 @@ export function downloadPage(opts: {
 export function landingPage(): string {
   const body = `
     <div class="icon">&#129418;</div>`;
-  return layout('yeet', body);
+  return layout("yeet", body);
 }
 
 export function notFoundPage(): string {
@@ -105,17 +106,21 @@ export function notFoundPage(): string {
     <div class="icon">&#9888;</div>
     <div class="filename">File not found</div>
     <div class="meta">This file has expired or does not exist.</div>`;
-  return layout('yeet \u2014 Not Found', body);
+  return layout("yeet \u2014 Not Found", body);
 }
 
-export function errorPage(message = 'Something went wrong.'): string {
+export function errorPage(message = "Something went wrong."): string {
   const body = `
     <div class="icon">&#9888;</div>
     <div class="filename">Error</div>
     <div class="meta">${escHtml(message)}</div>`;
-  return layout('yeet \u2014 Error', body);
+  return layout("yeet \u2014 Error", body);
 }
 
 function escHtml(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
