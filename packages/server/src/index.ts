@@ -3,8 +3,14 @@ import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import argon2 from 'argon2';
 import cron from 'node-cron';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { storage } from './storage-instance.js';
 import { downloadPage, notFoundPage, landingPage } from './template.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const clientJs = readFileSync(join(__dirname, 'client.js'));
 
 const app = new Hono();
 
@@ -28,6 +34,13 @@ async function deleteExpiredAndRespond404(id: string): Promise<Response> {
 // ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
+
+// GET /client.js — client-side shader bundle
+app.get('/client.js', (c) => {
+  c.header('Content-Type', 'application/javascript');
+  c.header('Cache-Control', 'public, max-age=31536000, immutable');
+  return c.body(clientJs);
+});
 
 // GET / — landing page
 app.get('/', (c) => c.html(landingPage()));

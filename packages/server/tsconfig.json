@@ -3,6 +3,8 @@
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
+    "jsx": "preserve",
+    "jsxImportSource": "solid-js",
     "outDir": "./dist",
     "rootDir": "./src",
     "strict": true,
@@ -12,5 +14,5 @@
     "sourceMap": true
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist"]
+  "exclude": ["node_modules", "dist", "src/client.tsx"]
 }

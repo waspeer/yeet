@@ -19,7 +19,8 @@ function formatExpiry(expiresAt: string): string {
 const CSS = `
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#888;font-family:Geneva,"Lucida Grande",sans-serif;font-size:12px;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:16px}
-.win{background:#fff;border:2px solid #000;box-shadow:3px 3px 0 #000;width:380px;max-width:100%}
+#shader-bg{position:fixed;inset:0;z-index:0}
+.win{background:#fff;border:2px solid #000;box-shadow:3px 3px 0 #000;width:380px;max-width:100%;position:relative;z-index:1}
 .title-bar{background:repeating-linear-gradient(#fff 0px,#fff 1px,#000 1px,#000 2px);border-bottom:2px solid #000;display:flex;align-items:center;padding:3px 6px;gap:6px;height:22px}
 .title-bar span{flex:1;text-align:center;font-weight:bold;font-size:12px;background:#fff;padding:0 8px;line-height:16px}
 .close-box{width:14px;height:14px;border:1px solid #000;background:#fff;flex-shrink:0}
@@ -47,6 +48,7 @@ function layout(title: string, body: string): string {
 <style>${CSS}</style>
 </head>
 <body>
+<div id="shader-bg"></div>
 <div class="win">
   <div class="title-bar">
     <div class="close-box"></div>
@@ -54,6 +56,7 @@ function layout(title: string, body: string): string {
   </div>
   <div class="body">${body}</div>
 </div>
+<script src="/client.js" type="module"></script>
 </body>
 </html>`;
 }
