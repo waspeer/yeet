@@ -42,6 +42,9 @@ app.get("/client.js", (c) => {
   return c.body(clientJs);
 });
 
+// GET /health — health check for Coolify
+app.get("/health", (c) => c.json({ status: "ok" }));
+
 // GET / — landing page
 app.get("/", (c) => c.html(landingPage()));
 
