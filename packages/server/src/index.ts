@@ -112,6 +112,11 @@ app.post("/:id/download", async (c) => {
     }
   }
 
+  // Record the download (fire-and-forget — never block the actual file transfer)
+  storage.recordDownload(id, meta).catch((err) => {
+    console.error(`[download] Failed to record download for ${id}:`, err);
+  });
+
   const upstream = await storage.streamFile(id, meta.filename);
 
   return new Response(upstream.body, {

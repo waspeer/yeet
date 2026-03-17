@@ -29,6 +29,7 @@ interface UploadArgs {
 
 interface ListArgs {
   command: "list";
+  showDownloads: boolean;
 }
 
 type Args = UploadArgs | ListArgs;
@@ -37,7 +38,7 @@ const USAGE = `Usage: yeet <command>
 
 Commands:
   upload <filepath> [--expires <duration>] [--password <string>]
-  list              Show all uploaded files`;
+  list [--downloads] Show all uploaded files (optionally with download history)`;
 
 function parseArgs(argv: string[]): Args {
   const args = argv.slice(2);
@@ -50,7 +51,8 @@ function parseArgs(argv: string[]): Args {
   const command = args[0];
 
   if (command === "list") {
-    return { command: "list" };
+    const showDownloads = args.includes("--downloads") || args.includes("-d");
+    return { command: "list", showDownloads };
   }
 
   if (command !== "upload") {
@@ -152,15 +154,20 @@ function formatDate(iso: string): string {
 // List command
 // ---------------------------------------------------------------------------
 
+interface DownloadRecord {
+  at: string;
+}
+
 interface UploadMeta {
   filename: string;
   file_size: number;
   uploaded_at: string;
   expires_at: string;
   password_hash?: string;
+  downloads?: DownloadRecord[];
 }
 
-async function listFiles(): Promise<void> {
+async function listFiles(showDownloads: boolean): Promise<void> {
   checkRclone();
 
   const remote = `${RCLONE_REMOTE}:${UPLOADS_PATH}`;
@@ -215,15 +222,29 @@ async function listFiles(): Promise<void> {
     const lockPart = meta.password_hash ? ` ${yellow("\u{1F512}")}` : "";
     const line1 = `  ${namePart} \u00B7 ${sizePart}${lockPart}`;
 
+    const dlCount = (meta.downloads ?? []).length;
+    const dlPart = dlCount > 0 ? ` \u00B7 ${dlCount} download${dlCount !== 1 ? "s" : ""}` : "";
+
     const uploadedPart = `Uploaded ${formatDate(meta.uploaded_at)}`;
     const expiryLabel = isExpired ? "Expired" : "Expires";
     const expiryPart = `${expiryLabel} ${formatDate(meta.expires_at)}`;
-    const line2 = `  ${dim(`${uploadedPart} \u00B7 ${expiryPart}`)}`;
+    const line2 = `  ${dim(`${uploadedPart} \u00B7 ${expiryPart}${dlPart}`)}`;
 
     const url = `${DOMAIN}/${id}/${encodeURIComponent(meta.filename)}`;
     const line3 = `  ${cyan(url)}`;
 
-    process.stdout.write(wrap(`${line1}\n${line2}\n${line3}`) + "\n\n");
+    let dlLines = "";
+    if (showDownloads && meta.downloads?.length) {
+      const recent = meta.downloads.slice(-5);
+      for (const dl of recent) {
+        dlLines += wrap(dim(`    \u2193 ${new Date(dl.at).toLocaleString()}`)) + "\n";
+      }
+      if (meta.downloads.length > 5) {
+        dlLines += wrap(dim(`    ... and ${meta.downloads.length - 5} more`)) + "\n";
+      }
+    }
+
+    process.stdout.write(wrap(`${line1}\n${line2}\n${line3}`) + "\n" + dlLines + "\n");
   }
 
   process.stdout.write(
@@ -293,7 +314,7 @@ async function main() {
   const args = parseArgs(process.argv);
 
   if (args.command === "list") {
-    await listFiles();
+    await listFiles(args.showDownloads);
   } else {
     await upload(args);
   }

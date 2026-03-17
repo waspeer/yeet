@@ -1,11 +1,16 @@
 import { Buffer } from "node:buffer";
 
+export interface DownloadRecord {
+  at: string; // ISO 8601
+}
+
 export interface UploadMeta {
   filename: string;
   file_size?: number;
   uploaded_at: string;
   expires_at: string;
   password_hash?: string;
+  downloads?: DownloadRecord[];
 }
 
 export interface StorageClientConfig {
@@ -95,6 +100,30 @@ export class StorageClient {
     if (!res.ok) throw this.webdavError("PROPFIND", res.status);
     const xml = await res.text();
     return parseUploadIds(xml, this.uploadsPath);
+  }
+
+  /** Write the .meta.json sidecar for the given upload ID. */
+  async writeMeta(id: string, meta: UploadMeta): Promise<void> {
+    const res = await fetch(this.url(`${this.uploadsPath}/${id}/.meta.json`), {
+      method: "PUT",
+      headers: {
+        Authorization: this.authHeader,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(meta, null, 2),
+    });
+    if (!res.ok) throw this.webdavError("PUT", res.status);
+  }
+
+  /** Append a download record to the metadata and persist it. Keeps last 50 entries. */
+  async recordDownload(id: string, meta: UploadMeta): Promise<void> {
+    const downloads = meta.downloads ?? [];
+    downloads.push({ at: new Date().toISOString() });
+    if (downloads.length > 50) {
+      downloads.splice(0, downloads.length - 50);
+    }
+    meta.downloads = downloads;
+    await this.writeMeta(id, meta);
   }
 
   /** Delete the entire upload directory (file + sidecar) for the given ID. */
