@@ -8,7 +8,8 @@
     "fmt": "oxfmt",
     "fmt:check": "oxfmt --check",
     "lint": "oxlint",
-    "lint:fix": "oxlint --fix"
+    "lint:fix": "oxlint --fix",
+    "cli:install": "./scripts/reinstall-cli.sh"
   },
   "devDependencies": {
     "oxfmt": "^0.40.0",
