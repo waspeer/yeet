@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@hono/node-server": "^1.19.11",
+    "@sentry/node": "^10.44.0",
     "argon2": "^0.41.1",
     "hono": "^4.0.0",
     "node-cron": "^3.0.0",

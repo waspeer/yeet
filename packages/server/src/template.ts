@@ -38,6 +38,30 @@ button.primary{background:#000;color:#fff}
 .error{background:#eee;border:1px solid #000;padding:6px 8px;margin-bottom:8px;font-size:11px}
 `.trim();
 
+const SENTRY_DSN = process.env.SENTRY_DSN ?? "";
+
+function sentryScript(): string {
+  if (!SENTRY_DSN) return "";
+  return `
+<script src="https://browser.sentry-cdn.com/9.41.0/bundle.tracing.replay.min.js" crossorigin="anonymous"></script>
+<script>
+  Sentry.init({
+    dsn: ${JSON.stringify(SENTRY_DSN)},
+    integrations: [
+      Sentry.replayIntegration({
+        maskAllText: false,
+        blockAllMedia: false,
+      }),
+    ],
+    // Capture 100% of transactions for user misery / performance
+    tracesSampleRate: 1.0,
+    // Capture replays only when an error occurs (saves your free quota)
+    replaysSessionSampleRate: 0,
+    replaysOnErrorSampleRate: 1.0,
+  });
+</script>`;
+}
+
 function layout(title: string, body: string): string {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -56,7 +80,7 @@ function layout(title: string, body: string): string {
   </div>
   <div class="body">${body}</div>
 </div>
-<script src="/client.js" type="module"></script>
+<script src="/client.js" type="module"></script>${sentryScript()}
 </body>
 </html>`;
 }

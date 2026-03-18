@@ -1,4 +1,14 @@
 // Entry point — server implementation lives here
+import * as Sentry from "@sentry/node";
+
+Sentry.init({
+  dsn: process.env.SENTRY_DSN,
+  enableLogs: true,
+  integrations: [
+    Sentry.consoleLoggingIntegration({ levels: ["warn", "error"] }),
+  ],
+});
+
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import argon2 from "argon2";
@@ -56,10 +66,12 @@ app.get("/:id/:filename?", async (c) => {
   try {
     meta = await storage.readMeta(id);
   } catch {
+    Sentry.logger.warn(Sentry.logger.fmt`Download page visited for unknown file: ${id}`);
     return c.html(notFoundPage(), 404);
   }
 
   if (isExpired(meta.expires_at)) {
+    Sentry.logger.info(Sentry.logger.fmt`Download page visited for expired file: ${id} (${meta.filename})`);
     return new Response(await deleteExpiredAndRespond404(id).then((r) => r.text()), {
       status: 404,
       headers: { "Content-Type": "text/html; charset=utf-8" },
@@ -84,10 +96,14 @@ app.post("/:id/download", async (c) => {
   try {
     meta = await storage.readMeta(id);
   } catch {
+    Sentry.logger.warn(Sentry.logger.fmt`Download attempted for unknown file: ${id}`);
     return c.html(notFoundPage(), 404);
   }
 
   if (isExpired(meta.expires_at)) {
+    Sentry.logger.warn(
+      Sentry.logger.fmt`Download attempted for expired file: ${id} (${meta.filename})`,
+    );
     return new Response(await deleteExpiredAndRespond404(id).then((r) => r.text()), {
       status: 404,
       headers: { "Content-Type": "text/html; charset=utf-8" },
@@ -99,6 +115,7 @@ app.post("/:id/download", async (c) => {
     const password = typeof body["password"] === "string" ? body["password"] : "";
     const valid = await argon2.verify(meta.password_hash, password);
     if (!valid) {
+      Sentry.logger.warn(Sentry.logger.fmt`Incorrect password attempt for file: ${id} (${meta.filename})`);
       return c.html(
         downloadPage({
           filename: meta.filename,
@@ -117,7 +134,16 @@ app.post("/:id/download", async (c) => {
     console.error(`[download] Failed to record download for ${id}:`, err);
   });
 
-  const upstream = await storage.streamFile(id, meta.filename);
+  let upstream: Awaited<ReturnType<typeof storage.streamFile>>;
+  try {
+    upstream = await storage.streamFile(id, meta.filename);
+  } catch (err) {
+    Sentry.logger.error(Sentry.logger.fmt`Failed to stream file: ${id} (${meta.filename})`, {
+      error: String(err),
+    });
+    Sentry.captureException(err);
+    return c.html(notFoundPage(), 500);
+  }
 
   return new Response(upstream.body, {
     status: upstream.status,
