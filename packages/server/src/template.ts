@@ -58,6 +58,18 @@ function sentryScript(): string {
     // Capture replays only when an error occurs (saves your free quota)
     replaysSessionSampleRate: 0,
     replaysOnErrorSampleRate: 1.0,
+    // Ignore known browser extension noise
+    ignoreErrors: [
+      'Internal JSON-RPC error',
+      /Object Not Found Matching Id/,
+    ],
+    beforeSend(event) {
+      const frames = event.exception?.values?.[0]?.stacktrace?.frames || [];
+      if (frames.some(f => f.filename?.startsWith('chrome-extension://'))) {
+        return null;
+      }
+      return event;
+    },
   });
 </script>`;
 }
