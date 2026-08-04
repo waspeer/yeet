@@ -11,10 +11,34 @@ import argon2 from "argon2";
 // Config — set via environment variables
 // ---------------------------------------------------------------------------
 
-const RCLONE_REMOTE = process.env.YEET_RCLONE_REMOTE ?? "storagebox";
-const UPLOADS_PATH = process.env.YEET_UPLOADS_PATH ?? "uploads";
-const DOMAIN = process.env.YEET_DOMAIN ?? "https://dl.example.com";
 const DEFAULT_EXPIRES_DAYS = Number(process.env.YEET_DEFAULT_EXPIRES_DAYS ?? "30");
+
+interface Config {
+  remote: string;
+  uploadsPath: string;
+  domain: string;
+}
+
+function requireEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) die(`Missing required environment variable: ${name}`);
+  return value;
+}
+
+/**
+ * Storage configuration, read from the environment with no fallbacks. These
+ * three say *where* files go, so there is no value that is right in general:
+ * a stale default would silently upload to the wrong backend, or print a URL
+ * that never resolves. Read at the point of use rather than on import, so
+ * `--help` still works with nothing configured.
+ */
+function loadConfig(): Config {
+  return {
+    remote: requireEnv("YEET_RCLONE_REMOTE"),
+    uploadsPath: requireEnv("YEET_UPLOADS_PATH"),
+    domain: requireEnv("YEET_DOMAIN"),
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Arg parsing
@@ -170,7 +194,8 @@ interface UploadMeta {
 async function listFiles(showDownloads: boolean): Promise<void> {
   checkRclone();
 
-  const remote = `${RCLONE_REMOTE}:${UPLOADS_PATH}`;
+  const config = loadConfig();
+  const remote = `${config.remote}:${config.uploadsPath}`;
 
   // Get all upload directories
   let dirsJson: string;
@@ -230,7 +255,7 @@ async function listFiles(showDownloads: boolean): Promise<void> {
     const expiryPart = `${expiryLabel} ${formatDate(meta.expires_at)}`;
     const line2 = `  ${dim(`${uploadedPart} \u00B7 ${expiryPart}${dlPart}`)}`;
 
-    const url = `${DOMAIN}/${id}/${encodeURIComponent(meta.filename)}`;
+    const url = `${config.domain}/${id}/${encodeURIComponent(meta.filename)}`;
     const line3 = `  ${cyan(url)}`;
 
     let dlLines = "";
@@ -268,6 +293,7 @@ async function upload(args: UploadArgs): Promise<void> {
 
   checkRclone();
 
+  const config = loadConfig();
   const filename = basename(args.filepath);
   const id = generateId();
 
@@ -295,14 +321,14 @@ async function upload(args: UploadArgs): Promise<void> {
   execFileSync("cp", [args.filepath, join(stagingDir, filename)]);
 
   // Upload via rclone
-  const dest = `${RCLONE_REMOTE}:${UPLOADS_PATH}/${id}`;
+  const dest = `${config.remote}:${config.uploadsPath}/${id}`;
   try {
     execFileSync("rclone", ["copy", stagingDir, dest, "--progress"], { stdio: "inherit" });
   } catch {
     die("Upload failed. Check your rclone configuration and connectivity.");
   }
 
-  const url = `${DOMAIN}/${id}/${encodeURIComponent(filename)}`;
+  const url = `${config.domain}/${id}/${encodeURIComponent(filename)}`;
   process.stdout.write(url + "\n");
 }
 
