@@ -4,9 +4,7 @@ import * as Sentry from "@sentry/node";
 Sentry.init({
   dsn: process.env.SENTRY_DSN,
   enableLogs: true,
-  integrations: [
-    Sentry.consoleLoggingIntegration({ levels: ["warn", "error"] }),
-  ],
+  integrations: [Sentry.consoleLoggingIntegration({ levels: ["warn", "error"] })],
 });
 
 import { serve } from "@hono/node-server";
@@ -30,6 +28,13 @@ const app = new Hono();
 
 function isExpired(expiresAt: string): boolean {
   return new Date(expiresAt) <= new Date();
+}
+
+// Upload IDs are base64url (see the CLI's generateId). Anything else — in
+// particular dot-segments smuggled in via %2F — must never reach the storage
+// layer, where it would resolve to object paths outside the uploads prefix.
+function isValidId(id: string): boolean {
+  return /^[A-Za-z0-9_-]+$/.test(id);
 }
 
 async function deleteExpiredAndRespond404(id: string): Promise<Response> {
@@ -61,6 +66,7 @@ app.get("/", (c) => c.html(landingPage()));
 // GET /:id and GET /:id/:filename — serve download page
 app.get("/:id/:filename?", async (c) => {
   const { id } = c.req.param();
+  if (!isValidId(id)) return c.html(notFoundPage(), 404);
 
   let meta;
   try {
@@ -71,7 +77,9 @@ app.get("/:id/:filename?", async (c) => {
   }
 
   if (isExpired(meta.expires_at)) {
-    Sentry.logger.info(Sentry.logger.fmt`Download page visited for expired file: ${id} (${meta.filename})`);
+    Sentry.logger.info(
+      Sentry.logger.fmt`Download page visited for expired file: ${id} (${meta.filename})`,
+    );
     return new Response(await deleteExpiredAndRespond404(id).then((r) => r.text()), {
       status: 404,
       headers: { "Content-Type": "text/html; charset=utf-8" },
@@ -88,9 +96,10 @@ app.get("/:id/:filename?", async (c) => {
   );
 });
 
-// POST /:id/download — verify password and stream file
+// POST /:id/download — verify password and redirect to a presigned R2 URL
 app.post("/:id/download", async (c) => {
   const { id } = c.req.param();
+  if (!isValidId(id)) return c.html(notFoundPage(), 404);
 
   let meta;
   try {
@@ -115,7 +124,9 @@ app.post("/:id/download", async (c) => {
     const password = typeof body["password"] === "string" ? body["password"] : "";
     const valid = await argon2.verify(meta.password_hash, password);
     if (!valid) {
-      Sentry.logger.warn(Sentry.logger.fmt`Incorrect password attempt for file: ${id} (${meta.filename})`);
+      Sentry.logger.warn(
+        Sentry.logger.fmt`Incorrect password attempt for file: ${id} (${meta.filename})`,
+      );
       return c.html(
         downloadPage({
           filename: meta.filename,
@@ -134,27 +145,21 @@ app.post("/:id/download", async (c) => {
     console.error(`[download] Failed to record download for ${id}:`, err);
   });
 
-  let upstream: Awaited<ReturnType<typeof storage.streamFile>>;
+  // Hand the transfer off to R2 — the browser fetches the bytes directly,
+  // which is fast and resumable, instead of proxying through this server.
+  let downloadUrl: string;
   try {
-    upstream = await storage.streamFile(id, meta.filename);
+    downloadUrl = await storage.presignDownloadUrl(id, meta.filename, meta.expires_at);
   } catch (err) {
-    Sentry.logger.error(Sentry.logger.fmt`Failed to stream file: ${id} (${meta.filename})`, {
-      error: String(err),
-    });
+    Sentry.logger.error(
+      Sentry.logger.fmt`Failed to presign download URL: ${id} (${meta.filename})`,
+      { error: String(err) },
+    );
     Sentry.captureException(err);
     return c.html(notFoundPage(), 500);
   }
 
-  return new Response(upstream.body, {
-    status: upstream.status,
-    headers: {
-      "Content-Type": upstream.headers.get("Content-Type") ?? "application/octet-stream",
-      "Content-Disposition": `attachment; filename="${encodeURIComponent(meta.filename)}"`,
-      ...(upstream.headers.get("Content-Length")
-        ? { "Content-Length": upstream.headers.get("Content-Length")! }
-        : {}),
-    },
-  });
+  return c.redirect(downloadUrl, 303);
 });
 
 // ---------------------------------------------------------------------------
@@ -176,8 +181,9 @@ async function runCleanup(): Promise<void> {
       try {
         const meta = await storage.readMeta(id);
         if (isExpired(meta.expires_at)) {
-          await storage.deleteUpload(id);
-          deleted++;
+          const removed = await storage.deleteUpload(id);
+          if (removed > 0) deleted++;
+          else console.warn(`[cleanup] No objects found to delete for ${id}`);
         }
       } catch {
         // Skip directories where .meta.json is missing or unreadable
