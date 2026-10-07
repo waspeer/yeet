@@ -57,7 +57,10 @@ test.describe("expiry at request time (no cron)", () => {
       // The server clamps a link's lifetime to the file's; this one claims an
       // hour, so only the file's own expiry check can stop it.
       const longLived = forgeDownloadUrl(forDl.id, Math.floor(Date.now() / 1000) + 3600);
-      expect((await fetch(longLived)).status).toBe(200);
+      expect(
+        (await fetch(longLived)).status,
+        "forgeDownloadUrl() is out of sync with signDownload() in packages/worker/src/crypto.ts",
+      ).toBe(200);
 
       await waitUntilExpired(forForm.id);
       // Still in the bucket: what follows is the request-time check, not cleanup.
