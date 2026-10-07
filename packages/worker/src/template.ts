@@ -38,9 +38,9 @@ button.primary{background:#000;color:#fff}
 .error{background:#eee;border:1px solid #000;padding:6px 8px;margin-bottom:8px;font-size:11px}
 `.trim();
 
-const SENTRY_DSN = process.env.SENTRY_DSN ?? "";
-
 function sentryScript(): string {
+  // Read per render: on Workers, vars and secrets reach process.env via nodejs_compat.
+  const SENTRY_DSN = process.env.SENTRY_DSN ?? "";
   if (!SENTRY_DSN) return "";
   return `
 <script src="https://browser.sentry-cdn.com/9.41.0/bundle.tracing.replay.min.js" crossorigin="anonymous"></script>

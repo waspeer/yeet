@@ -1,9 +1,6 @@
 {
   "name": "yeet",
   "private": true,
-  "workspaces": [
-    "packages/*"
-  ],
   "scripts": {
     "fmt": "oxfmt",
     "fmt:check": "oxfmt --check",

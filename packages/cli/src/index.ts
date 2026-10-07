@@ -1,107 +1,112 @@
 #!/usr/bin/env node
 
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, statSync, existsSync, readFileSync } from "node:fs";
-import { join, basename } from "node:path";
-import { tmpdir } from "node:os";
-import { randomBytes } from "node:crypto";
-import argon2 from "argon2";
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { open } from "node:fs/promises";
+import { homedir } from "node:os";
+import { basename, dirname, join } from "node:path";
+import { createInterface } from "node:readline";
+
+const README_URL = "https://github.com/waspeer/yeet#readme";
 
 // ---------------------------------------------------------------------------
-// Config — set via environment variables
+// Config — ~/.config/yeet/config.json, written by `yeet login`.
+// YEET_URL / YEET_TOKEN / YEET_DEFAULT_EXPIRES override it.
 // ---------------------------------------------------------------------------
 
-const README_URL = "https://github.com/waspeer/yeet#configuration";
+interface StoredConfig {
+  url?: string;
+  token?: string;
+  defaultExpires?: string;
+}
 
 interface Config {
-  remote: string;
-  uploadsPath: string;
-  domain: string;
+  url: string;
+  token: string;
 }
 
-const REQUIRED_ENV = {
-  YEET_RCLONE_REMOTE: "name of your rclone remote, e.g. r2",
-  YEET_UPLOADS_PATH: "bucket and prefix on that remote, e.g. yeet/uploads",
-  YEET_DOMAIN: "public URL of your yeet server, e.g. https://dl.example.com",
-} as const;
+function configPath(): string {
+  const base = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
+  return join(base, "yeet", "config.json");
+}
 
-/**
- * Storage configuration, read from the environment with no fallbacks. These
- * three say *where* files go, so there is no value that is right in general:
- * a stale default would silently upload to the wrong backend, or print a URL
- * that never resolves. Read at the point of use rather than on import, so
- * `--help` still works with nothing configured.
- */
+function readStoredConfig(): StoredConfig {
+  const path = configPath();
+  if (!existsSync(path)) return {};
+  try {
+    return JSON.parse(readFileSync(path, "utf-8")) as StoredConfig;
+  } catch {
+    die(`Could not read ${path}. Fix or delete it, then run \`yeet login\` again.`);
+  }
+}
+
+function writeStoredConfig(config: StoredConfig): void {
+  const path = configPath();
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify(config, null, 2) + "\n", { mode: 0o600 });
+  chmodSync(path, 0o600); // also tighten a file that already existed
+}
+
+function normalizeUrl(raw: string): string {
+  const url = raw.trim().replace(/\/+$/, "");
+  const withScheme = /^https?:\/\//.test(url) ? url : `https://${url}`;
+  try {
+    return new URL(withScheme).origin;
+  } catch {
+    die(`Invalid server URL: "${raw}" (expected something like https://yeet.example.workers.dev)`);
+  }
+}
+
 function loadConfig(): Config {
-  const missing = (Object.keys(REQUIRED_ENV) as (keyof typeof REQUIRED_ENV)[]).filter(
-    (name) => !process.env[name],
-  );
-  if (missing.length > 0) {
+  const stored = readStoredConfig();
+  const url = process.env.YEET_URL || stored.url;
+  const token = process.env.YEET_TOKEN || stored.token;
+  if (!url || !token) {
     die(
-      [
-        `yeet is not configured. Missing environment variable${missing.length > 1 ? "s" : ""}:`,
-        ...missing.map((name) => `  ${name.padEnd(20)} ${REQUIRED_ENV[name]}`),
-        "",
-        `See ${README_URL}`,
-      ].join("\n"),
+      "yeet is not set up yet. Run:\n\n" +
+        "  yeet login <your-server-url>\n\n" +
+        `Don't have a server yet? See ${README_URL}`,
     );
   }
-
-  const domain = process.env.YEET_DOMAIN!.replace(/\/+$/, "");
-  if (!/^https?:\/\/[^/]+/.test(domain)) {
-    die(`Invalid YEET_DOMAIN: "${domain}" (expected a URL like https://dl.example.com)`);
-  }
-
-  return {
-    remote: process.env.YEET_RCLONE_REMOTE!.replace(/:$/, ""),
-    uploadsPath: process.env.YEET_UPLOADS_PATH!.replace(/\/+$/, ""),
-    domain,
-  };
+  return { url: normalizeUrl(url), token };
 }
 
-/** Default link lifetime in days: YEET_DEFAULT_EXPIRES (a duration like 30d) or 30. */
+/** Default link lifetime in days: YEET_DEFAULT_EXPIRES, the config file, or 30. */
 function defaultExpiresDays(): number {
-  const raw = process.env.YEET_DEFAULT_EXPIRES;
-  if (!raw) return 30;
-  return parseDuration(raw, "YEET_DEFAULT_EXPIRES");
+  if (process.env.YEET_DEFAULT_EXPIRES) {
+    return parseDuration(process.env.YEET_DEFAULT_EXPIRES, "YEET_DEFAULT_EXPIRES");
+  }
+  const stored = readStoredConfig().defaultExpires;
+  if (stored) return parseDuration(stored, `defaultExpires in ${configPath()}`);
+  return 30;
 }
 
 // ---------------------------------------------------------------------------
 // Arg parsing
 // ---------------------------------------------------------------------------
 
-interface UploadArgs {
-  command: "upload";
-  filepath: string;
-  expires: number; // days
-  password: string | undefined;
-}
-
-interface ListArgs {
-  command: "list";
-  showDownloads: boolean;
-}
-
-type Args = UploadArgs | ListArgs;
+type Args =
+  | { command: "login"; url: string | undefined }
+  | { command: "upload"; filepaths: string[]; expires: number; password: string | undefined }
+  | { command: "list"; showDownloads: boolean }
+  | { command: "delete"; ids: string[] };
 
 const USAGE = `Usage: yeet <command>
 
 Commands:
-  upload <filepath> [--expires <duration>] [--password <string>]
-                     Upload a file and print its share link
+  login [url]        Connect to your yeet server (asks for the upload token)
+  upload <file...> [--expires <duration>] [--password <string>]
+                     Upload files and print one share link per file
                      --expires   link lifetime, e.g. 7d, 24h, 90m (default 30d)
                      --password  require this password to download
   list [--downloads] Show all uploaded files (optionally with download history)
+  delete <id|url...> Delete uploads before they expire
 
 Options:
   -h, --help         Show this help
   -v, --version      Show the version
 
-Configuration (environment variables):
-  YEET_RCLONE_REMOTE    rclone remote to upload to, e.g. r2
-  YEET_UPLOADS_PATH     bucket and prefix on that remote, e.g. yeet/uploads
-  YEET_DOMAIN           public URL of your yeet server, e.g. https://dl.example.com
-  YEET_DEFAULT_EXPIRES  default link lifetime (optional, default 30d)`;
+Settings are stored in ${configPath()}.
+Environment variables YEET_URL, YEET_TOKEN and YEET_DEFAULT_EXPIRES override them.`;
 
 function version(): string {
   const pkgPath = new URL("../package.json", import.meta.url);
@@ -123,16 +128,26 @@ function parseArgs(argv: string[]): Args {
 
   const command = args[0];
 
+  if (command === "login") {
+    return { command: "login", url: args[1] };
+  }
+
   if (command === "list") {
     const showDownloads = args.includes("--downloads") || args.includes("-d");
     return { command: "list", showDownloads };
+  }
+
+  if (command === "delete") {
+    const ids = args.slice(1).map(parseIdOrUrl);
+    if (ids.length === 0) die("Usage: yeet delete <id|url...>");
+    return { command: "delete", ids };
   }
 
   if (command !== "upload") {
     die(USAGE);
   }
 
-  let filepath: string | undefined;
+  const filepaths: string[] = [];
   let expires: number | undefined;
   let password: string | undefined;
 
@@ -147,14 +162,16 @@ function parseArgs(argv: string[]): Args {
       if (!val) die("--password requires a value");
       password = val;
     } else if (!arg.startsWith("--")) {
-      filepath = arg;
+      filepaths.push(arg);
     } else {
       die(`Unknown flag: ${arg}`);
     }
   }
 
-  if (!filepath) die("Usage: yeet upload <filepath> [--expires <duration>] [--password <string>]");
-  return { command: "upload", filepath, expires: expires ?? defaultExpiresDays(), password };
+  if (filepaths.length === 0) {
+    die("Usage: yeet upload <file...> [--expires <duration>] [--password <string>]");
+  }
+  return { command: "upload", filepaths, expires: expires ?? defaultExpiresDays(), password };
 }
 
 function parseDuration(s: string, source = "--expires"): number {
@@ -166,8 +183,16 @@ function parseDuration(s: string, source = "--expires"): number {
   const num = Number(n);
   if (unit.toLowerCase() === "d") return num;
   if (unit.toLowerCase() === "h") return num / 24;
-  if (unit.toLowerCase() === "m") return num / (24 * 60);
-  die(`Invalid duration unit: ${unit}`);
+  return num / (24 * 60);
+}
+
+/** Accept either a bare upload ID or a share link. */
+function parseIdOrUrl(value: string): string {
+  if (/^https?:\/\//.test(value)) {
+    const id = new URL(value).pathname.split("/")[1];
+    if (id) return id;
+  }
+  return value;
 }
 
 // ---------------------------------------------------------------------------
@@ -179,35 +204,75 @@ function die(msg: string): never {
   process.exit(1);
 }
 
-function generateId(): string {
-  return randomBytes(4).toString("base64url").slice(0, 6);
-}
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function checkRclone(): void {
-  try {
-    execFileSync("rclone", ["version"], { stdio: "ignore" });
-  } catch {
-    die("rclone is required but not found. Install it from https://rclone.org/install/");
+class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
   }
 }
 
-/** Fail early with a clear message if the configured remote does not exist in rclone. */
-function checkRemote(remote: string): void {
-  let remotes: string[];
+/** Call the server API and parse the JSON response, with readable errors. */
+async function api<T>(
+  config: Config,
+  method: string,
+  path: string,
+  body?: unknown,
+  init: RequestInit = {},
+): Promise<T> {
+  let res: Response;
   try {
-    remotes = execFileSync("rclone", ["listremotes"], { encoding: "utf-8" })
-      .split("\n")
-      .map((line) => line.trim().replace(/:$/, ""))
-      .filter(Boolean);
-  } catch {
-    return; // let the actual rclone call report the problem
+    res = await fetch(`${config.url}/api${path}`, {
+      method,
+      ...init,
+      headers: {
+        Authorization: `Bearer ${config.token}`,
+        ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+        ...init.headers,
+      },
+      body: body !== undefined ? JSON.stringify(body) : init.body,
+    });
+  } catch (err) {
+    const cause =
+      err instanceof Error && err.cause instanceof Error ? `: ${err.cause.message}` : "";
+    throw new ApiError(`Could not reach ${config.url}${cause}`, 0);
   }
-  if (!remotes.includes(remote)) {
-    die(
-      `rclone has no remote named "${remote}" (YEET_RCLONE_REMOTE).\n` +
-        `Configured remotes: ${remotes.length ? remotes.join(", ") : "none"}. ` +
-        `Create one with \`rclone config\`.`,
-    );
+
+  const text = await res.text();
+  let data: unknown;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = undefined;
+  }
+
+  if (!res.ok) {
+    if (res.status === 401) {
+      throw new ApiError("The server rejected the upload token. Run `yeet login` again.", 401);
+    }
+    const message = (data as { error?: string } | undefined)?.error;
+    if (res.status === 404 && message === undefined) {
+      throw new ApiError(`${config.url} does not look like a yeet server (404 on ${path})`, 404);
+    }
+    throw new ApiError(message ?? `Server returned ${res.status}`, res.status);
+  }
+  return data as T;
+}
+
+/** Retry transient failures (network errors and 5xx) with backoff. */
+async function withRetries<T>(attempt: () => Promise<T>, tries = 4): Promise<T> {
+  for (let i = 1; ; i++) {
+    try {
+      return await attempt();
+    } catch (err) {
+      const status = err instanceof ApiError ? err.status : 0;
+      const transient = status === 0 || status >= 500 || status === 429;
+      if (!transient || i >= tries) throw err;
+      await sleep(1000 * 2 ** (i - 1));
+    }
   }
 }
 
@@ -230,10 +295,6 @@ function yellow(s: string): string {
   return isTTY ? `\x1b[33m${s}\x1b[39m` : s;
 }
 
-// ---------------------------------------------------------------------------
-// Formatting helpers
-// ---------------------------------------------------------------------------
-
 function formatSize(bytes: number): string {
   if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
   if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`;
@@ -246,166 +307,298 @@ function formatDate(iso: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// List command
+// Login command
 // ---------------------------------------------------------------------------
 
-interface DownloadRecord {
-  at: string;
+function prompt(question: string): Promise<string> {
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  return new Promise((resolve) =>
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(answer.trim());
+    }),
+  );
 }
 
-interface UploadMeta {
+/** Read a secret without echoing it. Falls back to a plain line when piped. */
+function promptSecret(question: string): Promise<string> {
+  if (!process.stdin.isTTY) return prompt("");
+  process.stderr.write(question);
+  return new Promise((resolve) => {
+    let value = "";
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.setEncoding("utf-8");
+    const onData = (chunk: string) => {
+      for (const ch of chunk) {
+        if (ch === "\r" || ch === "\n") {
+          process.stdin.setRawMode(false);
+          process.stdin.pause();
+          process.stdin.off("data", onData);
+          process.stderr.write("\n");
+          resolve(value.trim());
+          return;
+        }
+        if (ch === "\u0003") process.exit(130); // Ctrl-C
+        if (ch === "\u007f") value = value.slice(0, -1);
+        else value += ch;
+      }
+    };
+    process.stdin.on("data", onData);
+  });
+}
+
+async function login(urlArg: string | undefined): Promise<void> {
+  const url = normalizeUrl(urlArg || (await prompt("Server URL: ")));
+  const token = await promptSecret("Upload token: ");
+  if (!token) die("No token given.");
+
+  try {
+    await api({ url, token }, "GET", "/me");
+  } catch (err) {
+    die(err instanceof Error ? err.message : String(err));
+  }
+
+  writeStoredConfig({ ...readStoredConfig(), url, token });
+  process.stderr.write(`Logged in to ${url}. Settings saved to ${configPath()}\n`);
+}
+
+// ---------------------------------------------------------------------------
+// List and delete commands
+// ---------------------------------------------------------------------------
+
+interface ListedUpload {
+  id: string;
   filename: string;
   file_size: number;
   uploaded_at: string;
   expires_at: string;
-  password_hash?: string;
-  downloads?: DownloadRecord[];
+  has_password: boolean;
+  download_count: number;
+  /** The last five download times. */
+  recent_downloads: string[];
+  url: string;
 }
 
 async function listFiles(showDownloads: boolean): Promise<void> {
-  checkRclone();
-
   const config = loadConfig();
-  checkRemote(config.remote);
-  const remote = `${config.remote}:${config.uploadsPath}`;
+  const { uploads } = await api<{ uploads: ListedUpload[] }>(config, "GET", "/uploads");
 
-  // Get all upload directories
-  let dirsJson: string;
-  try {
-    dirsJson = execFileSync("rclone", ["lsjson", remote, "--dirs-only"], { encoding: "utf-8" });
-  } catch {
-    die(`Failed to list ${remote}. Check your rclone configuration and connectivity.`);
-  }
-
-  const dirs = JSON.parse(dirsJson) as { Path: string; Name: string }[];
-
-  if (dirs.length === 0) {
+  if (uploads.length === 0) {
     process.stdout.write("No files found.\n");
     return;
   }
-
-  // Read metadata for each upload
-  const entries: { id: string; meta: UploadMeta }[] = [];
-
-  for (const dir of dirs) {
-    const metaPath = `${remote}/${dir.Path}/.meta.json`;
-    try {
-      const raw = execFileSync("rclone", ["cat", metaPath], { encoding: "utf-8" });
-      const meta = JSON.parse(raw) as UploadMeta;
-      entries.push({ id: dir.Path, meta });
-    } catch {
-      process.stderr.write(`Warning: could not read metadata for ${dir.Path}, skipping\n`);
-    }
-  }
-
-  // Sort newest first
-  entries.sort(
-    (a, b) => new Date(b.meta.uploaded_at).getTime() - new Date(a.meta.uploaded_at).getTime(),
-  );
 
   const now = new Date();
   let active = 0;
   let expired = 0;
 
-  for (const { id, meta } of entries) {
-    const isExpired = new Date(meta.expires_at) < now;
+  for (const upload of uploads) {
+    const isExpired = new Date(upload.expires_at) < now;
     if (isExpired) expired++;
     else active++;
 
     const wrap = isExpired ? dim : (s: string) => s;
 
-    const namePart = bold(meta.filename);
-    const sizePart = dim(formatSize(meta.file_size));
-    const lockPart = meta.password_hash ? ` ${yellow("\u{1F512}")}` : "";
-    const line1 = `  ${namePart} \u00B7 ${sizePart}${lockPart}`;
+    const lockPart = upload.has_password ? ` ${yellow("\u{1F512}")}` : "";
+    const line1 = `  ${bold(upload.filename)} · ${dim(formatSize(upload.file_size))}${lockPart}`;
 
-    const dlCount = (meta.downloads ?? []).length;
-    const dlPart = dlCount > 0 ? ` \u00B7 ${dlCount} download${dlCount !== 1 ? "s" : ""}` : "";
-
-    const uploadedPart = `Uploaded ${formatDate(meta.uploaded_at)}`;
+    const dlCount = upload.download_count;
+    const dlPart = dlCount > 0 ? ` · ${dlCount} download${dlCount !== 1 ? "s" : ""}` : "";
     const expiryLabel = isExpired ? "Expired" : "Expires";
-    const expiryPart = `${expiryLabel} ${formatDate(meta.expires_at)}`;
-    const line2 = `  ${dim(`${uploadedPart} \u00B7 ${expiryPart}${dlPart}`)}`;
-
-    const url = `${config.domain}/${id}/${encodeURIComponent(meta.filename)}`;
-    const line3 = `  ${cyan(url)}`;
+    const line2 = `  ${dim(
+      `Uploaded ${formatDate(upload.uploaded_at)} · ${expiryLabel} ${formatDate(upload.expires_at)}${dlPart}`,
+    )}`;
+    const line3 = `  ${cyan(upload.url)}`;
 
     let dlLines = "";
-    if (showDownloads && meta.downloads?.length) {
-      const recent = meta.downloads.slice(-5);
-      for (const dl of recent) {
-        dlLines += wrap(dim(`    \u2193 ${new Date(dl.at).toLocaleString()}`)) + "\n";
+    if (showDownloads && dlCount > 0) {
+      for (const at of upload.recent_downloads) {
+        dlLines += wrap(dim(`    ↓ ${new Date(at).toLocaleString()}`)) + "\n";
       }
-      if (meta.downloads.length > 5) {
-        dlLines += wrap(dim(`    ... and ${meta.downloads.length - 5} more`)) + "\n";
-      }
+      const older = dlCount - upload.recent_downloads.length;
+      if (older > 0) dlLines += wrap(dim(`    ... and ${older} more`)) + "\n";
     }
 
     process.stdout.write(wrap(`${line1}\n${line2}\n${line3}`) + "\n" + dlLines + "\n");
   }
 
   process.stdout.write(
-    dim(`${entries.length} files (${active} active, ${expired} expired)`) + "\n",
+    dim(`${uploads.length} files (${active} active, ${expired} expired)`) + "\n",
   );
+}
+
+async function deleteUploads(ids: string[]): Promise<void> {
+  const config = loadConfig();
+  let failed = false;
+  for (const id of ids) {
+    try {
+      await api(config, "DELETE", `/uploads/${encodeURIComponent(id)}`);
+      process.stderr.write(`Deleted ${id}\n`);
+    } catch (err) {
+      failed = true;
+      process.stderr.write(`Could not delete ${id}: ${err instanceof Error ? err.message : err}\n`);
+    }
+  }
+  if (failed) process.exit(1);
 }
 
 // ---------------------------------------------------------------------------
 // Upload command
 // ---------------------------------------------------------------------------
 
-async function upload(args: UploadArgs): Promise<void> {
-  // Validate file
-  if (!existsSync(args.filepath)) {
-    die(`File not found: ${args.filepath}`);
-  }
-  const stat = statSync(args.filepath);
-  if (!stat.isFile()) {
-    die(`Not a file: ${args.filepath}`);
-  }
+/** Parts uploaded at the same time. Each holds one part (up to 50 MiB) in memory. */
+const CONCURRENCY = 3;
 
-  checkRclone();
+class Progress {
+  private sent = 0;
+  private readonly started = Date.now();
+  private lastDraw = 0;
+  private readonly enabled = process.stderr.isTTY;
 
-  const config = loadConfig();
-  checkRemote(config.remote);
-  const filename = basename(args.filepath);
-  const id = generateId();
+  constructor(
+    private readonly label: string,
+    private readonly total: number,
+  ) {}
 
-  const uploadedAt = new Date();
-  const expiresAt = new Date(uploadedAt.getTime() + args.expires * 24 * 60 * 60 * 1000);
-
-  const meta: Record<string, unknown> = {
-    filename,
-    file_size: stat.size,
-    uploaded_at: uploadedAt.toISOString(),
-    expires_at: expiresAt.toISOString(),
-  };
-
-  if (args.password) {
-    meta.password_hash = await argon2.hash(args.password, { type: argon2.argon2id });
+  add(bytes: number): void {
+    this.sent += bytes;
+    if (Date.now() - this.lastDraw > 100) this.draw();
   }
 
-  // Build temp directory
-  const tmpDir = mkdtempSync(join(tmpdir(), "yeet-"));
-  const stagingDir = join(tmpDir, id);
-  mkdirSync(stagingDir);
-  writeFileSync(join(stagingDir, ".meta.json"), JSON.stringify(meta, null, 2));
+  draw(): void {
+    if (!this.enabled) return;
+    this.lastDraw = Date.now();
+    const pct = this.total ? Math.min(100, (this.sent / this.total) * 100) : 100;
+    const seconds = Math.max((Date.now() - this.started) / 1000, 0.001);
+    const rate = formatSize(this.sent / seconds);
+    process.stderr.write(
+      `\r\x1b[K${this.label}  ${pct.toFixed(0).padStart(3)}%  ${formatSize(this.sent)} / ${formatSize(this.total)}  ${rate}/s`,
+    );
+  }
 
-  // Copy original file into staging dir (rclone will pick up the whole dir)
-  execFileSync("cp", [args.filepath, join(stagingDir, filename)]);
+  done(): void {
+    if (this.enabled) process.stderr.write("\r\x1b[K");
+  }
+}
 
-  // Upload via rclone
-  const dest = `${config.remote}:${config.uploadsPath}/${id}`;
+/** Wrap a buffer in a stream that reports bytes as fetch pulls them. */
+function countingStream(buffer: Uint8Array, onChunk: (bytes: number) => void): ReadableStream {
+  const CHUNK = 256 * 1024;
+  let offset = 0;
+  return new ReadableStream({
+    pull(controller) {
+      if (offset >= buffer.length) {
+        controller.close();
+        return;
+      }
+      const chunk = buffer.subarray(offset, offset + CHUNK);
+      offset += chunk.length;
+      onChunk(chunk.length);
+      controller.enqueue(chunk);
+    },
+  });
+}
+
+async function uploadFile(
+  config: Config,
+  filepath: string,
+  expiresDays: number,
+  password: string | undefined,
+): Promise<string> {
+  if (!existsSync(filepath)) throw new Error(`File not found: ${filepath}`);
+  const stat = statSync(filepath);
+  if (!stat.isFile()) throw new Error(`Not a file: ${filepath}`);
+
+  const filename = basename(filepath);
+  const { id, part_size: partSize } = await api<{ id: string; part_size: number }>(
+    config,
+    "POST",
+    "/uploads",
+    {
+      filename,
+      size: stat.size,
+      expires_in: Math.round(expiresDays * 24 * 60 * 60),
+      ...(password ? { password } : {}),
+    },
+  );
+
+  const partCount = Math.max(1, Math.ceil(stat.size / partSize));
+  const parts: { part_number: number; etag: string }[] = [];
+  const progress = new Progress(filename, stat.size);
+  const file = await open(filepath, "r");
+
   try {
-    // Progress goes to stderr so stdout carries only the link, for piping.
-    execFileSync("rclone", ["copy", stagingDir, dest, "--progress"], {
-      stdio: ["inherit", 2, "inherit"],
-    });
-  } catch {
-    die(`Upload to ${dest} failed. Check your rclone configuration and connectivity.`);
-  }
+    let next = 1;
+    const worker = async () => {
+      while (next <= partCount) {
+        const partNumber = next++;
+        const start = (partNumber - 1) * partSize;
+        const length = Math.min(partSize, stat.size - start);
+        const buffer = new Uint8Array(length);
+        await file.read(buffer, 0, length, start);
 
-  const url = `${config.domain}/${id}/${encodeURIComponent(filename)}`;
-  process.stdout.write(url + "\n");
+        let counted = 0;
+        const part = await withRetries(() => {
+          progress.add(-counted); // undo progress from a failed attempt
+          counted = 0;
+          return api<{ part_number: number; etag: string }>(
+            config,
+            "PUT",
+            `/uploads/${id}/parts/${partNumber}`,
+            undefined,
+            {
+              body: countingStream(buffer, (bytes) => {
+                counted += bytes;
+                progress.add(bytes);
+              }),
+              headers: {
+                "Content-Type": "application/octet-stream",
+                "Content-Length": String(length),
+              },
+              duplex: "half",
+            } as RequestInit,
+          );
+        });
+        parts.push(part);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, partCount) }, worker));
+
+    parts.sort((a, b) => a.part_number - b.part_number);
+    const { url } = await withRetries(() =>
+      api<{ url: string }>(config, "POST", `/uploads/${id}/complete`, { parts }),
+    );
+    return url;
+  } catch (err) {
+    // Don't leave a half-finished upload behind.
+    await api(config, "DELETE", `/uploads/${id}`).catch(() => {});
+    throw err;
+  } finally {
+    progress.done();
+    await file.close();
+  }
+}
+
+async function upload(
+  filepaths: string[],
+  expiresDays: number,
+  password: string | undefined,
+): Promise<void> {
+  const config = loadConfig();
+  let failed = false;
+  for (const filepath of filepaths) {
+    try {
+      const url = await uploadFile(config, filepath, expiresDays, password);
+      process.stdout.write(url + "\n");
+    } catch (err) {
+      failed = true;
+      process.stderr.write(
+        `Upload of ${filepath} failed: ${err instanceof Error ? err.message : err}\n`,
+      );
+    }
+  }
+  if (failed) process.exit(1);
 }
 
 // ---------------------------------------------------------------------------
@@ -415,11 +608,10 @@ async function upload(args: UploadArgs): Promise<void> {
 async function main() {
   const args = parseArgs(process.argv);
 
-  if (args.command === "list") {
-    await listFiles(args.showDownloads);
-  } else {
-    await upload(args);
-  }
+  if (args.command === "login") await login(args.url);
+  else if (args.command === "list") await listFiles(args.showDownloads);
+  else if (args.command === "delete") await deleteUploads(args.ids);
+  else await upload(args.filepaths, args.expires, args.password);
 }
 
 main().catch((err: unknown) => {

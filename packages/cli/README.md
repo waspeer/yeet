@@ -1,14 +1,14 @@
 # @waspeer/yeet
 
 Command-line client for [yeet](https://github.com/waspeer/yeet): share files
-with expiring, optionally password-protected download links, stored in your own
-S3-compatible bucket and served by your own yeet server.
+from your terminal with expiring, optionally password-protected download links,
+served by your own Cloudflare Worker.
 
 ```sh
 npm install -g @waspeer/yeet
+yeet login https://yeet.<you>.workers.dev
 yeet upload song.wav --expires 7d
 ```
 
-yeet needs [rclone](https://rclone.org), a bucket, and a running yeet server.
-See the [main README](https://github.com/waspeer/yeet#readme) for setup and
-configuration.
+You need your own yeet server first; deploying one is a single click. See the
+[main README](https://github.com/waspeer/yeet#readme).

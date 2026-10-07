@@ -1,14 +1,14 @@
 {
   "name": "@waspeer/yeet",
-  "version": "0.1.0",
-  "description": "Share files with expiring, optionally password-protected download links, using your own rclone remote and S3-compatible storage",
+  "version": "0.2.0",
+  "description": "Share files from your terminal with expiring, optionally password-protected download links, served by your own Cloudflare Worker",
   "keywords": [
     "cli",
+    "cloudflare",
     "file-sharing",
     "r2",
-    "rclone",
-    "s3",
-    "upload"
+    "upload",
+    "workers"
   ],
   "homepage": "https://github.com/waspeer/yeet#readme",
   "bugs": "https://github.com/waspeer/yeet/issues",
@@ -34,9 +34,6 @@
     "prepare": "tsc",
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "argon2": "^0.41.1"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

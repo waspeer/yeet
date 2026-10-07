@@ -1,0 +1,21 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "yeet",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+  // Sentry needs AsyncLocalStorage; it also exposes vars/secrets on process.env.
+  "compatibility_flags": ["nodejs_compat"],
+  // Bundles the download page's shader background into public/client.js.
+  "build": { "command": "node build.mjs" },
+  "assets": { "directory": "./public" },
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "yeet" }],
+  // Daily cleanup of expired and abandoned uploads.
+  "triggers": { "crons": ["0 3 * * *"] },
+  "vars": {
+    // Key prefix inside the bucket.
+    "UPLOADS_PREFIX": "uploads",
+    // Lifetime of a download link handed out after the password check, in seconds.
+    "DOWNLOAD_URL_TTL": "3600",
+  },
+  "observability": { "enabled": true },
+}

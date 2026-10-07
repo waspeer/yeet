@@ -1,0 +1,1 @@
+UPLOAD_TOKEN=  # Secret that lets the yeet CLI upload. Generate one with: openssl rand -base64 32
