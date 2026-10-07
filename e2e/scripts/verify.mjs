@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // One-command end-to-end verification for yeet.
 //
-//   npm run verify [-- <playwright test args>]
+//   npm run verify [-- [--allow-skips] <playwright test args>]
 //
 // 1. installs package dependencies that are missing or stale, builds the CLI
 // 2. starts `wrangler dev` on free ports with a throwaway R2 directory and a
@@ -10,6 +10,12 @@
 // 3. runs `playwright test` with any extra arguments passed through
 // 4. tears everything down — also on failure, Ctrl-C or SIGTERM — and writes
 //    results/summary.json
+//
+// Strict by default: a run where any selected test was skipped ("incomplete")
+// exits 1, like a failure. --allow-skips makes it exit 0 instead.
+//
+// One run per checkout at a time: a second concurrent run refuses to start
+// (exit 2) instead of clobbering results/ and the CLI build of the first.
 //
 // Set YEET_E2E_KEEP=1 to keep the temp directory (R2 state, fixtures) for debugging.
 
@@ -20,6 +26,8 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
+  closeSync,
   readFileSync,
   rmSync,
   statSync,
@@ -37,11 +45,13 @@ const WORKER_DIR = join(REPO_DIR, "packages", "worker");
 const RESULTS_DIR = join(E2E_DIR, "results");
 const SUMMARY_PATH = join(RESULTS_DIR, "summary.json");
 const WRANGLER_LOG = join(RESULTS_DIR, "wrangler.log");
+const LOCK_PATH = join(E2E_DIR, ".verify.lock");
 
 const SERVER_READY_TIMEOUT_MS = 90_000;
 const KILL_GRACE_MS = 5_000;
 
-const playwrightArgs = process.argv.slice(2);
+const allowSkips = process.argv.includes("--allow-skips");
+const playwrightArgs = process.argv.slice(2).filter((arg) => arg !== "--allow-skips");
 const startedAt = Date.now();
 const timings = {};
 
@@ -147,7 +157,7 @@ async function startWrangler({ port, inspectorPort, persistDir, token }) {
     // Own process group, so teardown can kill wrangler, workerd and esbuild at once.
     detached: true,
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, WRANGLER_SEND_METRICS: "false", NO_COLOR: "1", FORCE_COLOR: "0" },
+    env: { ...withoutForceColor(process.env), WRANGLER_SEND_METRICS: "false", NO_COLOR: "1" },
   });
   wrangler.stdout.pipe(logStream);
   wrangler.stderr.pipe(logStream);
@@ -187,6 +197,11 @@ async function startWrangler({ port, inspectorPort, persistDir, token }) {
     throw new Error(`GET /api/me with the harness token returned ${me.status}; is --var ignored?`);
   }
   return base;
+}
+
+function withoutForceColor(env) {
+  const { FORCE_COLOR: _, ...rest } = env;
+  return rest;
 }
 
 function tail(file, lines = 40) {
@@ -238,6 +253,7 @@ async function cleanup() {
     if (process.env.YEET_E2E_KEEP) log(`kept temp directory ${tmpRoot}`);
     else rmSync(tmpRoot, { recursive: true, force: true });
   }
+  releaseLock();
 }
 
 let signalCount = 0;
@@ -273,6 +289,7 @@ function writeHarnessSummary(extra) {
   }
   if (interrupted && summary.status !== "error") summary.status = "interrupted";
   summary.args = playwrightArgs;
+  summary.strict = !allowSkips;
   summary.harness = {
     ...summary.harness,
     ...extra,
@@ -281,6 +298,45 @@ function writeHarnessSummary(extra) {
   };
   writeFileSync(SUMMARY_PATH, JSON.stringify(summary, null, 2) + "\n");
   return summary;
+}
+
+// ---------------------------------------------------------------------------
+// One run per checkout
+// ---------------------------------------------------------------------------
+
+function isAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === "EPERM";
+  }
+}
+
+/** Take the checkout's run lock, or return the PID of the run that holds it. */
+function acquireLock() {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = openSync(LOCK_PATH, "wx");
+      writeFileSync(fd, String(process.pid));
+      closeSync(fd);
+      return null;
+    } catch (err) {
+      if (err.code !== "EEXIST") throw err;
+      const pid = Number(readFileSync(LOCK_PATH, "utf-8"));
+      if (pid && isAlive(pid)) return pid;
+      rmSync(LOCK_PATH, { force: true }); // left behind by a run that was killed
+    }
+  }
+  throw new Error(`Could not take ${LOCK_PATH}`);
+}
+
+function releaseLock() {
+  try {
+    if (Number(readFileSync(LOCK_PATH, "utf-8")) === process.pid) rmSync(LOCK_PATH);
+  } catch {
+    // not ours or already gone
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -342,6 +398,15 @@ async function main() {
   return code;
 }
 
+const holder = acquireLock();
+if (holder) {
+  log(
+    `another verify run (PID ${holder}) is already using this checkout; ` +
+      "wait for it to finish (its results go to results/summary.json). Not starting.",
+  );
+  process.exit(2);
+}
+
 let exitCode = 1;
 let harnessError = null;
 try {
@@ -365,5 +430,12 @@ log(
     `server start ${seconds(timings["start wrangler dev"] ?? 0)}, tests ${seconds(timings["tests"] ?? 0)}). ` +
     `Summary: ${relative(process.cwd(), SUMMARY_PATH)}`,
 );
-if (summary.status !== "passed" && exitCode === 0 && summary.status !== "incomplete") exitCode = 1;
+if (summary.status === "incomplete" && !allowSkips) {
+  log(
+    "INCOMPLETE counts as a failure: some selected tests did not run. Use --allow-skips to accept.",
+  );
+  exitCode = 1;
+} else if (summary.status !== "passed" && summary.status !== "incomplete" && exitCode === 0) {
+  exitCode = 1;
+}
 process.exit(interrupted ? 130 : exitCode);

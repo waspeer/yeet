@@ -19,3 +19,4 @@ packages/worker/.dev.vars
 
 # End-to-end harness output
 e2e/results/
+e2e/.verify.lock
