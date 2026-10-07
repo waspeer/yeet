@@ -25,13 +25,37 @@ Nothing touches Cloudflare, your real `~/.config/yeet` or `packages/worker/.dev.
      precedence over a developer's `.dev.vars`, which is neither needed nor
      modified; the harness checks `GET /api/me` with its token before testing;
    - `--test-scheduled`, so tests can trigger the cron;
-   - a free `--inspector-port`, so parallel runs do not collide on 9229.
+   - a free `--inspector-port`, so runs in different checkouts (worktrees) do not
+     collide on 9229.
 4. Runs `playwright test`, passing through any arguments after `--`.
 5. Tears down — also on test failure, Ctrl-C or SIGTERM: kills wrangler's whole
    process group (wrangler, workerd, esbuild) and deletes the temp directory.
 
-Exit code: 0 if everything selected passed (or was skipped), 1 on any failure or
-harness error, 130 when interrupted.
+### Exit codes and strict mode
+
+| exit | meaning                                                                                                            |
+| ---- | ------------------------------------------------------------------------------------------------------------------ |
+| 0    | every selected test ran and passed (`status: "passed"`)                                                            |
+| 1    | a test failed or was flaky, no test matched, the harness failed, or — in strict mode — a selected test was skipped |
+| 2    | another `verify` run is already active in this checkout; nothing was started                                       |
+| 130  | interrupted (Ctrl-C, SIGTERM)                                                                                      |
+
+Strict mode is the default: a skipped test (`test.skip`, `test.fixme`, a
+conditional skip) means something was not verified, so the run exits 1 with
+`status: "incomplete"`. **Verifiers must use the default (strict) mode and treat
+any non-zero exit as "not verified".** While iterating locally you can pass
+`--allow-skips` (`npm run verify -- --allow-skips`) to exit 0 on `incomplete`.
+Filtering with `--grep`/`--project` is not skipping: excluded tests are simply
+not part of the run.
+
+### One run per checkout
+
+A run holds `e2e/.verify.lock` (with its PID) while it works, because runs in the
+same checkout share `results/` and the CLI build. A second run in the same
+checkout refuses to start (exit 2) and names the PID of the active one. A lock
+left by a killed run is detected (PID gone) and taken over. Runs in different
+checkouts or git worktrees are independent and can go in parallel: each gets its
+own free ports and temp directory.
 
 ### Filtering
 
@@ -66,25 +90,30 @@ per test, grouped per project:
 chromium: 4/4 passed
   PASS    1.4s  tests/browser/download.spec.ts › download page › Download saves the exact file under its name
 ...
-Overall: PASSED — 23 passed, 0 failed, 0 flaky, 0 skipped of 23 in 15.0s
+Overall: PASSED — 42 passed, 0 failed, 0 flaky, 0 skipped of 42 in 15.0s
 ```
 
-Machine-readable results go to `results/summary.json` (gitignored):
+Machine-readable results of the latest run go to `results/summary.json`
+(gitignored; overwritten by every run, and never touched by a run refused with
+exit 2):
 
 ```jsonc
 {
   "status": "passed", // passed | failed | incomplete | interrupted | error
-  "totals": { "total": 23, "passed": 23, "failed": 0, "skipped": 0, "flaky": 0 },
+  "totals": { "total": 42, "passed": 42, "failed": 0, "skipped": 0, "flaky": 0 },
   "projects": { "node": { ... }, "chromium": { ... }, "webkit": { ... }, "firefox": { ... } },
   "tests": [{ "project", "file", "title", "tags", "outcome", "durationMs", "attempts", "error?" }],
-  "args": ["--project=webkit"],          // what was passed after --
+  "args": ["--project=webkit"],          // what was passed after -- (minus --allow-skips)
+  "strict": true,                        // false with --allow-skips
   "harness": { "timingsMs": { "prepare", "build CLI", "start wrangler dev", "tests" }, "totalMs" }
 }
 ```
 
 - `passed` means every selected test ran and passed on its first attempt.
-- `incomplete`: nothing failed, but something was skipped (or no test matched).
-  The exit code is 0; read the status, do not treat it as a pass.
+- `incomplete`: nothing failed, but at least one selected test was skipped. Exit 1
+  in strict mode (the default), 0 with `--allow-skips`. Never a pass.
+- `failed`: a test failed or was flaky, or no test matched the filters
+  (Playwright reports "No tests found" as a failure).
 - Retries are off. If you pass `--retries`, a test that passes only on a retry is
   reported as `flaky` and fails the run (`failOnFlakyTests`).
 - `error`: the harness itself failed (e.g. wrangler did not start); see `error`.
@@ -149,9 +178,14 @@ All exported from `lib/index.ts`.
   point to a fresh temp directory (or `configHome`, to keep state between calls),
   inherited `YEET_*` variables are removed, stdin is `stdin` or empty (so
   `login` reads the token from it). `auth: true` sets `YEET_URL`/`YEET_TOKEN` for
-  the test server. `env: { X: undefined }` removes a variable.
+  the test server. `env: { X: undefined }` removes a variable. `FORCE_COLOR` is
+  dropped and `NO_COLOR=1` set, so output is plain.
+- `expectExitCode(result, code)`: asserts the exit code; a failure shows the
+  expected and received code plus the command's stdout and stderr.
+  `describeRun(result)` gives that dump for your own assertion messages.
 - `cliUpload(file, args?, opts?)` → `{ url, id, result }`; runs `yeet upload`
-  with `auth: true` and throws unless it exits 0 with exactly one line on stdout.
+  with `auth: true` and fails unless it exits 0 with exactly one URL on stdout
+  ("stdout was not exactly one URL: …").
 - `newConfigHome()` → a fresh empty config home.
 
 ### HTTP — `api.ts`
@@ -164,10 +198,16 @@ All exported from `lib/index.ts`.
 - `listUploads()`, `deleteUpload(id)`, `idFromUrl(shareUrl)`.
 - `uploadViaApi({ filename, data, expiresInSeconds?, password? })` → `{ id, url }`:
   uploads like the CLI does but with expiry in seconds (the CLI's minimum is 1 minute).
+- `startUpload({ filename, size, expiresInSeconds? })` → id of an upload left
+  pending (POST /api/uploads only, real R2 multipart upload).
 - `submitDownloadForm(shareUrl, password?)` → the raw 303/401/404 response.
+  Without `password` the form has no password field.
 - `signedDownloadUrl(shareUrl, password?)` → the `/_dl/<id>?expires=&sig=` link.
 - `downloadBytes(shareUrl, password?)` → `Buffer`; `downloadSha256(shareUrl,
 password?)` → `{ sha256, size }`, streaming, for large files.
+- `forgeDownloadUrl(id, expires)` → a `/_dl` link correctly signed with the test
+  token for any expiry, e.g. beyond the file's own (the server clamps the links
+  it hands out). Mirrors `signDownload()` in `packages/worker/src/crypto.ts`.
 
 ### Bucket and cron — `bucket.ts`
 
@@ -180,6 +220,11 @@ These talk to wrangler's Local Explorer API
   `{ id, url, meta }`: an upload as yeet < 0.2 / rclone left it — the file plus
   `.meta.json`, neither with R2 custom metadata. `meta` overrides fields of the
   sidecar (e.g. `expires_at` in the past, `password_hash`).
+- `readUploadMeta(id)` → the parsed `.meta.json` (or null);
+  `writeUploadMeta(id, meta, { withSummary = true })` overwrites it, with the
+  `summary` custom metadata the Worker's `writeMeta()` sets, or without it
+  (`withSummary: false`, like an old sidecar). `summarize(meta)` mirrors
+  `summarize()` in `packages/worker/src/uploads.ts`; keep the copies in sync.
 - `randomId()` → a 6-character upload ID.
 - `triggerCron(cron = "0 3 * * *")`: calls `/__scheduled`. The cleanup runs in
   `waitUntil()`, so poll for its effect with `eventually()`.
