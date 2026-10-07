@@ -16,3 +16,6 @@ skills-lock.json
 
 # Secrets
 packages/worker/.dev.vars
+
+# End-to-end harness output
+e2e/results/
