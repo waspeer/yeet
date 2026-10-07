@@ -25,6 +25,25 @@ copied verbatim into `packages/cli` (Node) and `packages/worker` (Worker + brows
   on the default `CompressionStream("deflate-raw")` would require `>=20.12` (measured).
 - Timestamps: DOS date/time in the producer's local zone plus the Info-ZIP UTC
   extended-timestamp extra (0x5455). UTF-8 flag (bit 11) always set.
+- Extra fields: the ZIP64 extra (0x0001), when present, is always the **first** extra field,
+  before UT (0x5455). Windows 7 Explorer reportedly requires that.
+- Filenames: the core NFC-normalizes paths and rejects collisions after NFC and case
+  folding. Windows-illegal names are fixed by an opt-in `sanitizeForWindows` helper, which
+  the CLI and browser apply (see [Filename policy](#filename-policy)).
+- On macOS, **Archive Utility is the reference reader**. `ditto` is not a usable proxy past
+  4 GiB: it mis-extracts valid archives (see the reader matrix).
+
+Revision 2 (after independent verification): extra-field order, filename policy,
+must-test list, known limitations and the `ditto` >4 GiB finding were added. All suites
+were re-run after the extra-field change; nothing regressed:
+
+| Suite                                 | Result                                                                                           |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| Node                                  | ALL PASS: 95 passing checks, 9 expected failures (the non-policy variants and the empty archive) |
+| workerd                               | ALL PASS (`ditto` expected to fail on UTC mtimes)                                                |
+| Chromium / WebKit / Firefox           | ALL PASS                                                                                         |
+| >4 GiB suite (6 archives × 9 readers) | all pass except `ditto` on the odd-size layout (expected)                                        |
+| Archive Utility                       | 10/10, including >4 GiB and odd sizes                                                            |
 
 ## Interface
 
@@ -66,6 +85,8 @@ export function createZip(
 export function isCompressedPath(path: string): boolean;
 export const COMPRESSED_EXTENSIONS: ReadonlySet<string>;
 export function crc32Js(data: Uint8Array, previous?: number): number;
+/** Opt-in: make a "/"-separated path extractable by Windows Explorer (not applied by createZip). */
+export function sanitizeForWindows(path: string): string;
 ```
 
 The prototype also has `zip64?: "auto" | "always"` and an `experimental` object. Both exist
@@ -91,7 +112,8 @@ the `"mirror"` variant break `ditto`, see below).
   sniffs the runtime, so the copied file is identical in both packages. Each caller picks
   its fastest primitives.
 - **Errors and cancellation.** These are all tested:
-  - invalid paths (absolute, `..`, drive letters) and duplicate paths throw;
+  - invalid paths (absolute, `..`) throw, and so do paths that collide after NFC
+    normalization or case folding;
   - a source error errors the zip stream;
   - cancelling the zip stream cancels the current entry's source, in both store and
     deflate mode.
@@ -129,12 +151,57 @@ source is pulled only after the previous entry finished.
 | ZIP64 local header         | When `size` is unknown or `>= 4 GiB − 16 MiB`. Then: version needed 4.5, 32-bit sizes `0xFFFFFFFF`, ZIP64 extra with zeros.                                                                                             | The 16 MiB margin covers deflate expansion of incompressible data (measured: +0.03 %). `0xFFFFFFFF` + extra is the spec-consistent form, the same one Python's streaming writer uses. A variant with zero 32-bit sizes also passed every reader, but it puts ZIP64 fields behind non-`0xFFFFFFFF` values, which APPNOTE forbids. |
 | ZIP64 central extra        | Only the overflowing fields, in spec order (size, compressed size, offset)                                                                                                                                              | Measured: `ditto` **rejects** a stored entry whose central header carries ZIP64 sizes below 4 GiB (`zip64: "always"` and `"mirror"` variants; deflated entries were fine). Writing only what overflows also matches APPNOTE 4.5.3 and Go issue 33116 (unneeded fields broke 7-Zip, Keka, The Unarchiver, …).                     |
 | ZIP64 end record + locator | Only when entries `>= 65535` or central-directory offset/size `>= 0xFFFFFFFF`                                                                                                                                           | 70,000-entry archive passes in all readers, including Archive Utility.                                                                                                                                                                                                                                                           |
-| Version made by / needed   | made by Unix (3), version 2.0, or 4.5 for ZIP64 entries; external attrs `0100644` / `040755`                                                                                                                            | Gives sane permissions with `unzip`/`ditto`/`bsdtar`.                                                                                                                                                                                                                                                                            |
-| Filenames                  | Always UTF-8 with bit 11                                                                                                                                                                                                | Ü, 日本語, emoji, em dash round-trip in every tested reader. ASCII is valid UTF-8, so there is no reason to branch.                                                                                                                                                                                                              |
-| Timestamps                 | DOS date/time in the producer's local zone (`timeZoneOffset` overrides), plus UT extra (0x5455) with UTC mtime                                                                                                          | Measured: `unzip`, `bsdtar`, `7za` and **Archive Utility** use the UT extra. **`ditto` uses the DOS fields only**: a zip made in workerd (UTC) extracted 2 h early with `ditto` on a CEST machine, and correct with `?tz=120`. The CLI and browser produce local time, so they are correct everywhere.                           |
+| Version made by / needed   | made by Unix (3), version 2.0, or 4.5 for ZIP64 entries; external attrs `0100644` / `040755`                                                                                                                            | Gives sane permissions with `unzip`/`ditto`/`bsdtar`. An entry whose only ZIP64 field is its offset gets 4.5 in the central header but 2.0 in its local header (see known limitations).                                                                                                                                          |
+| Extra-field order          | ZIP64 (0x0001) first, then UT (0x5455), in local and central headers                                                                                                                                                    | zip_kit's implementation notes (github.com/julik/zip_kit, IMPLEMENTATION_DETAILS.md) report that Windows 7 Explorer only finds ZIP64 as the first extra. Not verified on Windows. No regression in any local reader after the change (re-run below).                                                                             |
+| Filenames                  | Always UTF-8 with bit 11; NFC-normalized; "/" is the only separator                                                                                                                                                     | Ü, 日本語, emoji, em dash round-trip in every tested reader. ASCII is valid UTF-8, so there is no reason to branch. See [Filename policy](#filename-policy).                                                                                                                                                                     |
+| Timestamps                 | DOS date/time in the producer's local zone (`timeZoneOffset` overrides), plus UT extra (0x5455) with UTC mtime, clamped to 0..2³¹−1                                                                                     | Measured: `unzip`, `bsdtar`, `7za` and **Archive Utility** use the UT extra. **`ditto` uses the DOS fields only**: a zip made in workerd (UTC) extracted 2 h early with `ditto` on a CEST machine, and correct with `?tz=120`. The CLI and browser produce local time, so they are correct everywhere.                           |
 | Directories                | Path ending in `/`: stored, no descriptor                                                                                                                                                                               | Supported (an empty dir round-trips). Whether the CLI emits empty dirs is a product call.                                                                                                                                                                                                                                        |
 | Store list                 | `isCompressedPath`: mp3 m4a aac ogg oga opus flac wma, mp4 m4v mov mkv webm avi wmv, jpg jpeg png gif webp heic heif avif jxl, zip gz tgz bz2 xz zst 7z rar br lz4, docx xlsx pptx odt ods odp epub jar apk ipa dmg pdf | Deflating these costs CPU for about 0 % gain (the random-data rows below show the throughput cost). `pdf` is borderline (some PDFs are uncompressed); keep it or drop it.                                                                                                                                                        |
 | Empty archive              | Byte-identical to Python's empty `ZipFile`                                                                                                                                                                              | `unzip` warns "zipfile is empty" (exit 1) and `ditto` rejects it. **The CLI must refuse an empty selection** rather than upload such a zip.                                                                                                                                                                                      |
+
+## Filename policy
+
+The core enforces only rules that hold for every recipient platform. Platform-specific
+renaming is an explicit, opt-in step. All of the rules below are implemented in the
+prototype and tested in `scripts/node-test.ts`.
+
+**In the core (`createZip`), always:**
+
+1. **NFC-normalize every path.** macOS file APIs and some browsers hand out NFD names
+   (`e` + U+0301). Windows and Linux tools then show or compare them differently.
+   Tested: an NFD input is stored as NFC.
+2. **Reject collisions after NFC and case folding** (`path.toLowerCase()`), rather than
+   de-duplicate them. Two such entries overwrite each other when extracted on macOS
+   (case-insensitive APFS by default) and on Windows, so the zip would silently lose a file.
+   - Why throw and not rename: renaming inside the core would change user-visible paths
+     without the caller knowing.
+   - The CLI already has the full file list before zipping (it stats every file for sizes),
+     so it can pre-flight the same check and either error early or rename (e.g. `name (2).ext`).
+   - Tested: `café` composed vs decomposed, and `Readme.TXT` vs `readme.txt`.
+3. **"/" is the only separator; a backslash is a literal character.** It is legal in
+   macOS and Linux names, and silently splitting on it would invent directories. Tested:
+   `back\slash.txt` round-trips as one name.
+4. **Reject absolute paths and `..` segments.** Drop `.` and empty segments.
+
+**`sanitizeForWindows(path)` (exported helper, applied by the CLI and the browser before
+`createZip`):**
+
+- Replaces `< > : " \ | ? *` and control characters with `_`. Finder shows a POSIX `:` as
+  `/`, so `:` really occurs in Mac names.
+- Strips trailing dots and spaces from each segment; a segment that becomes empty becomes `_`.
+- Prefixes reserved device names with `_`: CON, PRN, AUX, NUL, COM0–9, LPT0–9, also with
+  an extension (e.g. `CON.txt`).
+- Leaves paths of 260+ characters alone. Renaming cannot fix them reliably, so the caller
+  should warn.
+- Renames can create new collisions; `createZip` catches those.
+
+**Why the core stays neutral:**
+
+- yeet does not know the recipient's OS. Sanitizing always is cheap and only changes names
+  that would fail on Windows anyway, so callers should apply it by default.
+- Keeping it out of the core keeps the core spec-pure and testable. A future caller that
+  wants exact names (e.g. a Linux-to-Linux transfer flag) can skip the helper.
+- The helper is in the same file, so both packages get an identical copy.
 
 ## Compression and CRC strategy per runtime
 
@@ -203,15 +270,16 @@ Fixture set (`fixtures.ts`, 9 entries, ~12.8 MB uncompressed):
 
 Each fixture set was written in three variants: all sizes known, all unknown (ZIP64 local
 headers), and mixed. Validation checks every entry's SHA-256 against an independent manifest
-computed in Node, plus mtimes where the extractor sets them.
+computed in Node, plus mtimes where the extractor sets them. A wrong mtime counts as a
+failure. Every archive also goes through the structural checker.
 
-| Runtime                            | Version                                                                              | Result                                                                                 |
-| ---------------------------------- | ------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------- |
-| Node                               | 24.16.0 (also 20.12.0, 20.20.2, 22.0.0, 26.9.0 with a reduced reader set)            | PASS: all readers, all default variants, 70k entries, error/cancel paths               |
-| workerd via `wrangler dev` (local) | wrangler 4.148.0, workerd 2026-10-06, compat date 2026-10-01, **no** `nodejs_compat` | PASS: all readers. `ditto` shows the UTC mtime shift unless `timeZoneOffset` is set.   |
-| Chromium (Playwright)              | 153.0.8010.12                                                                        | PASS: all readers, including zips built from real `File` objects                       |
-| WebKit (Playwright)                | 26.6                                                                                 | PASS (its deflate output differs in bytes, 8,232,128 vs 8,244,712, and is still valid) |
-| Firefox (Playwright)               | 155.0                                                                                | PASS                                                                                   |
+| Runtime                            | Version                                                                              | Result                                                                                         |
+| ---------------------------------- | ------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------- |
+| Node                               | 24.16.0 (also 20.12.0, 20.20.2, 22.0.0, 26.9.0 with a reduced reader set)            | PASS: all readers, all default variants, 70k entries, error/cancel paths                       |
+| workerd via `wrangler dev` (local) | wrangler 4.148.0, workerd 2026-10-06, compat date 2026-10-01, **no** `nodejs_compat` | PASS, except `ditto` (expected failure: wrong mtime, see below) unless `timeZoneOffset` is set |
+| Chromium (Playwright)              | 153.0.8010.12                                                                        | PASS: all readers, including zips built from real `File` objects                               |
+| WebKit (Playwright)                | 26.6                                                                                 | PASS (its deflate output differs in bytes, 8,232,128 vs 8,244,712, and is still valid)         |
+| Firefox (Playwright)               | 155.0                                                                                | PASS                                                                                           |
 
 `CompressionStream` in all three engines and workerd supports `deflate-raw`, `deflate` and
 `gzip` (tested).
@@ -240,11 +308,38 @@ Tested on macOS 26.6.2 (25G83). Readers:
 | deflated 4.5 GiB → 28.1 MB (only uncompressed size > 4 GiB)                      | ✅                    | ✅     | ✅                                                       | not run         | ✅                    | ✅                                   |
 | deflated incompressible 4.5 GiB (compressed size > 4 GiB), size unknown          | ✅                    | ✅     | ✅                                                       | ✅              | ✅                    | ✅                                   |
 | 4 × 1.2 GiB stored, no ZIP64 local headers, 5th entry and central dir past 4 GiB | ✅                    | ✅     | ✅                                                       | not run         | ✅                    | ✅                                   |
+| stored odd sizes past 4 GiB: 262,140 B + 5 × (1000 MiB − 1), sizes known         | ✅                    | ✅     | ❌ **exit 0 with wrong files** (see below)               | ✅ (4.6 s)      | ✅                    | ✅                                   |
 | empty archive (0 entries)                                                        | ⚠️ "zipfile is empty" | ✅     | ❌ (same for Python's own empty zip)                     | not run         | ✅                    | ✅ t                                 |
 
-`ditto` is **not** a perfect proxy for Archive Utility: Archive Utility accepted the
-`zip64: "always"` file that `ditto` rejected, and Archive Utility honors the UT timestamp
-while `ditto` does not. The chosen policy passes both.
+**`ditto` must not be used as a stand-in for Archive Utility, especially past 4 GiB.
+Archive Utility (the real app) is the macOS reference.** The evidence:
+
+- **Odd-size stored entries past 4 GiB.** `ditto` fails on archives larger than 4 GiB
+  that contain stored data-descriptor entries whose size is not a multiple of 1 MiB.
+  - The independent verifier found it with 262,140 B and 1000 MiB − 1 entries. It saw
+    "Couldn't read pkzip signature" and, once, exit 0 with a corrupted 4.7 GB file.
+  - The verifier reports that Python's own streaming writer triggers the same failure.
+  - My re-run reproduced the silent variant: `ditto` exited 0, but files were missing and
+    others had wrong sizes (e.g. `small-odd.bin` 1,048,838,202 B instead of 262,140 B).
+  - All other readers, the structural checker and **Archive Utility** extracted the same
+    archive correctly.
+  - My original >4 GiB entries were all 1 MiB multiples, which hid this.
+- **ZIP64 central sizes below 4 GiB.** Archive Utility accepted the `zip64: "always"` file
+  that `ditto` rejected.
+- **Timestamps.** Archive Utility honors the UT timestamp; `ditto` does not.
+
+The chosen policy passes Archive Utility and every other reader in every row above.
+
+**Structural check.** Every archive written with the chosen policy also passes the
+verifier's strict parser `prototypes/0c-zip/scripts/check.py`, run as the "structural"
+reader in all suites. That includes:
+
+- the fixtures from Node, workerd and the three browsers;
+- the 65,534/65,535/70,000-entry archives;
+- all six >4 GiB archives.
+
+It rejects the non-policy variants: `zip64: "always"` and central "mirror" (unneeded ZIP64
+fields), and zero 32-bit sizes behind a local ZIP64 extra.
 
 All >4 GiB archives were written to the OS temp dir and deleted afterwards. These are the
 sizes on disk:
@@ -255,15 +350,34 @@ sizes on disk:
 | stored 4.5 GiB entry, size unknown | 4,831,838,706 |
 | deflated incompressible 4.5 GiB    | 4,833,313,321 |
 | 4 × 1.2 GiB stored                 | 5,153,961,560 |
+| stored odd sizes                   | 5,243,143,199 |
 
-### Not tested (do not assume)
+### Not tested: human-in-the-loop checks before release
 
-- **Windows Explorer** (any version), including its UTF-8 flag and ZIP64 handling. From
-  research: Explorer is reported to reject central ZIP64 extras with fields that do not
-  overflow, which the chosen policy avoids. Not verified.
-- Modern 7-Zip (only p7zip 16.02 from 2016), WinRAR, The Unarchiver, Keka, BetterZip.
-- Linux distribution `unzip` builds, Android, iOS/iPadOS Files app.
-- Real Safari (Playwright WebKit is not Safari), mobile browsers.
+Each of these needs a person on a real device. Use the archives the suites generate:
+fixtures with sizes known and unknown, a >4 GiB archive with odd-size stored entries, and
+awkward names (NFD, `:`, `?`, `CON.txt`, trailing dot/space, Ü/日本語/emoji, a 260+
+character path).
+
+- **Windows 11 Explorer** ("Extract all" and opening the zip as a folder):
+  1. a normal archive with sizes known;
+  2. sizes unknown, i.e. ZIP64 local headers on small entries;
+  3. a >4 GiB archive (stored and deflated);
+  4. awkward names, with and without `sanitizeForWindows`.
+
+  From research: Explorer is reported to reject central ZIP64 extras with fields that do
+  not overflow (avoided by the policy), and Windows 7 is reported to need ZIP64 as the
+  first extra (now done). Neither is verified.
+
+- **iOS / iPadOS Files app** (tap to expand), small and >4 GiB.
+- **Android Files** (Google Files) plus one third-party unzip app (e.g. ZArchiver or RAR).
+  Android apps built on Java `ZipInputStream` / Commons Compress may reject stored entries
+  with data descriptors (see known limitations).
+- **Older macOS Archive Utility**: only macOS 26.6.2 was tested.
+- Modern 7-Zip (only p7zip 16.02 from 2016 was tested), WinRAR, The Unarchiver, Keka,
+  BetterZip.
+- Linux distribution `unzip` builds.
+- Real Safari (Playwright WebKit is not Safari) and mobile browsers.
 - **Production** Cloudflare Workers (only local `wrangler dev`); CPU limits there.
 - Browser zipping of large real files read from disk via `File.stream()`. Tested: in-memory
   `File`s, plus stems served over localhost for the deflate benchmark only.
@@ -396,6 +510,88 @@ Browser: entries from `FileList` / drag-and-drop with `webkitRelativePath`, then
 Copying: `zip.ts` lives byte-identical in `packages/cli/src/` and `packages/worker/src/`
 (exact location is up to the implementing session), with a root `scripts/check-zip-copies`
 that compares hashes in CI or a pre-commit step.
+
+## Must-test list for the production implementation
+
+The test-first session should treat each item as a required test. Items marked (proto)
+already exist in `prototypes/0c-zip/scripts/` and can be ported.
+
+1. **Structural validator as a test oracle.** Port or reuse `prototypes/0c-zip/scripts/check.py`
+   (the independent verifier's parser, kept verbatim as the reference) (proto). It checks
+   both views of the archive (central directory and sequential local headers):
+   - flags and UTF-8 bit;
+   - version needed / made by;
+   - 32-bit vs ZIP64 sizes, and ZIP64 extra contents (only overflowing fields);
+   - presence of the ZIP64 end record and locator;
+   - UT extra and DOS date/time against the expected zone;
+   - descriptor signature and width;
+   - contiguous offsets, CRC and SHA-256;
+   - the ZIP64 policy itself (local ZIP64 iff size unknown or ≥ 4 GiB − 16 MiB).
+2. **Descriptor width asserted structurally:** 24 bytes iff the local ZIP64 extra is
+   present, 16 otherwise. Never inferred from a reader accepting the file, and never via
+   `ditto` (proto via check.py).
+3. **mtime skew is a failure, not a note** (proto). Assert DOS date/time and the UT value
+   directly, then after extraction. Cover:
+   - UTC and non-UTC producer zones (`timeZoneOffset`, and the process TZ via `TZ=...`);
+   - **both sides of a DST transition** (e.g. Europe/Amsterdam, last Sunday of March and of
+     October), since the default offset is taken per entry mtime;
+   - odd seconds (DOS has 2 s resolution: round down);
+   - pre-1980 clamping, and post-2038 UT clamping (2³¹−1).
+4. **ZIP64 end-record boundary:** 65,534 entries → no ZIP64 end record; 65,535 → present
+   (asserted structurally, proto). Also a central-directory offset just below and above
+   4 GiB.
+5. **The 16 MiB ZIP64 margin:** a declared size of exactly `0xFFFFFFFF − 16 MiB − 1`
+   (no ZIP64) vs `0xFFFFFFFF − 16 MiB` (ZIP64). Use a synthetic stream that does not touch
+   disk.
+6. **The "exceeds 4 GiB without ZIP64 local header" guard.** It is unreachable with
+   honest size hints and a real deflater, because deflate expands by far less than 16 MiB.
+   Test it with a small declared size (e.g. 1 byte, matching the input) and an injected
+   `deflateRaw` that emits more than 4 GiB. The stream must error instead of writing a
+   32-bit descriptor.
+7. **Size-hint mismatch** (shorter and longer than declared) errors the stream (proto).
+8. **Stored odd-size entries past 4 GiB** (e.g. 262,140 B and 1000 MiB − 1, total > 4 GiB)
+   in Archive Utility and the structural checker (proto).
+9. **Deflated entries whose compressed size exceeds 4 GiB** (incompressible input, size
+   unknown) (proto).
+10. **Extra-field order:** ZIP64 is the first extra in local and central headers when
+    present (assert bytes).
+11. **Filename policy** (proto):
+    - NFC normalization;
+    - case-insensitive and NFC collisions throw;
+    - backslash stays literal;
+    - `sanitizeForWindows` table: `:`, `?`, `CON.txt`, `nul`, trailing dot/space, `...`, Unicode untouched.
+12. **Error and cancel paths** (proto):
+    - source error propagates;
+    - cancelling the zip cancels the active source (store and deflate);
+    - invalid paths throw.
+13. **Cross-runtime:** the same module in Node, workerd (no `nodejs_compat`) and
+    Chromium/WebKit/Firefox, validated with the structural checker (proto).
+14. **Copy check:** the CLI and Worker copies of `zip.ts` are byte-identical.
+15. **Tooling guard:** the 7za binary from `7zip-bin` is executable; fail with a `chmod`
+    hint if not (proto: `assertSevenZip`).
+
+## Known limitations
+
+- **Strict streaming readers reject stored entries with data descriptors.** A reader that
+  does not use the central directory cannot find the end of a stored entry whose sizes are
+  only in the trailing descriptor. That covers Java `ZipInputStream` and Apache Commons
+  Compress `ZipArchiveInputStream` without `allowStoredEntriesWithDataDescriptor`, which
+  are common in Android apps.
+  - Deflated entries are fine, because the deflate stream terminates itself.
+  - Stored + descriptor is inherent to streaming without seeking. The only alternative is
+    knowing the CRC before writing the header, which needs a second read of the file.
+  - Not tested here. Listed for the Android check above.
+- **UT mtime is a signed 32-bit value** (Info-ZIP reads it as signed), so it is clamped
+  at 2038-01-19. Later mtimes keep a correct DOS date (up to 2107) but a saturated UT.
+- **Version needed differs between local (2.0) and central (4.5)** for an entry whose only
+  ZIP64 field is its offset (it starts past 4 GiB but has a known small size). The local
+  header was written before the offset mattered for the central record. Python's writer
+  does the same. All tested readers, including Archive Utility, accept it. `check.py`
+  reports it as a note.
+- **`7zip-bin`'s `7za` lacks the exec bit** when npm install scripts are blocked (as on this
+  machine). The validator now checks for it and prints a `chmod +x` hint.
+- **Empty archives** are rejected or warned about by `unzip` and `ditto`; callers must
+  refuse an empty selection.
 
 ## Risks and open questions
 
