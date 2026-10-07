@@ -68,6 +68,39 @@ const harness = {
     const bytes = await bytesOf(createZip(entries, { timeZoneOffset: tzOffset }));
     return { base64: toBase64(bytes), ms: performance.now() - t0 };
   },
+  /** CompressionStream("deflate-raw") on files fetched from the harness server (held in memory first). */
+  async benchUrls(urls: string[]) {
+    const files = await Promise.all(
+      urls.map(async (u) => new Uint8Array(await (await fetch(u)).arrayBuffer())),
+    );
+    const total = files.reduce((a, f) => a + f.length, 0);
+    let best = Infinity;
+    let out = 0;
+    for (let run = 0; run < 3; run++) {
+      const t = performance.now();
+      out = 0;
+      for (const f of files) {
+        const source = new ReadableStream<Uint8Array>({
+          start(c) {
+            for (let i = 0; i < f.length; i += 1 << 16) c.enqueue(f.subarray(i, i + (1 << 16)));
+            c.close();
+          },
+        });
+        out += (
+          await bytesOf(
+            source.pipeThrough(
+              new CompressionStream("deflate-raw") as unknown as ReadableWritablePair<
+                Uint8Array,
+                Uint8Array
+              >,
+            ),
+          )
+        ).length;
+      }
+      best = Math.min(best, performance.now() - t);
+    }
+    return { bytes: total, "deflate-raw MB/s": total / 1e6 / (best / 1000), ratio: out / total };
+  },
   /** Throughput of crc32Js and CompressionStream("deflate-raw") on 64 MiB of random and synthetic WAV data. */
   async bench() {
     const size = 64 * 1024 * 1024;

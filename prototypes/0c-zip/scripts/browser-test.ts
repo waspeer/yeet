@@ -1,7 +1,11 @@
 // Browsers: bundle browser/harness.ts (which imports the same zip.ts), load it
 // in Chromium, WebKit and Firefox via Playwright, build zips in the page,
-// return the bytes to Node and validate them. Usage: node scripts/browser-test.ts [--bench]
-import { writeFile, mkdtemp, rm } from "node:fs/promises";
+// return the bytes to Node and validate them.
+// Usage: node scripts/browser-test.ts [--bench] [--stems]
+// --stems serves the real stems folder (read-only, streamed from disk, never copied) to the page
+// and measures CompressionStream("deflate-raw") on it.
+import { createReadStream } from "node:fs";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,6 +17,9 @@ import { manifestOf, printResults, validateZip } from "./validate.ts";
 const here = new URL(".", import.meta.url).pathname;
 const MTIME = Date.UTC(2026, 9, 7, 12, 34, 56);
 const bench = process.argv.includes("--bench");
+const stems = process.argv.includes("--stems");
+const STEMS = "/Users/wannessalome/Downloads/tien-voor-sil-148bpm";
+const stemNames = stems ? (await readdir(STEMS)).filter((n) => n.endsWith(".wav")).sort() : [];
 
 const bundle = await esbuild.build({
   entryPoints: [join(here, "../browser/harness.ts")],
@@ -25,9 +32,15 @@ const script = bundle.outputFiles[0].text;
 const html = `<!doctype html><meta charset="utf-8"><title>zip harness</title><script>${script}</script>`;
 
 // Served from localhost so the page is a secure context, like the real upload page.
-const server = createServer((_, res) =>
-  res.writeHead(200, { "content-type": "text/html" }).end(html),
-);
+const server = createServer((req, res) => {
+  const name = decodeURIComponent(req.url ?? "/").replace(/^\/stems\//, "");
+  if (req.url?.startsWith("/stems/") && stemNames.includes(name)) {
+    res.writeHead(200, { "content-type": "application/octet-stream" });
+    createReadStream(join(STEMS, name)).pipe(res);
+    return;
+  }
+  res.writeHead(200, { "content-type": "text/html" }).end(html);
+});
 await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
 const url = `http://127.0.0.1:${(server.address() as { port: number }).port}/`;
 
@@ -46,6 +59,15 @@ try {
           "bench:",
           JSON.stringify(await page.evaluate(() => (globalThis as any).zipHarness.bench())),
         );
+      if (stems) {
+        const urls = stemNames.map((n) => `${url}stems/${encodeURIComponent(n)}`);
+        console.log(
+          "stems:",
+          JSON.stringify(
+            await page.evaluate((u) => (globalThis as any).zipHarness.benchUrls(u), urls),
+          ),
+        );
+      }
       for (const [sizes, viaFiles] of [
         ["known", true],
         ["unknown", false],
