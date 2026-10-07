@@ -39,6 +39,20 @@ const credentials: { name: string; headers: () => Record<string, string> }[] = [
     name: "the right token without the Bearer prefix",
     headers: () => ({ Authorization: server.token }),
   },
+  // Prefix and suffix variants catch a startsWith()/includes() comparison.
+  {
+    name: "the token with an extra character",
+    headers: () => ({ Authorization: `Bearer ${server.token}x` }),
+  },
+  {
+    name: "the token missing its last character",
+    headers: () => ({ Authorization: `Bearer ${server.token.slice(0, -1)}` }),
+  },
+  { name: "an empty bearer token", headers: () => ({ Authorization: "Bearer " }) },
+  {
+    name: "the token after two spaces",
+    headers: () => ({ Authorization: `Bearer  ${server.token}` }),
+  },
 ];
 
 test.describe("API authentication", () => {
