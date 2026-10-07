@@ -92,14 +92,16 @@ file.
 ### Server settings
 
 Set these in the Cloudflare dashboard under **Workers → yeet → Settings →
-Variables and secrets**, or in `packages/worker/wrangler.jsonc`:
+Variables and secrets**. Only `UPLOAD_TOKEN` is required; the others have
+defaults in the code, so `wrangler.jsonc` lists no vars (vars listed there would
+overwrite your dashboard values on every deploy).
 
-| Name               | Type   | Description                                                                        |
-| ------------------ | ------ | ---------------------------------------------------------------------------------- |
-| `UPLOAD_TOKEN`     | secret | Token the CLI authenticates with. Changing it also invalidates open download links |
-| `UPLOADS_PREFIX`   | var    | Key prefix inside the bucket (default `uploads`)                                   |
-| `DOWNLOAD_URL_TTL` | var    | Lifetime of a download link after the password check, in seconds (default `3600`)  |
-| `SENTRY_DSN`       | secret | Optional. Enables Sentry error reporting, including session replay on errors       |
+| Name               | Type   | Description                                                                                                                                |
+| ------------------ | ------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `UPLOAD_TOKEN`     | secret | At least 16 characters. Used by the CLI and to log in at `/upload`. Changing it logs out every browser and invalidates open download links |
+| `UPLOADS_PREFIX`   | var    | Key prefix inside the bucket (default `uploads`)                                                                                           |
+| `DOWNLOAD_URL_TTL` | var    | Lifetime of a download link after the password check, in seconds (default `3600`)                                                          |
+| `SENTRY_DSN`       | secret | Optional. Enables Sentry error reporting, including session replay on errors. Without it, no Sentry code runs                              |
 
 ### Your own domain
 

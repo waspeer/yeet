@@ -11,11 +11,12 @@
   "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "yeet" }],
   // Daily cleanup of expired and abandoned uploads.
   "triggers": { "crons": ["0 3 * * *"] },
-  "vars": {
-    // Key prefix inside the bucket.
-    "UPLOADS_PREFIX": "uploads",
-    // Lifetime of a download link handed out after the password check, in seconds.
-    "DOWNLOAD_URL_TTL": "3600",
-  },
+  // Erik's links live on <name>.<account>.workers.dev; per-version preview
+  // URLs would expose every deployed version under its own hostname.
+  "workers_dev": true,
+  "preview_urls": false,
+  // No "vars": UPLOADS_PREFIX and DOWNLOAD_URL_TTL have defaults in the code
+  // and can be set in the dashboard. Vars listed here would overwrite the
+  // dashboard values on every deploy.
   "observability": { "enabled": true },
 }
