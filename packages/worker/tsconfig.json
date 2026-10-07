@@ -12,5 +12,5 @@
     "noEmit": true
   },
   "include": ["src/**/*"],
-  "exclude": ["src/client.tsx"]
+  "exclude": ["src/client.tsx", "src/upload"]
 }
