@@ -68,20 +68,23 @@ const cases: Case[] = [
     label: "zip64 always",
     entries: () => fixtureEntries({ sizes: "known" }),
     options: { zip64: "always" },
-    expectFail: ["ditto -x -k"],
+    // Not the policy: ditto rejects it, and check.py flags unneeded ZIP64.
+    expectFail: ["ditto -x -k", "structural"],
     mtime: MTIME,
   },
   {
     label: "sizes unknown, central ZIP64 mirrors local (experimental)",
     entries: () => fixtureEntries({ sizes: "unknown" }),
     options: { experimental: { centralZip64: "mirror" } },
-    expectFail: ["ditto -x -k"],
+    expectFail: ["ditto -x -k", "structural"],
     mtime: MTIME,
   },
   {
     label: "sizes unknown, ZIP64 local with zero 32-bit sizes (experimental)",
     entries: () => fixtureEntries({ sizes: "unknown" }),
     options: { experimental: { localSizes: "zero" } },
+    // Readers accept it, but ZIP64 fields behind non-0xFFFFFFFF values violate APPNOTE.
+    expectFail: ["structural"],
     mtime: MTIME,
   },
   {
@@ -108,6 +111,7 @@ const cases: Case[] = [
       "bsdtar",
       "bsdtar (stdin)",
       "7za t",
+      "structural",
     ],
   },
 ];

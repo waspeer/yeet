@@ -49,6 +49,13 @@ const small: ZipEntry = {
   size: 3,
   stream: () => generatedStream(3, (c) => c.set([0x61, 0x62, 0x0a])),
 };
+const oddEntry = (path: string, size: number): ZipEntry => ({
+  path,
+  compress: false,
+  lastModified: MTIME,
+  size,
+  stream: () => generatedStream(size, blockFill, 1 << 20),
+});
 
 const cases: { label: string; entries: () => ZipEntry[]; options?: ZipOptions; timeout: number }[] =
   [
@@ -114,6 +121,16 @@ if (process.argv.includes("--big")) {
       options: { deflateRaw: zlib1, crc32: zlib.crc32 },
       timeout: 300,
     },
+    {
+      // The layout ditto fails on (stored, odd sizes, past 4 GiB).
+      label: "stored odd sizes (262,140 B + 5 x (1000 MiB - 1)) past 4 GiB",
+      entries: () => [
+        oddEntry("small-odd.bin", 262_140),
+        ...[1, 2, 3, 4, 5].map((i) => oddEntry(`odd${i}.bin`, 1000 * 1024 * 1024 - 1)),
+        small,
+      ],
+      timeout: 300,
+    },
   );
 }
 
@@ -149,7 +166,7 @@ for (const c of cases) {
       continue;
     }
     const { problems, skew } = await compareDir(out, manifest, MTIME);
-    const ok = problems.length === 0;
+    const ok = problems.length === 0 && skew.length === 0; // wrong mtime is a failure
     console.log(
       `  ${ok ? "PASS" : "FAIL"}  ${c.label} [${seconds} s]${ok ? "" : ": " + problems.slice(0, 3).join("; ")}${skew.length ? ` (mtime skew on ${skew.length})` : ""}`,
     );

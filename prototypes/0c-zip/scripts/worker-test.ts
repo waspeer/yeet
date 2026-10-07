@@ -58,8 +58,18 @@ try {
     await pipeline(Readable.fromWeb(response.body as never), createWriteStream(path));
     const size = (await stat(path)).size;
     const manifest = await manifestOf(fixtureEntries({ sizes }));
-    const results = await validateZip(path, manifest, { mtime: MTIME });
-    const expectFail = query.includes("zip64=always") ? ["ditto -x -k"] : [];
+    // workerd's local zone is UTC unless ?tz= is given.
+    const tz = new URLSearchParams(query).get("tz");
+    const results = await validateZip(path, manifest, {
+      mtime: MTIME,
+      tzMinutes: tz ? Number(tz) : 0,
+    });
+    // ditto reads only the DOS time, so UTC-written zips extract with an
+    // mtime shifted by this machine's offset; zip64=always is not the policy.
+    const expectFail = [
+      ...(tz ? [] : ["ditto -x -k"]),
+      ...(query.includes("zip64=always") ? ["structural"] : []),
+    ];
     allOk = printResults(`workerd /zip?${query} — ${size} bytes`, results, expectFail) && allOk;
   }
 } finally {

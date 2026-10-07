@@ -51,7 +51,12 @@ const zlib1 = () =>
     readable: ReadableStream<Uint8Array>;
   };
 
-const cases: { label: string; entries: () => ZipEntry[]; options?: ZipOptions }[] = [
+const cases: {
+  label: string;
+  entries: () => ZipEntry[];
+  options?: ZipOptions;
+  expectFail?: string[];
+}[] = [
   {
     label: "stored 4.5 GiB entry (size known) + small file at offset > 4 GiB",
     entries: () => [
@@ -82,6 +87,19 @@ const cases: { label: string; entries: () => ZipEntry[]; options?: ZipOptions }[
       entry("after.txt", 1000, textFill, true, false),
     ],
     options: { deflateRaw: zlib1, crc32: zlib.crc32 },
+  },
+  {
+    // Found by the independent verifier: all sizes above are 1 MiB multiples,
+    // which hid a ditto bug with stored data-descriptor entries past 4 GiB.
+    label: "stored odd-size entries (262,140 B + 5 x (1000 MiB - 1)) past 4 GiB",
+    entries: () => [
+      entry("small-odd.bin", 262_140, stampedFill, false),
+      ...[1, 2, 3, 4, 5].map((i) =>
+        entry(`odd${i}.bin`, 1000 * 1024 * 1024 - 1, stampedFill, false),
+      ),
+      entry("after.txt", 1000, textFill, true),
+    ],
+    expectFail: ["ditto -x -k"],
   },
   {
     label: "stored 4.5 GiB entry, size unknown",
@@ -116,6 +134,7 @@ for (const c of cases) {
       "bsdtar (stdin)",
       "7za t",
       "7za x",
+      "structural",
     ]) {
       const r0 = performance.now();
       const r = await validateZip(path, manifest, { mtime: MTIME, readers: [reader] });
@@ -125,7 +144,7 @@ for (const c of cases) {
           detail: `${v.detail} [${((performance.now() - r0) / 1000).toFixed(0)} s]`,
         };
     }
-    printResults(c.label, results);
+    printResults(c.label, results, c.expectFail);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
