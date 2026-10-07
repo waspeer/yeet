@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, statSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, statSync, existsSync, readFileSync } from "node:fs";
 import { join, basename } from "node:path";
 import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
@@ -11,7 +11,7 @@ import argon2 from "argon2";
 // Config — set via environment variables
 // ---------------------------------------------------------------------------
 
-const DEFAULT_EXPIRES_DAYS = Number(process.env.YEET_DEFAULT_EXPIRES_DAYS ?? "30");
+const README_URL = "https://github.com/waspeer/yeet#configuration";
 
 interface Config {
   remote: string;
@@ -19,11 +19,11 @@ interface Config {
   domain: string;
 }
 
-function requireEnv(name: string): string {
-  const value = process.env[name];
-  if (!value) die(`Missing required environment variable: ${name}`);
-  return value;
-}
+const REQUIRED_ENV = {
+  YEET_RCLONE_REMOTE: "name of your rclone remote, e.g. r2",
+  YEET_UPLOADS_PATH: "bucket and prefix on that remote, e.g. yeet/uploads",
+  YEET_DOMAIN: "public URL of your yeet server, e.g. https://dl.example.com",
+} as const;
 
 /**
  * Storage configuration, read from the environment with no fallbacks. These
@@ -33,11 +33,37 @@ function requireEnv(name: string): string {
  * `--help` still works with nothing configured.
  */
 function loadConfig(): Config {
+  const missing = (Object.keys(REQUIRED_ENV) as (keyof typeof REQUIRED_ENV)[]).filter(
+    (name) => !process.env[name],
+  );
+  if (missing.length > 0) {
+    die(
+      [
+        `yeet is not configured. Missing environment variable${missing.length > 1 ? "s" : ""}:`,
+        ...missing.map((name) => `  ${name.padEnd(20)} ${REQUIRED_ENV[name]}`),
+        "",
+        `See ${README_URL}`,
+      ].join("\n"),
+    );
+  }
+
+  const domain = process.env.YEET_DOMAIN!.replace(/\/+$/, "");
+  if (!/^https?:\/\/[^/]+/.test(domain)) {
+    die(`Invalid YEET_DOMAIN: "${domain}" (expected a URL like https://dl.example.com)`);
+  }
+
   return {
-    remote: requireEnv("YEET_RCLONE_REMOTE"),
-    uploadsPath: requireEnv("YEET_UPLOADS_PATH"),
-    domain: requireEnv("YEET_DOMAIN"),
+    remote: process.env.YEET_RCLONE_REMOTE!.replace(/:$/, ""),
+    uploadsPath: process.env.YEET_UPLOADS_PATH!.replace(/\/+$/, ""),
+    domain,
   };
+}
+
+/** Default link lifetime in days: YEET_DEFAULT_EXPIRES (a duration like 30d) or 30. */
+function defaultExpiresDays(): number {
+  const raw = process.env.YEET_DEFAULT_EXPIRES;
+  if (!raw) return 30;
+  return parseDuration(raw, "YEET_DEFAULT_EXPIRES");
 }
 
 // ---------------------------------------------------------------------------
@@ -62,13 +88,36 @@ const USAGE = `Usage: yeet <command>
 
 Commands:
   upload <filepath> [--expires <duration>] [--password <string>]
-  list [--downloads] Show all uploaded files (optionally with download history)`;
+                     Upload a file and print its share link
+                     --expires   link lifetime, e.g. 7d, 24h, 90m (default 30d)
+                     --password  require this password to download
+  list [--downloads] Show all uploaded files (optionally with download history)
+
+Options:
+  -h, --help         Show this help
+  -v, --version      Show the version
+
+Configuration (environment variables):
+  YEET_RCLONE_REMOTE    rclone remote to upload to, e.g. r2
+  YEET_UPLOADS_PATH     bucket and prefix on that remote, e.g. yeet/uploads
+  YEET_DOMAIN           public URL of your yeet server, e.g. https://dl.example.com
+  YEET_DEFAULT_EXPIRES  default link lifetime (optional, default 30d)`;
+
+function version(): string {
+  const pkgPath = new URL("../package.json", import.meta.url);
+  return (JSON.parse(readFileSync(pkgPath, "utf-8")) as { version: string }).version;
+}
 
 function parseArgs(argv: string[]): Args {
   const args = argv.slice(2);
 
   if (args[0] === "--help" || args[0] === "-h" || args.length === 0) {
     process.stdout.write(USAGE + "\n");
+    process.exit(0);
+  }
+
+  if (args[0] === "--version" || args[0] === "-v") {
+    process.stdout.write(version() + "\n");
     process.exit(0);
   }
 
@@ -84,7 +133,7 @@ function parseArgs(argv: string[]): Args {
   }
 
   let filepath: string | undefined;
-  let expires = DEFAULT_EXPIRES_DAYS;
+  let expires: number | undefined;
   let password: string | undefined;
 
   for (let i = 1; i < args.length; i++) {
@@ -105,12 +154,14 @@ function parseArgs(argv: string[]): Args {
   }
 
   if (!filepath) die("Usage: yeet upload <filepath> [--expires <duration>] [--password <string>]");
-  return { command: "upload", filepath, expires, password };
+  return { command: "upload", filepath, expires: expires ?? defaultExpiresDays(), password };
 }
 
-function parseDuration(s: string): number {
+function parseDuration(s: string, source = "--expires"): number {
   const match = s.match(/^(\d+)(d|h|m)$/i);
-  if (!match) die(`Invalid duration: ${s}. Use format like 7d, 24h, or 60m`);
+  if (!match || Number(match[1]) === 0) {
+    die(`Invalid ${source}: "${s}". Use a positive duration like 7d, 24h, or 60m`);
+  }
   const [, n, unit] = match as [string, string, string];
   const num = Number(n);
   if (unit.toLowerCase() === "d") return num;
@@ -137,6 +188,26 @@ function checkRclone(): void {
     execFileSync("rclone", ["version"], { stdio: "ignore" });
   } catch {
     die("rclone is required but not found. Install it from https://rclone.org/install/");
+  }
+}
+
+/** Fail early with a clear message if the configured remote does not exist in rclone. */
+function checkRemote(remote: string): void {
+  let remotes: string[];
+  try {
+    remotes = execFileSync("rclone", ["listremotes"], { encoding: "utf-8" })
+      .split("\n")
+      .map((line) => line.trim().replace(/:$/, ""))
+      .filter(Boolean);
+  } catch {
+    return; // let the actual rclone call report the problem
+  }
+  if (!remotes.includes(remote)) {
+    die(
+      `rclone has no remote named "${remote}" (YEET_RCLONE_REMOTE).\n` +
+        `Configured remotes: ${remotes.length ? remotes.join(", ") : "none"}. ` +
+        `Create one with \`rclone config\`.`,
+    );
   }
 }
 
@@ -195,6 +266,7 @@ async function listFiles(showDownloads: boolean): Promise<void> {
   checkRclone();
 
   const config = loadConfig();
+  checkRemote(config.remote);
   const remote = `${config.remote}:${config.uploadsPath}`;
 
   // Get all upload directories
@@ -202,7 +274,7 @@ async function listFiles(showDownloads: boolean): Promise<void> {
   try {
     dirsJson = execFileSync("rclone", ["lsjson", remote, "--dirs-only"], { encoding: "utf-8" });
   } catch {
-    die("Failed to list uploads. Check your rclone configuration and connectivity.");
+    die(`Failed to list ${remote}. Check your rclone configuration and connectivity.`);
   }
 
   const dirs = JSON.parse(dirsJson) as { Path: string; Name: string }[];
@@ -294,6 +366,7 @@ async function upload(args: UploadArgs): Promise<void> {
   checkRclone();
 
   const config = loadConfig();
+  checkRemote(config.remote);
   const filename = basename(args.filepath);
   const id = generateId();
 
@@ -323,9 +396,12 @@ async function upload(args: UploadArgs): Promise<void> {
   // Upload via rclone
   const dest = `${config.remote}:${config.uploadsPath}/${id}`;
   try {
-    execFileSync("rclone", ["copy", stagingDir, dest, "--progress"], { stdio: "inherit" });
+    // Progress goes to stderr so stdout carries only the link, for piping.
+    execFileSync("rclone", ["copy", stagingDir, dest, "--progress"], {
+      stdio: ["inherit", 2, "inherit"],
+    });
   } catch {
-    die("Upload failed. Check your rclone configuration and connectivity.");
+    die(`Upload to ${dest} failed. Check your rclone configuration and connectivity.`);
   }
 
   const url = `${config.domain}/${id}/${encodeURIComponent(filename)}`;

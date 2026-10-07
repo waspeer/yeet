@@ -57,7 +57,7 @@ app.get("/client.js", (c) => {
   return c.body(clientJs);
 });
 
-// GET /health — health check for Coolify
+// GET /health — health check for container orchestrators
 app.get("/health", (c) => c.json({ status: "ok" }));
 
 // GET / — landing page

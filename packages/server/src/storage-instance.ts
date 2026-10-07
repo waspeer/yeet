@@ -23,4 +23,5 @@ export const storage = new StorageClient({
   bucket: requireEnv("R2_BUCKET"),
   uploadsPrefix: process.env.R2_UPLOADS_PREFIX || "uploads",
   presignExpirySeconds: optionalPositiveInt("R2_PRESIGN_EXPIRY_SECONDS"),
+  region: process.env.R2_REGION || undefined,
 });

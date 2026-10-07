@@ -24,6 +24,8 @@ export interface StorageClientConfig {
   uploadsPrefix: string;
   /** Lifetime of presigned download URLs, in seconds. Defaults to 3600. */
   presignExpirySeconds?: number;
+  /** SigV4 signing region. "auto" for R2; other S3 providers need their real region. */
+  region?: string;
 }
 
 const DEFAULT_PRESIGN_EXPIRY_SECONDS = 3600;
@@ -95,7 +97,7 @@ function parseContentKeys(xml: string): string[] {
   return keys;
 }
 
-/** Thin signed-fetch wrapper for a Cloudflare R2 (S3-compatible) bucket. */
+/** Thin signed-fetch wrapper for an S3-compatible bucket (built for Cloudflare R2). */
 export class StorageClient {
   private readonly client: AwsClient;
   private readonly endpoint: string;
@@ -108,7 +110,7 @@ export class StorageClient {
       accessKeyId: config.accessKeyId,
       secretAccessKey: config.secretAccessKey,
       service: "s3",
-      region: "auto",
+      region: config.region ?? "auto",
     });
     this.endpoint = config.endpoint.replace(/\/$/, "");
     this.bucket = config.bucket;
@@ -185,11 +187,7 @@ export class StorageClient {
    * expires, past any password gate. Its lifetime is therefore clamped to
    * the file's own expiry.
    */
-  async presignDownloadUrl(
-    id: string,
-    filename: string,
-    fileExpiresAt?: string,
-  ): Promise<string> {
+  async presignDownloadUrl(id: string, filename: string, fileExpiresAt?: string): Promise<string> {
     let expirySeconds = this.presignExpirySeconds;
     if (fileExpiresAt) {
       const secondsUntilFileExpiry = Math.ceil(

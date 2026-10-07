@@ -1,7 +1,24 @@
 {
-  "name": "@yeet/cli",
+  "name": "@waspeer/yeet",
   "version": "0.1.0",
-  "private": true,
+  "description": "Share files with expiring, optionally password-protected download links, using your own rclone remote and S3-compatible storage",
+  "keywords": [
+    "cli",
+    "file-sharing",
+    "r2",
+    "rclone",
+    "s3",
+    "upload"
+  ],
+  "homepage": "https://github.com/waspeer/yeet#readme",
+  "bugs": "https://github.com/waspeer/yeet/issues",
+  "license": "MIT",
+  "author": "Wannes Salomé",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/waspeer/yeet.git",
+    "directory": "packages/cli"
+  },
   "bin": {
     "yeet": "./dist/index.js"
   },
@@ -9,6 +26,9 @@
     "dist"
   ],
   "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc",
     "prepare": "tsc",
@@ -21,5 +41,8 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }
