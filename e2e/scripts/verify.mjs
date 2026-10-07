@@ -11,11 +11,14 @@
 // 4. tears everything down — also on failure, Ctrl-C or SIGTERM — and writes
 //    results/summary.json
 //
-// Strict by default: a run where any selected test was skipped ("incomplete")
-// exits 1, like a failure. --allow-skips makes it exit 0 instead.
+// Strict by default: a run where any selected test was skipped or is an
+// expected failure (test.fail) is "incomplete" and exits 1, like a failure.
+// --allow-skips makes it exit 0 instead.
 //
 // One run per checkout at a time: a second concurrent run refuses to start
-// (exit 2) instead of clobbering results/ and the CLI build of the first.
+// (exit 2) instead of clobbering results/ and the CLI build of the first. If
+// the lock's holder died without tearing down (SIGKILL), the next run stops
+// its leftover process groups and deletes its temp directory first.
 //
 // Set YEET_E2E_KEEP=1 to keep the temp directory (R2 state, fixtures) for debugging.
 
@@ -28,6 +31,7 @@ import {
   mkdtempSync,
   openSync,
   closeSync,
+  renameSync,
   readFileSync,
   rmSync,
   statSync,
@@ -159,6 +163,7 @@ async function startWrangler({ port, inspectorPort, persistDir, token }) {
     stdio: ["ignore", "pipe", "pipe"],
     env: { ...withoutForceColor(process.env), WRANGLER_SEND_METRICS: "false", NO_COLOR: "1" },
   });
+  if (wrangler.pid) updateLock({ groups: [...lockState.groups, wrangler.pid] });
   wrangler.stdout.pipe(logStream);
   wrangler.stderr.pipe(logStream);
 
@@ -282,7 +287,7 @@ function writeHarnessSummary(extra) {
   } catch {
     summary = {
       status: "error",
-      totals: { total: 0, passed: 0, failed: 0, skipped: 0, flaky: 0 },
+      totals: { total: 0, passed: 0, failed: 0, skipped: 0, flaky: 0, expectedFailure: 0 },
       projects: {},
       tests: [],
     };
@@ -304,28 +309,124 @@ function writeHarnessSummary(extra) {
 // One run per checkout
 // ---------------------------------------------------------------------------
 
-function isAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return err.code === "EPERM";
+// The lock file records who holds it and what that run started, so a run
+// that was killed with SIGKILL (and could not tear down) can be cleaned up by
+// the next one:
+//
+//   { pid, startTime, nonce, groups: [process group IDs], tmpRoot }
+//
+// The holder counts as alive only if its PID exists *and* has the recorded
+// start time, so a reused PID does not keep the lock forever.
+
+/** @type {{pid: number, startTime: string | null, nonce: string, groups: number[], tmpRoot: string | null} | null} */
+let lockState = null;
+
+/** The start time `ps` reports for a PID, or null if there is no such process. */
+function processStartTime(pid) {
+  const result = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf-8" });
+  const value = result.status === 0 ? result.stdout.trim() : "";
+  return value || null;
+}
+
+function holderAlive(lock) {
+  if (!Number.isInteger(lock.pid) || lock.pid <= 0) return false;
+  const started = processStartTime(lock.pid);
+  if (!started) return false;
+  return !lock.startTime || started === lock.startTime;
+}
+
+/** Commands of the processes in a process group. */
+function groupMembers(pgid) {
+  const result = spawnSync("ps", ["-A", "-o", "pgid=,command="], { encoding: "utf-8" });
+  return result.stdout
+    .split("\n")
+    .map((line) => line.trim().match(/^(\d+)\s+(.*)$/))
+    .filter((match) => match && Number(match[1]) === pgid)
+    .map((match) => match[2]);
+}
+
+/**
+ * Stop what a dead run left behind: its wrangler and Playwright process groups
+ * (only if they still run programs from this checkout, so a reused group ID is
+ * left alone) and its temp directory.
+ */
+async function cleanUpAfter(lock) {
+  for (const pgid of lock.groups ?? []) {
+    const members = groupMembers(pgid);
+    if (!members.some((command) => command.includes(REPO_DIR))) continue;
+    log(`stopping process group ${pgid} left by the dead run (${members.length} processes)`);
+    try {
+      process.kill(-pgid, "SIGTERM");
+    } catch {
+      continue;
+    }
+    const deadline = Date.now() + KILL_GRACE_MS;
+    while (groupMembers(pgid).length > 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    try {
+      process.kill(-pgid, "SIGKILL");
+    } catch {
+      // gone
+    }
+  }
+  const root = lock.tmpRoot;
+  if (root && dirname(root) === dirname(join(tmpdir(), "x")) && root.includes("yeet-e2e-")) {
+    log(`removing temp directory ${root} of the dead run`);
+    rmSync(root, { recursive: true, force: true });
   }
 }
 
-/** Take the checkout's run lock, or return the PID of the run that holds it. */
-function acquireLock() {
-  for (let attempt = 0; attempt < 2; attempt++) {
+function writeLock() {
+  const tmp = `${LOCK_PATH}.${process.pid}`;
+  writeFileSync(tmp, JSON.stringify(lockState) + "\n");
+  renameSync(tmp, LOCK_PATH);
+}
+
+/** Record something the next run must clean up if this one is killed. */
+function updateLock(patch) {
+  if (!lockState) return;
+  lockState = { ...lockState, ...patch };
+  writeLock();
+}
+
+function readLock() {
+  const raw = readFileSync(LOCK_PATH, "utf-8");
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return { pid: Number(raw), startTime: null, groups: [], tmpRoot: null }; // older format
+  }
+}
+
+/** Take the checkout's run lock, or return the PID of the live run that holds it. */
+async function acquireLock() {
+  const mine = {
+    pid: process.pid,
+    startTime: processStartTime(process.pid),
+    nonce: randomBytes(8).toString("hex"),
+    groups: [],
+    tmpRoot: null,
+  };
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const fd = openSync(LOCK_PATH, "wx");
-      writeFileSync(fd, String(process.pid));
+      writeFileSync(fd, JSON.stringify(mine) + "\n");
       closeSync(fd);
+      lockState = mine;
       return null;
     } catch (err) {
       if (err.code !== "EEXIST") throw err;
-      const pid = Number(readFileSync(LOCK_PATH, "utf-8"));
-      if (pid && isAlive(pid)) return pid;
-      rmSync(LOCK_PATH, { force: true }); // left behind by a run that was killed
+      let lock;
+      try {
+        lock = readLock();
+      } catch {
+        continue; // removed meanwhile
+      }
+      if (holderAlive(lock)) return lock.pid;
+      log(`previous run (PID ${lock.pid}) is gone without tearing down; cleaning up after it`);
+      await cleanUpAfter(lock);
+      rmSync(LOCK_PATH, { force: true });
     }
   }
   throw new Error(`Could not take ${LOCK_PATH}`);
@@ -333,9 +434,9 @@ function acquireLock() {
 
 function releaseLock() {
   try {
-    if (Number(readFileSync(LOCK_PATH, "utf-8")) === process.pid) rmSync(LOCK_PATH);
+    if (lockState && readLock().nonce === lockState.nonce) rmSync(LOCK_PATH);
   } catch {
-    // not ours or already gone
+    // already gone
   }
 }
 
@@ -356,6 +457,7 @@ async function main() {
   await step("build CLI", () => run("npm", ["run", "--silent", "build"], CLI_DIR));
 
   tmpRoot = mkdtempSync(join(tmpdir(), "yeet-e2e-"));
+  updateLock({ tmpRoot });
   const persistDir = join(tmpRoot, "r2-state");
   const token = randomBytes(32).toString("base64url");
   const [port, inspectorPort] = [await freePort(), await freePort()];
@@ -388,6 +490,7 @@ async function main() {
         },
       },
     );
+    if (playwright.pid) updateLock({ groups: [...lockState.groups, playwright.pid] });
     playwright.on("exit", (exitCode, signal) => resolve(exitCode ?? (signal ? 1 : 0)));
     playwright.on("error", (err) => {
       log(`could not start Playwright: ${err.message}`);
@@ -398,7 +501,7 @@ async function main() {
   return code;
 }
 
-const holder = acquireLock();
+const holder = await acquireLock();
 if (holder) {
   log(
     `another verify run (PID ${holder}) is already using this checkout; ` +
@@ -425,14 +528,16 @@ writeFileSync(SUMMARY_PATH, JSON.stringify(summary, null, 2) + "\n");
 const t = summary.totals;
 log(
   `${summary.status.toUpperCase()}: ${t.passed} passed, ${t.failed} failed, ${t.flaky} flaky, ` +
-    `${t.skipped} skipped in ${seconds(Date.now() - startedAt)} total ` +
+    `${t.skipped} skipped, ${t.expectedFailure ?? 0} expected failure ` +
+    `in ${seconds(Date.now() - startedAt)} total ` +
     `(prepare ${seconds(timings["prepare"] ?? 0)}, CLI build ${seconds(timings["build CLI"] ?? 0)}, ` +
     `server start ${seconds(timings["start wrangler dev"] ?? 0)}, tests ${seconds(timings["tests"] ?? 0)}). ` +
     `Summary: ${relative(process.cwd(), SUMMARY_PATH)}`,
 );
 if (summary.status === "incomplete" && !allowSkips) {
   log(
-    "INCOMPLETE counts as a failure: some selected tests did not run. Use --allow-skips to accept.",
+    "INCOMPLETE counts as a failure: some selected tests were skipped or marked test.fail(). " +
+      "Use --allow-skips to accept.",
   );
   exitCode = 1;
 } else if (summary.status !== "passed" && summary.status !== "incomplete" && exitCode === 0) {
