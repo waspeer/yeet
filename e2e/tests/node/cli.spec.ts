@@ -3,15 +3,20 @@ import { readFile, rm, stat } from "node:fs/promises";
 import {
   cli,
   cliUpload,
+  describeRun,
   downloadSha256,
   eventually,
   expect,
+  expectExitCode,
   FILENAMES,
+  fileWith,
+  listUploads,
   MiB,
   randomFile,
   server,
   serverLog,
   test,
+  uploadObjects,
 } from "../../lib/index.js";
 
 /** A share link for a file on the test server: <origin>/<6-char id>/<encoded name>. */
@@ -24,11 +29,18 @@ function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/** The link lifetime the server stored for an upload, in seconds. */
+async function storedLifetimeSeconds(id: string): Promise<number> {
+  const upload = (await listUploads()).find((u) => u.id === id);
+  if (!upload) throw new Error(`Upload ${id} is not in GET /api/uploads`);
+  return (Date.parse(upload.expires_at) - Date.parse(upload.uploaded_at)) / 1000;
+}
+
 test.describe("yeet login", () => {
   test("a wrong token fails with a clear message and exit code 1", async () => {
     const result = await cli(["login", server.baseURL], { stdin: "not-the-token\n" });
 
-    expect(result.code, result.stderr).toBe(1);
+    expectExitCode(result, 1);
     expect(result.stderr).toContain("The server rejected the upload token");
     expect(result.stdout).toBe("");
     expect(existsSync(result.configPath)).toBe(false);
@@ -37,7 +49,7 @@ test.describe("yeet login", () => {
   test("a valid token is saved to a config file with mode 0600", async () => {
     const result = await cli(["login", server.baseURL], { stdin: `${server.token}\n` });
 
-    expect(result.code, result.stderr).toBe(0);
+    expectExitCode(result, 0);
     expect(result.stderr).toContain(`Logged in to ${server.baseURL}`);
     const info = await stat(result.configPath);
     expect((info.mode & 0o777).toString(8)).toBe("600");
@@ -45,8 +57,7 @@ test.describe("yeet login", () => {
     expect(config).toMatchObject({ url: server.baseURL, token: server.token });
 
     // The saved config is what later commands use.
-    const list = await cli(["list"], { configHome: result.configHome });
-    expect(list.code, list.stderr).toBe(0);
+    expectExitCode(await cli(["list"], { configHome: result.configHome }), 0);
   });
 });
 
@@ -60,16 +71,19 @@ test.describe("yeet upload, list and delete", () => {
     expect(await downloadSha256(url)).toEqual({ sha256: file.sha256, size: file.size });
 
     const list = await cli(["list"], { auth: true });
-    expect(list.code, list.stderr).toBe(0);
+    expectExitCode(list, 0);
     expect(list.stdout).toContain(file.name);
     expect(list.stdout).toContain(url);
 
     const del = await cli(["delete", url], { auth: true });
-    expect(del.code, del.stderr).toBe(0);
+    expectExitCode(del, 0);
     expect(del.stderr).toContain(`Deleted ${id}`);
 
-    const page = await fetch(url);
-    expect(page.status).toBe(404);
+    // Every object of the upload is gone, not just its metadata.
+    await eventually(async () => (await uploadObjects(id)).length === 0, {
+      message: `uploads/${id}/ to be empty after yeet delete`,
+    });
+    expect((await fetch(url)).status).toBe(404);
     const after = await cli(["list"], { auth: true });
     expect(after.stdout).not.toContain(url);
   });
@@ -108,9 +122,59 @@ test.describe("yeet upload, list and delete", () => {
 
       expect(await downloadSha256(url)).toEqual({ sha256: file.sha256, size: file.size });
 
-      const del = await cli(["delete", url], { auth: true });
-      expect(del.code, del.stderr).toBe(0);
+      expectExitCode(await cli(["delete", url], { auth: true }), 0);
+      await eventually(async () => (await uploadObjects(id)).length === 0, {
+        message: `uploads/${id}/ to be empty after yeet delete`,
+      });
       expect((await fetch(url)).status).toBe(404);
     },
   );
+});
+
+test.describe("yeet upload --expires", () => {
+  test("--expires 90m stores a 90 minute lifetime", async ({ tmp }) => {
+    const file = await fileWith(tmp, "ninety.txt", "90 minutes\n");
+    const { id } = await cliUpload(file.path, ["--expires", "90m"]);
+    expect(await storedLifetimeSeconds(id)).toBeCloseTo(5400, -1); // ±5 s
+  });
+
+  test("YEET_DEFAULT_EXPIRES sets the lifetime; --expires overrides it", async ({ tmp }) => {
+    const file = await fileWith(tmp, "default.txt", "default expiry\n");
+    const env = { YEET_DEFAULT_EXPIRES: "2h" };
+
+    const { id } = await cliUpload(file.path, [], { env });
+    expect(await storedLifetimeSeconds(id)).toBeCloseTo(7200, -1);
+
+    const { id: overridden } = await cliUpload(file.path, ["--expires", "3d"], { env });
+    expect(await storedLifetimeSeconds(overridden)).toBeCloseTo(3 * 86400, -1);
+  });
+
+  test("without any setting the lifetime is 30 days", async ({ tmp }) => {
+    const file = await fileWith(tmp, "thirty.txt", "30 days\n");
+    const { id } = await cliUpload(file.path);
+    expect(await storedLifetimeSeconds(id)).toBeCloseTo(30 * 86400, -1);
+  });
+
+  for (const value of ["0d", "5x", "7"]) {
+    test(`an invalid --expires ${value} exits 1 with a clear message`, async ({ tmp }) => {
+      const file = await fileWith(tmp, "never.txt", "never uploaded\n");
+      const result = await cli(["upload", file.path, "--expires", value], { auth: true });
+
+      expectExitCode(result, 1);
+      expect(result.stderr, describeRun(result)).toContain(`Invalid --expires: "${value}"`);
+      expect(result.stdout).toBe("");
+    });
+  }
+
+  test("an invalid YEET_DEFAULT_EXPIRES exits 1 with a clear message", async ({ tmp }) => {
+    const file = await fileWith(tmp, "never.txt", "never uploaded\n");
+    const result = await cli(["upload", file.path], {
+      auth: true,
+      env: { YEET_DEFAULT_EXPIRES: "5x" },
+    });
+
+    expectExitCode(result, 1);
+    expect(result.stderr, describeRun(result)).toContain('Invalid YEET_DEFAULT_EXPIRES: "5x"');
+    expect(result.stdout).toBe("");
+  });
 });
