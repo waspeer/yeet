@@ -2,6 +2,7 @@
 
 import { test as base } from "@playwright/test";
 import { rm } from "node:fs/promises";
+import { clientIp } from "./api.js";
 import { makeTempDir } from "./util.js";
 
 export const test = base.extend<{
@@ -14,6 +15,11 @@ export const test = base.extend<{
     await use(dir);
     await rm(dir, { recursive: true, force: true });
   },
+  // Every browser test is its own client (CF-Connecting-IP), so the Worker's
+  // per-IP failure limits never carry over between tests. See clientIp().
+  extraHTTPHeaders: async ({ extraHTTPHeaders }, use) => {
+    await use({ "CF-Connecting-IP": clientIp(), ...extraHTTPHeaders });
+  },
 });
 
 export { expect } from "@playwright/test";
@@ -22,4 +28,5 @@ export * from "./bucket.js";
 export * from "./cli.js";
 export * from "./env.js";
 export * from "./fixtures.js";
+export * from "./servers.js";
 export * from "./util.js";

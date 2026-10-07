@@ -13,12 +13,12 @@ export interface BucketObject {
   custom_metadata: Record<string, string>;
 }
 
-function explorerUrl(path: string): string {
-  return `${server.baseURL}/cdn-cgi/local/explorer/api/r2/buckets/${server.bucketName}${path}`;
+function explorerUrl(path: string, baseURL = server.baseURL): string {
+  return `${baseURL}/cdn-cgi/local/explorer/api/r2/buckets/${server.bucketName}${path}`;
 }
 
-async function explorerJson<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(explorerUrl(path), init);
+async function explorerJson<T>(path: string, init?: RequestInit, baseURL?: string): Promise<T> {
+  const res = await fetch(explorerUrl(path, baseURL), init);
   const body = (await res.json().catch(() => null)) as {
     success?: boolean;
     result?: T;
@@ -65,17 +65,22 @@ export function uploadObjects(id: string): Promise<BucketObject[]> {
 export async function putObject(
   key: string,
   body: string | Uint8Array,
-  opts: { contentType?: string; customMetadata?: Record<string, string> } = {},
+  opts: {
+    contentType?: string;
+    customMetadata?: Record<string, string>;
+    /** Another server's bucket (e2e/lib/servers.ts). */
+    baseURL?: string;
+  } = {},
 ): Promise<void> {
   const headers: Record<string, string> = {
     "Content-Type": opts.contentType ?? "application/octet-stream",
   };
   if (opts.customMetadata) headers["cf-r2-custom-metadata"] = JSON.stringify(opts.customMetadata);
-  await explorerJson(objectPath(key), {
-    method: "PUT",
-    body: body as string | Uint8Array<ArrayBuffer>,
-    headers,
-  });
+  await explorerJson(
+    objectPath(key),
+    { method: "PUT", body: body as string | Uint8Array<ArrayBuffer>, headers },
+    opts.baseURL,
+  );
 }
 
 /** Read an object's bytes, or null when it does not exist. */
