@@ -120,13 +120,13 @@ request with exponential backoff or `Retry-After`. Playwright 1.63 builds,
 local `wrangler dev`, 120 MiB (3 parts):
 
 - **XHR `upload.onprogress` with Blob bodies works in all three engines.**
-  8–10 of 10–13 progress updates per upload fell between part boundaries.
+  6–10 of 10–13 progress updates per upload fell between part boundaries.
 - **Origin from the worker.** Its POST/PUT/DELETE requests carry
   `Origin: <page origin>` and `Sec-Fetch-Site: same-origin` in all three
-  engines (as Playwright reports them; the development stub of the session
-  check also enforced the Origin and accepted them).
-- **Main thread, max lag of a 10 ms timer during the upload:** WebKit 4 ms,
-  Firefox 20–29 ms, Chromium 81–82 ms. Headless Chromium also lags 52 ms when
+  engines: Playwright reports them, and the Worker's session check, which
+  refuses requests without them, accepts every upload.
+- **Main thread, max lag of a 10 ms timer during the upload:** WebKit 3–4 ms,
+  Firefox 20–39 ms, Chromium 74–82 ms. Headless Chromium also lags 52 ms when
   idle (26 ticks in 1.5 s instead of ~150), so its figure is timer throttling,
   not upload work.
 - **Memory (RSS of all browser processes, 360 MiB upload):** Chromium 478 →
