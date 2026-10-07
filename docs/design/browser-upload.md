@@ -136,6 +136,33 @@ about half the page memory of `Uint8Array` bodies in WebKit.
   Origin check). Upload requests from the Web Worker carry that cookie on the
   same origin.
 
+## Phase 1B: single-file upload page (measured)
+
+The page (`packages/worker/src/upload-page.ts`, `src/upload/`) uploads one
+file without zipping: a fresh Web Worker per upload, parts sent with XHR as
+`file.slice()` Blobs, 2 in flight (1 after the first retry), 4 attempts per
+request with exponential backoff or `Retry-After`. Playwright 1.63 builds,
+local `wrangler dev`, 120 MiB (3 parts):
+
+- **XHR `upload.onprogress` with Blob bodies works in all three engines.**
+  6–10 of 10–13 progress updates per upload fell between part boundaries.
+- **Origin from the worker.** Its POST/PUT/DELETE requests carry
+  `Origin: <page origin>` and `Sec-Fetch-Site: same-origin` in all three
+  engines: Playwright reports them, and the Worker's session check, which
+  refuses requests without them, accepts every upload.
+- **Main thread, max lag of a 10 ms timer during the upload:** WebKit 3–4 ms,
+  Firefox 20–39 ms, Chromium 74–82 ms. Headless Chromium also lags 52 ms when
+  idle (26 ticks in 1.5 s instead of ~150), so its figure is timer throttling,
+  not upload work.
+- **Memory (RSS of all browser processes, 360 MiB upload):** Chromium 478 →
+  peak 494 → 507 MiB 30 s after; WebKit 575 → 585 → 586; Firefox 1125 → 1174
+  → 1133. File-backed Blobs do not grow memory, and the worker is terminated
+  after success, failure or cancel. RSS only; the iPhone is untested.
+- **Empty files** upload as one empty part and download as 0 bytes (local R2
+  only; real R2 is untested).
+- **Playwright WebKit cancels the `keepalive` DELETE sent on `pagehide`
+  whenever a `page.route()` is active;** without interception it arrives.
+
 ## Untested
 
 - **iOS Safari** (much stricter memory limits). This is a human test, see

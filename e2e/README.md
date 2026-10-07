@@ -1,7 +1,7 @@
 # yeet end-to-end tests
 
 One command checks the whole product locally: the built CLI, the Worker under
-`wrangler dev` with a local R2 bucket, and the download page in Chromium, WebKit
+`wrangler dev` with a local R2 bucket, and the download and upload pages in Chromium, WebKit
 and Firefox.
 
 ```sh
@@ -71,7 +71,7 @@ own free ports and temp directory.
 Arguments after `--` go to Playwright:
 
 ```sh
-npm run verify -- --project=webkit          # download page tests in WebKit only
+npm run verify -- --project=webkit          # browser tests in WebKit only
 npm run verify -- --project=node            # CLI, HTTP and cron tests only
 npm run verify -- --grep "password"         # by title, across all projects
 npm run verify -- --grep-invert @slow       # skip the 120 MB upload (= npm run verify:fast)
@@ -80,12 +80,12 @@ npm run verify -- tests/node/http.spec.ts   # one file
 
 Projects:
 
-| project    | tests             | runs                                                    |
-| ---------- | ----------------- | ------------------------------------------------------- |
-| `node`     | `tests/node/*`    | CLI, HTTP and cron tests; no browser, once per run      |
-| `chromium` | `tests/browser/*` | download page in Playwright's Chromium (Desktop Chrome) |
-| `webkit`   | `tests/browser/*` | download page in Playwright's WebKit (Desktop Safari)   |
-| `firefox`  | `tests/browser/*` | download page in Playwright's Firefox (Desktop Firefox) |
+| project    | tests             | runs                                                              |
+| ---------- | ----------------- | ----------------------------------------------------------------- |
+| `node`     | `tests/node/*`    | CLI, HTTP and cron tests; no browser, once per run                |
+| `chromium` | `tests/browser/*` | download + upload pages in Playwright's Chromium (Desktop Chrome) |
+| `webkit`   | `tests/browser/*` | download + upload pages in Playwright's WebKit (Desktop Safari)   |
+| `firefox`  | `tests/browser/*` | download + upload pages in Playwright's Firefox (Desktop Firefox) |
 
 Environment knobs: `YEET_E2E_WORKERS=<n>` (parallel workers, default 4),
 `YEET_E2E_KEEP=1` (keep the temp directory with the R2 state and print its path).
@@ -135,7 +135,7 @@ test; open a trace with `npx playwright show-trace <path>`).
 
 ## Writing a test
 
-Put tests that need no browser in `tests/node/`, download page tests in
+Put tests that need no browser in `tests/node/`, browser (page) tests in
 `tests/browser/` (they run once per engine). Import everything from `lib/`:
 
 ```ts
@@ -277,6 +277,25 @@ logPath, stop() }`: another `wrangler dev` of the Worker, with its own ports,
   `<tmpRoot>/extra-servers/`; `verify` stops whatever is still running there on
   teardown, and a later run does so for a killed one, like its own wrangler.
 - `putObject(key, body, { baseURL })` seeds another server's bucket.
+
+### Upload page — `browser.ts`
+
+- `logIn(page)`: logs in through the real form on `/upload` (field `token`),
+  then waits until the page script is ready ("Choose file" enabled).
+- `dropFile(page, path)`: drops a file on the drop zone with a synthetic
+  `DragEvent` whose `DataTransfer` holds a real `File` (taken from a helper file
+  input, so large files are not copied through the protocol).
+- `instrumentUploadPage(page)` (before `goto`), `pageStats(page)`,
+  `resetStats(page)`: every value of the progress bar, and the main thread's
+  worst lateness on a 10 ms `setInterval`.
+- `shareLink(page, timeout?)`: waits for the done state and returns the link.
+
+The upload runs in a Web Worker. In Playwright 1.63, `page.route()`,
+`page.waitForRequest/Response()` and `context.on("request")` all see that
+worker's requests in Chromium, WebKit and Firefox; the failure tests inject
+errors with `page.route()`. Exception: while any route is active, Playwright's
+WebKit cancels a `keepalive` fetch sent from `pagehide`, so the "leaving the
+page" test uses no route.
 
 ### Utilities — `util.ts`
 
