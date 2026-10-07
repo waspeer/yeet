@@ -1,8 +1,39 @@
 // HTTP helpers against the Worker: the token-protected API and the public
 // download flow (download page → POST → 303 → signed /_dl link).
 
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { server } from "./env.js";
+
+/**
+ * Start an upload (POST /api/uploads) without sending parts or completing it,
+ * leaving it pending with a real R2 multipart upload. Returns its ID.
+ */
+export async function startUpload(opts: {
+  filename: string;
+  size: number;
+  expiresInSeconds?: number;
+}): Promise<string> {
+  const { id } = await apiJson<{ id: string }>("/api/uploads", {
+    method: "POST",
+    body: JSON.stringify({
+      filename: opts.filename,
+      size: opts.size,
+      expires_in: opts.expiresInSeconds ?? 3600,
+    }),
+  });
+  return id;
+}
+
+/**
+ * A `/_dl/<id>` link signed with the test token for any expiry, including one
+ * past the file's own expiry (the server clamps the links it hands out to it).
+ * Mirrors signDownload() in packages/worker/src/crypto.ts; keep them in sync.
+ */
+export function forgeDownloadUrl(id: string, expires: number): string {
+  const key = createHash("sha256").update(`yeet-download:${server.token}`).digest();
+  const signature = createHmac("sha256", key).update(`${id}:${expires}`).digest("base64url");
+  return `${server.baseURL}/_dl/${id}?expires=${expires}&sig=${signature}`;
+}
 
 /**
  * fetch() against the server with the upload token. `path` is relative to the

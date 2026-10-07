@@ -146,3 +146,49 @@ export async function triggerCron(cron = "0 3 * * *"): Promise<void> {
   const text = await res.text();
   if (!res.ok) throw new Error(`/__scheduled returned ${res.status}: ${text}`);
 }
+
+export interface UploadMeta extends LegacyMeta {
+  /** Set while the file is still being uploaded: the R2 multipart upload ID. */
+  pending_upload_id?: string;
+}
+
+/**
+ * The summary the Worker keeps in the sidecar's R2 custom metadata (key
+ * `summary`). Mirrors summarize() in packages/worker/src/uploads.ts; keep the
+ * two in sync.
+ */
+export function summarize(meta: UploadMeta): Record<string, unknown> {
+  const downloads = meta.downloads ?? [];
+  return {
+    filename: meta.filename,
+    file_size: meta.file_size ?? 0,
+    uploaded_at: meta.uploaded_at,
+    expires_at: meta.expires_at,
+    has_password: !!meta.password_hash,
+    ...(meta.pending_upload_id ? { pending_upload_id: meta.pending_upload_id } : {}),
+    download_count: downloads.length,
+    recent_downloads: downloads.slice(-5).map((download) => download.at),
+  };
+}
+
+/** Read an upload's `.meta.json` sidecar straight from the bucket. */
+export async function readUploadMeta(id: string): Promise<UploadMeta | null> {
+  const raw = await getObject(`${server.uploadsPrefix}/${id}/.meta.json`);
+  return raw && (JSON.parse(raw.toString("utf-8")) as UploadMeta);
+}
+
+/**
+ * Overwrite an upload's `.meta.json`. By default it also gets the `summary`
+ * custom metadata, as the Worker's writeMeta() does; `withSummary: false`
+ * writes it the way yeet < 0.2 / rclone did, without custom metadata.
+ */
+export async function writeUploadMeta(
+  id: string,
+  meta: UploadMeta,
+  { withSummary = true } = {},
+): Promise<void> {
+  await putObject(`${server.uploadsPrefix}/${id}/.meta.json`, JSON.stringify(meta, null, 2), {
+    contentType: "application/json",
+    ...(withSummary ? { customMetadata: { summary: JSON.stringify(summarize(meta)) } } : {}),
+  });
+}
