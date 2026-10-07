@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { readFile, rm, stat } from "node:fs/promises";
 import {
+  api,
   cli,
   cliUpload,
   describeRun,
@@ -15,6 +16,7 @@ import {
   randomFile,
   server,
   serverLog,
+  startServer,
   test,
   uploadObjects,
 } from "../../lib/index.js";
@@ -41,9 +43,60 @@ test.describe("yeet login", () => {
     const result = await cli(["login", server.baseURL], { stdin: "not-the-token\n" });
 
     expectExitCode(result, 1);
-    expect(result.stderr).toContain("The server rejected the upload token");
+    expect(result.stderr).toBe(
+      `That upload token is not correct for ${server.baseURL}. Check it and try again.\n`,
+    );
     expect(result.stdout).toBe("");
     expect(existsSync(result.configPath)).toBe(false);
+  });
+
+  test("other commands with a wrong token advise running yeet login again", async ({ tmp }) => {
+    const env = { YEET_TOKEN: "not-the-token-0123456789" };
+    const list = await cli(["list"], { auth: true, env });
+    expectExitCode(list, 1);
+    expect(list.stderr).toBe("The server rejected the upload token. Run `yeet login` again.\n");
+
+    const file = await fileWith(tmp, "rejected.txt", "never uploaded\n");
+    const upload = await cli(["upload", file.path], { auth: true, env });
+    expectExitCode(upload, 1);
+    expect(upload.stderr).toContain("Run `yeet login` again.");
+    expect(upload.stdout).toBe("");
+  });
+
+  test("rate-limited (429): login and other commands say when to try again", async () => {
+    // Its own server: the CLI sends no CF-Connecting-IP, so all of its
+    // requests share one address, which must not be rate-limited on the
+    // server that the other tests use.
+    test.setTimeout(120_000);
+    const srv = await startServer({ token: server.token });
+    try {
+      for (let i = 1; i <= 20; i++) {
+        const res = await api("/api/me", { baseURL: srv.baseURL, token: `wrong-${i}-0123456789` });
+        expect(res.status, `failure ${i}`).toBe(401);
+      }
+
+      const tooMany =
+        /^Too many wrong upload tokens were tried from this address\. Try again in (\d+) seconds?\./;
+      for (const token of ["still-wrong-0123456789", server.token]) {
+        const login = await cli(["login", srv.baseURL], { stdin: `${token}\n` });
+        expectExitCode(login, 1);
+        expect(login.stderr, describeRun(login)).toMatch(tooMany);
+        expect(login.stderr).not.toContain("yeet login");
+        expect(existsSync(login.configPath)).toBe(false);
+      }
+
+      const list = await cli(["list"], {
+        env: { YEET_URL: srv.baseURL, YEET_TOKEN: "still-wrong-0123456789" },
+      });
+      expectExitCode(list, 1);
+      expect(list.stderr, describeRun(list)).toMatch(tooMany);
+      expect(list.stderr).toContain("run `yeet login`");
+      const seconds = Number(list.stderr.match(tooMany)![1]);
+      expect(seconds).toBeGreaterThanOrEqual(1);
+      expect(seconds).toBeLessThanOrEqual(60);
+    } finally {
+      await srv.stop();
+    }
   });
 
   test("a valid token is saved to a config file with mode 0600", async () => {
