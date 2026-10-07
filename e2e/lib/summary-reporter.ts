@@ -1,16 +1,17 @@
-// Prints a PASS/FAIL/SKIP/FLAKY line per test, grouped per Playwright project
-// (node, chromium, webkit, firefox), and writes results/summary.json.
+// Prints a PASS/FAIL/SKIP/FLAKY/XFAIL line per test, grouped per Playwright
+// project (node, chromium, webkit, firefox), and writes results/summary.json.
 //
 // Overall status: "failed" if any test failed or was flaky, or the run did not
-// finish normally; "incomplete" if nothing failed but something was skipped;
-// "passed" only if every selected test ran and passed on its first attempt.
+// finish normally; "incomplete" if nothing failed but something was skipped or
+// is marked test.fail() (an expected failure verifies nothing); "passed" only
+// if every selected test ran and passed on its first attempt.
 
 import type { FullConfig, FullResult, Reporter, Suite, TestCase } from "@playwright/test/reporter";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
-type Outcome = "passed" | "failed" | "skipped" | "flaky";
+type Outcome = "passed" | "failed" | "skipped" | "flaky" | "expectedFailure";
 
 interface TestEntry {
   project: string;
@@ -30,12 +31,14 @@ const LABEL: Record<Outcome, string> = {
   failed: "FAIL ",
   skipped: "SKIP ",
   flaky: "FLAKY",
+  expectedFailure: "XFAIL",
 };
 
 function outcomeOf(test: TestCase): Outcome {
   switch (test.outcome()) {
     case "expected":
-      return "passed";
+      // test.fail(): it failed as declared, which proves nothing about the product.
+      return test.expectedStatus === "failed" ? "expectedFailure" : "passed";
     case "flaky":
       return "flaky";
     case "skipped":
@@ -93,7 +96,14 @@ export default class SummaryReporter implements Reporter {
       };
     });
 
-    const empty = () => ({ total: 0, passed: 0, failed: 0, skipped: 0, flaky: 0 });
+    const empty = () => ({
+      total: 0,
+      passed: 0,
+      failed: 0,
+      skipped: 0,
+      flaky: 0,
+      expectedFailure: 0,
+    });
     const totals = empty();
     const projects: Record<string, ReturnType<typeof empty>> = {};
     for (const entry of tests) {
@@ -108,8 +118,9 @@ export default class SummaryReporter implements Reporter {
     if (result.status === "interrupted") status = "interrupted";
     else if (result.status !== "passed" || totals.failed > 0 || totals.flaky > 0) {
       status = "failed";
-    } else if (totals.total === 0 || totals.skipped > 0) status = "incomplete";
-    else status = "passed";
+    } else if (totals.total === 0 || totals.skipped > 0 || totals.expectedFailure > 0) {
+      status = "incomplete";
+    } else status = "passed";
 
     const out: string[] = ["", "=== yeet e2e summary ==="];
     for (const [name, counts] of Object.entries(projects)) {
@@ -118,7 +129,10 @@ export default class SummaryReporter implements Reporter {
         `${name}: ${counts.passed}/${counts.total} passed` +
           (counts.failed ? `, ${counts.failed} FAILED` : "") +
           (counts.flaky ? `, ${counts.flaky} FLAKY` : "") +
-          (counts.skipped ? `, ${counts.skipped} skipped` : ""),
+          (counts.skipped ? `, ${counts.skipped} skipped` : "") +
+          (counts.expectedFailure
+            ? `, ${counts.expectedFailure} expected failure (test.fail)`
+            : ""),
       );
       for (const entry of tests.filter((t) => t.project === name)) {
         const seconds = (entry.durationMs / 1000).toFixed(1).padStart(5);
@@ -130,7 +144,8 @@ export default class SummaryReporter implements Reporter {
     out.push(
       "",
       `Overall: ${status.toUpperCase()} — ${totals.passed} passed, ${totals.failed} failed, ` +
-        `${totals.flaky} flaky, ${totals.skipped} skipped of ${totals.total} ` +
+        `${totals.flaky} flaky, ${totals.skipped} skipped, ` +
+        `${totals.expectedFailure} expected failure of ${totals.total} ` +
         `in ${((Date.now() - this.started) / 1000).toFixed(1)}s ` +
         `(playwright status: ${result.status})`,
       "",
