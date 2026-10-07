@@ -53,14 +53,16 @@ export interface ZipOptions {
   /**
    * "auto" (default): ZIP64 structures only where needed (entries with an
    * unknown or large `size`, offsets or counts past the classic limits).
-   * "always": ZIP64 for every entry and the end records. Mainly for testing.
+   * "always": ZIP64 for every entry and the end records. Testing only:
+   * ditto rejects stored entries whose central header carries ZIP64 sizes
+   * below 4 GiB.
    */
   zip64?: "auto" | "always";
   /**
    * Minutes east of UTC used for the DOS date/time fields, which have no
    * time zone and are shown as-is by readers that ignore the UTC timestamp
-   * extra field (ditto/Archive Utility, Windows Explorer). Defaults to the
-   * producer's local offset at each entry's mtime (always 0 in workerd).
+   * extra field (measured: ditto; reportedly Windows Explorer). Defaults to
+   * the producer's local offset at each entry's mtime (always 0 in workerd).
    */
   timeZoneOffset?: number;
   /**
@@ -84,7 +86,6 @@ export const COMPRESSED_EXTENSIONS: ReadonlySet<string> = new Set([
   "opus",
   "flac",
   "wma",
-  "alac",
   // video
   "mp4",
   "m4v",
