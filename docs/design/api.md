@@ -104,6 +104,17 @@ stays the same as today; the CLI and the tests depend on it.
 - **Storage:** the stored hash format stays `pbkdf2-sha256$<iterations>$<salt>$<hash>`.
   The iteration count lives in the hash, so changing it never breaks
   existing links.
+- **Iterations: 20,000** (lowered from 50,000 in phase 1, after measuring).
+  - **Measured** on Workers Free (test account, `wrangler tail`):
+    - with 50,000 iterations, a password check costs 13 ms CPU median and
+      20 ms at p90, against 2 ms without a password;
+    - Sentry loading lazily and the download pass did not change that path.
+  - **Expected:** at roughly 0.2–0.4 ms per 1,000 iterations, 20,000 brings
+    p90 to about 10 ms. To be confirmed by the next measurement.
+  - **Trade-off:** a stolen bucket's hashes are 2.5× cheaper to brute-force.
+    Online guessing stays capped at 5 wrong passwords per minute per IP per
+    upload.
+  - **Old links:** hashes with any other iteration count still verify.
 - **Download pass:** after a correct password, the response also sets
   `yeet_dl_<id>`:
   - **Value:** `<expires>.<base64url(HMAC(key("dlpass"), id + ":" + expires))>`.

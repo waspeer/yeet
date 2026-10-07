@@ -131,7 +131,7 @@ Files live in the bucket as `uploads/<id>/<filename>`, next to a small
   CLI's token), counted in a Durable Object.
 - After a correct password, the browser gets a cookie for that file for up to
   24 hours, so it is not asked again.
-- Passwords are hashed with PBKDF2-SHA256 (50,000 iterations), which fits the
+- Passwords are hashed with PBKDF2-SHA256 (20,000 iterations), which fits the
   free plan's CPU budget. The hash is stored in your private bucket.
 - After the password check, the browser gets a signed download link that works
   without the password until it expires (at most `DOWNLOAD_URL_TTL`).

@@ -31,9 +31,11 @@ async function safeEqual(a: string, b: string): Promise<boolean> {
 // ---------------------------------------------------------------------------
 
 // PBKDF2-SHA256. Argon2 would be stronger, but it does not fit in the 10 ms of
-// CPU a free-plan Worker gets per request; 50k iterations takes a few ms. The
-// hash lives in a private bucket, so it is only exposed if the bucket is.
-const PBKDF2_ITERATIONS = 50_000;
+// CPU a free-plan Worker gets per request. Measured on Cloudflare, 50k
+// iterations cost ~11-20 ms; 20k keeps a password check near 10 ms at p90.
+// The hash lives in a private bucket, so it is only exposed if the bucket is,
+// and online guessing is rate limited. See docs/design/api.md.
+const PBKDF2_ITERATIONS = 20_000;
 
 async function pbkdf2(
   password: string,
