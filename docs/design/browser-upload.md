@@ -97,6 +97,31 @@ about half the page memory of `Uint8Array` bodies in WebKit.
    policy from [zip.md](zip.md) (NFC, duplicates, Windows sanitising). Keep
    folder paths from `webkitRelativePath`.
 
+### Seen on a real iPhone (Safari 26.6.1, prototype)
+
+- **358 MB in 9 WAVs:** completed in 147 s.
+  - Page memory peaked at 296 MB, with no memory-pressure events and at most
+    6 ms of main-thread lag.
+  - The zip verified byte-correct.
+  - The network, not the phone, was the bottleneck: 98 s of waiting for an
+    upload slot.
+  - Page memory stayed at about 230 MB after the upload. Terminate the worker
+    after each upload.
+- **1 GB WAV:** 7 parts (about 350 MB) succeeded, then part 8 failed with
+  status 0. About 24 s later, reading the picked file failed with
+  `NotFoundError: The object can not be found here`. The most likely cause is
+  that the screen locked or Safari went to the background: iOS drops the
+  upload, then revokes access to the picked `File`.
+- **Production consequences:**
+  - Keep the screen awake with a Wake Lock.
+  - Treat `NotFoundError` while reading as "file access lost", not as a
+    retryable error, and say so plainly, e.g. "Safari stopped when the screen
+    locked. Choose the file again to continue".
+  - For a single file, resume from the first unacknowledged part after the
+    user re-selects the same file (check its name, size and `lastModified`).
+    The multipart upload stays open for 24 h, so this is possible.
+  - A deflated zip cannot resume part-way and must restart.
+
 ### Server API changes this needs
 
 - **Size at `complete`.** `size` becomes optional at create. The stored size
