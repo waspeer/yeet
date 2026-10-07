@@ -9,10 +9,14 @@
   "build": { "command": "node build.mjs" },
   "assets": { "directory": "./public" },
   "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "yeet" }],
+  // Counters for failed logins, download passwords and bearer tokens (one
+  // object per client key). SQLite-backed, the only kind the free plan offers.
+  "durable_objects": { "bindings": [{ "name": "RATE_LIMITER", "class_name": "RateLimiter" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["RateLimiter"] }],
   // Daily cleanup of expired and abandoned uploads.
   "triggers": { "crons": ["0 3 * * *"] },
-  // Erik's links live on <name>.<account>.workers.dev; per-version preview
-  // URLs would expose every deployed version under its own hostname.
+  // Share links live on <name>.<account>.workers.dev unless a custom domain is
+  // added; per-version preview URLs would serve every version on its own host.
   "workers_dev": true,
   "preview_urls": false,
   // No "vars": UPLOADS_PREFIX and DOWNLOAD_URL_TTL have defaults in the code
