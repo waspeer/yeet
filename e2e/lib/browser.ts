@@ -63,14 +63,15 @@ export async function instrumentUploadPage(page: Page): Promise<void> {
       state.lagSamples++;
       last = now;
     }, 10);
-    document.addEventListener("DOMContentLoaded", () => {
-      const bar = document.getElementById("bar") as HTMLProgressElement | null;
-      if (!bar) return;
-      new MutationObserver(() => state.progress.push(bar.value)).observe(bar, {
-        attributes: true,
-        attributeFilter: ["value"],
-      });
-    });
+    // Observe the whole document from the start, so no update can be missed
+    // however early the page script runs (an observer attached on
+    // DOMContentLoaded missed every update once in Firefox).
+    new MutationObserver((records) => {
+      for (const record of records) {
+        const target = record.target as HTMLProgressElement;
+        if (target.id === "bar") state.progress.push(target.value);
+      }
+    }).observe(document, { subtree: true, attributes: true, attributeFilter: ["value"] });
   });
 }
 
