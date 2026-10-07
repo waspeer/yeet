@@ -30,7 +30,7 @@ body{background:#222;font-family:Geneva,"Lucida Grande",sans-serif;font-size:12p
 .meta{text-align:center;color:#444;line-height:1.8;margin-bottom:16px}
 hr{border:none;border-top:1px solid #000;margin:0 0 16px}
 .center{text-align:center}
-input[type=password]{font-family:inherit;font-size:12px;border:1px solid #000;padding:4px 8px;width:100%;margin-bottom:8px;display:block}
+input[type=password],input[type=text]{font-family:inherit;font-size:12px;border:1px solid #000;padding:4px 8px;width:100%;margin-bottom:8px;display:block}
 label{display:block;margin-bottom:4px;font-weight:bold}
 button{font-family:inherit;font-size:12px;border:2px solid #000;background:#fff;padding:5px 20px;cursor:pointer;box-shadow:2px 2px 0 #000}
 button:active{box-shadow:none;transform:translate(2px,2px)}
@@ -74,7 +74,8 @@ function sentryScript(): string {
 </script>`;
 }
 
-function layout(title: string, body: string): string {
+/** The page shell (styles, window chrome, client.js). `body` is trusted HTML. */
+export function layout(title: string, body: string): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -103,13 +104,16 @@ export function downloadPage(opts: {
   expiresAt: string;
   hasPassword: boolean;
   passwordError?: boolean;
+  /** Shown instead of the wrong-password message, e.g. when rate-limited. */
+  errorMessage?: string;
 }): string {
-  const { filename, fileSize, expiresAt, hasPassword, passwordError } = opts;
+  const { filename, fileSize, expiresAt, hasPassword, passwordError, errorMessage } = opts;
+  const error = errorMessage ?? (passwordError ? "Incorrect password. Please try again." : null);
   const meta = `${formatBytes(fileSize)}<br>Expires ${formatExpiry(expiresAt)}`;
 
   const actionBlock = hasPassword
     ? `<form method="POST" action="download">
-        ${passwordError ? '<div class="error">Incorrect password. Please try again.</div>' : ""}
+        ${error ? `<div class="error">${escHtml(error)}</div>` : ""}
         <label for="pw">Password required</label>
         <input type="password" id="pw" name="password" autofocus placeholder="Enter password">
         <div class="center"><button type="submit" class="primary">Download</button></div>
@@ -152,7 +156,29 @@ export function errorPage(message = "Something went wrong."): string {
   return layout("yeet \u2014 Error", body);
 }
 
-function escHtml(s: string): string {
+/** The login form of /upload. Never contains the token, not even a wrong one. */
+export function loginPage(opts: { error?: string } = {}): string {
+  const body = `
+    <div class="icon">&#128274;</div>
+    <div class="filename">Log in to upload</div>
+    <div class="meta">Paste the upload token you set when deploying yeet.</div>
+    <hr>
+    <form method="POST" action="/login">
+      ${opts.error ? `<div class="error">${escHtml(opts.error)}</div>` : ""}
+      <label for="token">Upload token</label>
+      <input type="password" id="token" name="token" required autofocus
+        autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="current-password">
+      <div class="center"><button type="submit" class="primary">Log in</button></div>
+    </form>`;
+  return layout("yeet \u2014 Log in", body);
+}
+
+/** Readable message for a 429, as shown on pages. */
+export function tooManyAttempts(retryAfter: number): string {
+  return `Too many attempts. Try again in ${retryAfter} seconds.`;
+}
+
+export function escHtml(s: string): string {
   return s
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
