@@ -41,8 +41,10 @@ Nothing touches Cloudflare, your real `~/.config/yeet` or `packages/worker/.dev.
 | 130  | interrupted (Ctrl-C, SIGTERM)                                                                                      |
 
 Strict mode is the default: a skipped test (`test.skip`, `test.fixme`, a
-conditional skip) means something was not verified, so the run exits 1 with
-`status: "incomplete"`. **Verifiers must use the default (strict) mode and treat
+conditional skip) or an expected failure (`test.fail()`, reported as `XFAIL`)
+means something was not verified, so the run exits 1 with
+`status: "incomplete"`. (A `test.fail()` test that unexpectedly passes is a
+normal failure.) **Verifiers must use the default (strict) mode and treat
 any non-zero exit as "not verified".** While iterating locally you can pass
 `--allow-skips` (`npm run verify -- --allow-skips`) to exit 0 on `incomplete`.
 Filtering with `--grep`/`--project` is not skipping: excluded tests are simply
@@ -50,10 +52,17 @@ not part of the run.
 
 ### One run per checkout
 
-A run holds `e2e/.verify.lock` (with its PID) while it works, because runs in the
-same checkout share `results/` and the CLI build. A second run in the same
-checkout refuses to start (exit 2) and names the PID of the active one. A lock
-left by a killed run is detected (PID gone) and taken over. Runs in different
+A run holds `e2e/.verify.lock` while it works, because runs in the same
+checkout share `results/` and the CLI build. The lock records the run's PID and
+process start time, a nonce, the process group IDs of its wrangler and
+Playwright children, and its temp directory. A second run in the same checkout
+refuses to start (exit 2) and names the PID of the active one.
+
+If the holder is gone — no process with that PID, or one with a different start
+time (a reused PID) — it died without tearing down (e.g. `kill -9`). The next
+run then stops the recorded process groups that still run programs from this
+checkout (SIGTERM, SIGKILL after 5 s), deletes the dead run's temp directory,
+and takes the lock, so orphans cannot later overwrite `results/summary.json`. Runs in different
 checkouts or git worktrees are independent and can go in parallel: each gets its
 own free ports and temp directory.
 
@@ -90,7 +99,7 @@ per test, grouped per project:
 chromium: 4/4 passed
   PASS    1.4s  tests/browser/download.spec.ts › download page › Download saves the exact file under its name
 ...
-Overall: PASSED — 42 passed, 0 failed, 0 flaky, 0 skipped of 42 in 15.0s
+Overall: PASSED — 46 passed, 0 failed, 0 flaky, 0 skipped, 0 expected failure of 46 in 15.0s
 ```
 
 Machine-readable results of the latest run go to `results/summary.json`
@@ -100,7 +109,7 @@ exit 2):
 ```jsonc
 {
   "status": "passed", // passed | failed | incomplete | interrupted | error
-  "totals": { "total": 42, "passed": 42, "failed": 0, "skipped": 0, "flaky": 0 },
+  "totals": { "total": 46, "passed": 46, "failed": 0, "skipped": 0, "flaky": 0, "expectedFailure": 0 },
   "projects": { "node": { ... }, "chromium": { ... }, "webkit": { ... }, "firefox": { ... } },
   "tests": [{ "project", "file", "title", "tags", "outcome", "durationMs", "attempts", "error?" }],
   "args": ["--project=webkit"],          // what was passed after -- (minus --allow-skips)
@@ -110,8 +119,9 @@ exit 2):
 ```
 
 - `passed` means every selected test ran and passed on its first attempt.
-- `incomplete`: nothing failed, but at least one selected test was skipped. Exit 1
-  in strict mode (the default), 0 with `--allow-skips`. Never a pass.
+- `incomplete`: nothing failed, but at least one selected test was skipped or is
+  an expected failure (`test.fail()`). Exit 1 in strict mode (the default), 0
+  with `--allow-skips`. Never a pass.
 - `failed`: a test failed or was flaky, or no test matched the filters
   (Playwright reports "No tests found" as a failure).
 - Retries are off. If you pass `--retries`, a test that passes only on a retry is
