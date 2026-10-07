@@ -1,0 +1,14 @@
+{
+  "name": "yeet-prototype-0c-zip",
+  "private": true,
+  "description": "Throwaway prototype: isomorphic streaming ZIP writer (phase 0c)",
+  "type": "module",
+  "devDependencies": {
+    "7zip-bin": "^5.2.0",
+    "@types/node": "^24.19.1",
+    "esbuild": "^0.28.2",
+    "playwright": "^1.63.0",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.148.0"
+  }
+}
