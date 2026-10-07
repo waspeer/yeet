@@ -3,6 +3,8 @@
 //
 //   <prefix>/<id>/<filename>     the file itself
 //   <prefix>/<id>/.meta.json     metadata sidecar (UploadMeta)
+//   <prefix>/<id>/.parts/<n>     size of part n, only while an upload of
+//                                unknown size is pending
 
 export interface DownloadRecord {
   at: string; // ISO 8601
@@ -10,6 +12,7 @@ export interface DownloadRecord {
 
 export interface UploadMeta {
   filename: string;
+  /** While pending: the size the client declared, if any. Once finished: R2's object.size. */
   file_size?: number;
   uploaded_at: string;
   expires_at: string;
@@ -127,6 +130,37 @@ export class Uploads {
       httpMetadata: { contentType: "application/json" },
       customMetadata: toCustomMetadata(meta),
     });
+  }
+
+  /**
+   * Remember the size of an uploaded part while the total size is unknown, so
+   * `complete` can check the part layout before R2 does. One empty object per
+   * part (`<id>/.parts/<n>`), overwritten if the part is sent again, deleted
+   * with the upload.
+   */
+  async writePartSize(id: string, partNumber: number, size: number): Promise<void> {
+    await this.bucket.put(`${this.dir(id)}.parts/${partNumber}`, "", {
+      customMetadata: { size: String(size) },
+    });
+  }
+
+  /** The recorded part sizes of an upload, and the keys of their records. */
+  async readPartSizes(id: string): Promise<{ sizes: Map<number, number>; keys: string[] }> {
+    const prefix = `${this.dir(id)}.parts/`;
+    const sizes = new Map<number, number>();
+    const keys: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await this.bucket.list({ prefix, cursor, include: ["customMetadata"] });
+      for (const object of page.objects) {
+        keys.push(object.key);
+        const partNumber = Number(object.key.slice(prefix.length));
+        const size = Number(object.customMetadata?.size);
+        if (Number.isInteger(partNumber) && Number.isSafeInteger(size)) sizes.set(partNumber, size);
+      }
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+    return { sizes, keys };
   }
 
   async exists(id: string): Promise<boolean> {

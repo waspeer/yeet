@@ -92,14 +92,16 @@ file.
 ### Server settings
 
 Set these in the Cloudflare dashboard under **Workers → yeet → Settings →
-Variables and secrets**, or in `packages/worker/wrangler.jsonc`:
+Variables and secrets**. Only `UPLOAD_TOKEN` is required; the others have
+defaults in the code, so `wrangler.jsonc` lists no vars (vars listed there would
+overwrite your dashboard values on every deploy).
 
-| Name               | Type   | Description                                                                        |
-| ------------------ | ------ | ---------------------------------------------------------------------------------- |
-| `UPLOAD_TOKEN`     | secret | Token the CLI authenticates with. Changing it also invalidates open download links |
-| `UPLOADS_PREFIX`   | var    | Key prefix inside the bucket (default `uploads`)                                   |
-| `DOWNLOAD_URL_TTL` | var    | Lifetime of a download link after the password check, in seconds (default `3600`)  |
-| `SENTRY_DSN`       | secret | Optional. Enables Sentry error reporting, including session replay on errors       |
+| Name               | Type   | Description                                                                                                                                |
+| ------------------ | ------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `UPLOAD_TOKEN`     | secret | At least 16 characters. Used by the CLI and to log in at `/upload`. Changing it logs out every browser and invalidates open download links |
+| `UPLOADS_PREFIX`   | var    | Key prefix inside the bucket (default `uploads`)                                                                                           |
+| `DOWNLOAD_URL_TTL` | var    | Lifetime of a download link after the password check, in seconds (default `3600`)                                                          |
+| `SENTRY_DSN`       | secret | Optional. Enables Sentry error reporting, including session replay on errors. Without it, no Sentry code runs                              |
 
 ### Your own domain
 
@@ -121,6 +123,14 @@ Files live in the bucket as `uploads/<id>/<filename>`, next to a small
 
 - Uploading, listing and deleting require the upload token. Anyone with a
   share link can download, unless it has a password.
+- In the browser, `/upload` asks for the token once and keeps you logged in
+  with a signed, HttpOnly cookie for 90 days. The token itself never reaches
+  the page. Changing `UPLOAD_TOKEN` logs out every browser.
+- Wrong tokens and wrong download passwords are rate limited per client
+  (5 per minute for logins and per file for passwords, 20 per minute for the
+  CLI's token), counted in a Durable Object.
+- After a correct password, the browser gets a cookie for that file for up to
+  24 hours, so it is not asked again.
 - Passwords are hashed with PBKDF2-SHA256 (50,000 iterations), which fits the
   free plan's CPU budget. The hash is stored in your private bucket.
 - After the password check, the browser gets a signed download link that works

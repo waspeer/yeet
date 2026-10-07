@@ -9,13 +9,18 @@
   "build": { "command": "node build.mjs" },
   "assets": { "directory": "./public" },
   "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "yeet" }],
+  // Counters for failed logins, download passwords and bearer tokens (one
+  // object per client key). SQLite-backed, the only kind the free plan offers.
+  "durable_objects": { "bindings": [{ "name": "RATE_LIMITER", "class_name": "RateLimiter" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["RateLimiter"] }],
   // Daily cleanup of expired and abandoned uploads.
   "triggers": { "crons": ["0 3 * * *"] },
-  "vars": {
-    // Key prefix inside the bucket.
-    "UPLOADS_PREFIX": "uploads",
-    // Lifetime of a download link handed out after the password check, in seconds.
-    "DOWNLOAD_URL_TTL": "3600",
-  },
+  // Share links live on <name>.<account>.workers.dev unless a custom domain is
+  // added; per-version preview URLs would serve every version on its own host.
+  "workers_dev": true,
+  "preview_urls": false,
+  // No "vars": UPLOADS_PREFIX and DOWNLOAD_URL_TTL have defaults in the code
+  // and can be set in the dashboard. Vars listed here would overwrite the
+  // dashboard values on every deploy.
   "observability": { "enabled": true },
 }

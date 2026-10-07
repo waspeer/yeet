@@ -1,4 +1,4 @@
-import { api, expect, server, test, uploadViaApi } from "../../lib/index.js";
+import { api, clientIp, expect, server, test, uploadViaApi } from "../../lib/index.js";
 
 // Every API route must reject requests without the upload token. The ID is a
 // real finished upload, so an unprotected route would answer 2xx/4xx other
@@ -58,10 +58,14 @@ const credentials: { name: string; headers: () => Record<string, string> }[] = [
 test.describe("API authentication", () => {
   for (const credential of credentials) {
     test(`every route answers 401 to ${credential.name}`, async () => {
+      // Its own client address: the six failures stay below the per-IP limit
+      // of 20 failed bearer attempts per minute (tested in rate-limit.spec.ts).
+      const ip = clientIp();
       for (const route of routes) {
         const res = await api(route.path(), {
           method: route.method,
           token: null,
+          ip,
           headers: { "Content-Type": "application/json", ...credential.headers() },
           body: route.body?.(),
         });

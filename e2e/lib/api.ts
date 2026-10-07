@@ -1,7 +1,7 @@
 // HTTP helpers against the Worker: the token-protected API and the public
 // download flow (download page → POST → 303 → signed /_dl link).
 
-import { createHash, createHmac } from "node:crypto";
+import { createHash, createHmac, randomInt } from "node:crypto";
 import { server } from "./env.js";
 
 /**
@@ -36,18 +36,95 @@ export function forgeDownloadUrl(id: string, expires: number): string {
 }
 
 /**
+ * A random address in 10.0.0.0/8 to send as `CF-Connecting-IP`. The Worker
+ * rate-limits failures per client IP; `wrangler dev` passes this header
+ * through (Cloudflare's edge overwrites it in production), so a test that
+ * counts failures, or makes many, uses its own address and does not trip or
+ * inherit another test's limit. Requests without it count as 127.0.0.1.
+ */
+export function clientIp(): string {
+  return `10.${randomInt(256)}.${randomInt(256)}.${randomInt(1, 255)}`;
+}
+
+/**
  * fetch() against the server with the upload token. `path` is relative to the
  * origin, e.g. `api("/api/uploads")`. Pass `token: null` to send none, or
- * another string to send a wrong one.
+ * another string to send a wrong one; `ip` sets CF-Connecting-IP (see
+ * clientIp()); `baseURL` targets another server (e2e/lib/servers.ts).
  */
 export function api(
   path: string,
-  init: RequestInit & { token?: string | null } = {},
+  init: RequestInit & { token?: string | null; ip?: string; baseURL?: string } = {},
 ): Promise<Response> {
-  const { token = server.token, ...rest } = init;
+  const { token = server.token, ip, baseURL = server.baseURL, ...rest } = init;
   const headers = new Headers(rest.headers);
   if (token !== null) headers.set("Authorization", `Bearer ${token}`);
-  return fetch(new URL(path, server.baseURL), { ...rest, headers });
+  if (ip) headers.set("CF-Connecting-IP", ip);
+  return fetch(new URL(path, baseURL), { ...rest, headers });
+}
+
+/**
+ * POST /login like a same-origin browser form would (Origin and
+ * Sec-Fetch-Site set). Returns the raw response (303 + Set-Cookie on success).
+ */
+export function postLogin(
+  token: string,
+  opts: { ip?: string; baseURL?: string; headers?: Record<string, string> } = {},
+): Promise<Response> {
+  const baseURL = opts.baseURL ?? server.baseURL;
+  return fetch(new URL("/login", baseURL), {
+    method: "POST",
+    body: new URLSearchParams({ token }),
+    redirect: "manual",
+    headers: {
+      Origin: baseURL,
+      "Sec-Fetch-Site": "same-origin",
+      ...(opts.ip ? { "CF-Connecting-IP": opts.ip } : {}),
+      ...opts.headers,
+    },
+  });
+}
+
+/** `name=value` of a Set-Cookie header, for sending it back in a Cookie header. */
+export function cookiePair(setCookie: string | null): string {
+  const pair = setCookie?.split(";")[0];
+  if (!pair) throw new Error(`No Set-Cookie: ${setCookie}`);
+  return pair;
+}
+
+/** Log in and return the `yeet_session=...` cookie pair. */
+export async function loginCookie(
+  opts: { token?: string; ip?: string; baseURL?: string } = {},
+): Promise<string> {
+  const res = await postLogin(opts.token ?? server.token, opts);
+  if (res.status !== 303) throw new Error(`POST /login → ${res.status}: ${await res.text()}`);
+  return cookiePair(res.headers.get("set-cookie"));
+}
+
+/**
+ * fetch() as the logged-in browser page would: the session cookie, plus
+ * Origin and Sec-Fetch-Site of the server's own origin. Override or remove
+ * (`undefined`) headers with `headers`.
+ */
+export function sessionFetch(
+  path: string,
+  cookie: string,
+  init: Omit<RequestInit, "headers"> & {
+    headers?: Record<string, string | undefined>;
+    baseURL?: string;
+  } = {},
+): Promise<Response> {
+  const { headers: overrides = {}, baseURL = server.baseURL, ...rest } = init;
+  const headers = new Headers();
+  const all: Record<string, string | undefined> = {
+    Cookie: cookie,
+    Origin: baseURL,
+    "Sec-Fetch-Site": "same-origin",
+    ...overrides,
+  };
+  for (const [name, value] of Object.entries(all))
+    if (value !== undefined) headers.set(name, value);
+  return fetch(new URL(path, baseURL), { redirect: "manual", ...rest, headers });
 }
 
 /** Like api(), but parses JSON and throws on a non-2xx status. */
@@ -133,10 +210,22 @@ export function idFromUrl(shareUrl: string): string {
  * Submit the download form like a browser would and return the raw response
  * (303 with Location on success, 401 HTML on a wrong password, 404 if gone).
  */
-export function submitDownloadForm(shareUrl: string, password?: string): Promise<Response> {
+export function submitDownloadForm(
+  shareUrl: string,
+  password?: string,
+  opts: { ip?: string; cookie?: string } = {},
+): Promise<Response> {
   const form = new URLSearchParams();
   if (password !== undefined) form.set("password", password);
-  return fetch(new URL("download", shareUrl), { method: "POST", body: form, redirect: "manual" });
+  const headers: Record<string, string> = {};
+  if (opts.ip) headers["CF-Connecting-IP"] = opts.ip;
+  if (opts.cookie) headers["Cookie"] = opts.cookie;
+  return fetch(new URL("download", shareUrl), {
+    method: "POST",
+    body: form,
+    redirect: "manual",
+    headers,
+  });
 }
 
 /** The signed `/_dl/<id>?expires=&sig=` link the download form redirects to. */

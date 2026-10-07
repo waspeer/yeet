@@ -33,6 +33,7 @@ import {
   closeSync,
   renameSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -254,6 +255,7 @@ async function cleanup() {
       await waitForExit(wrangler, 1000);
     }
   }
+  if (tmpRoot) await stopExtraServers(tmpRoot);
   if (tmpRoot) {
     if (process.env.YEET_E2E_KEEP) log(`kept temp directory ${tmpRoot}`);
     else rmSync(tmpRoot, { recursive: true, force: true });
@@ -372,8 +374,42 @@ async function cleanUpAfter(lock) {
   }
   const root = lock.tmpRoot;
   if (root && dirname(root) === dirname(join(tmpdir(), "x")) && root.includes("yeet-e2e-")) {
+    await stopExtraServers(root);
     log(`removing temp directory ${root} of the dead run`);
     rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Stop the extra `wrangler dev` instances tests started (e2e/lib/servers.ts).
+ * Each one registers its process group as a file in <tmpRoot>/extra-servers/;
+ * a group is only signalled if it still runs programs from this checkout.
+ */
+async function stopExtraServers(root) {
+  let pgids = [];
+  try {
+    pgids = readdirSync(join(root, "extra-servers")).map(Number).filter(Number.isInteger);
+  } catch {
+    return; // none started
+  }
+  for (const pgid of pgids) {
+    const members = groupMembers(pgid);
+    if (!members.some((command) => command.includes(REPO_DIR))) continue;
+    log(`stopping extra wrangler dev (process group ${pgid})`);
+    try {
+      process.kill(-pgid, "SIGTERM");
+    } catch {
+      continue;
+    }
+    const deadline = Date.now() + KILL_GRACE_MS;
+    while (groupMembers(pgid).length > 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    try {
+      process.kill(-pgid, "SIGKILL");
+    } catch {
+      // gone
+    }
   }
 }
 
