@@ -168,6 +168,14 @@ Rules of thumb:
 - Opening the page of an expired upload deletes it, so do not visit an upload
   whose removal by the cron you want to observe.
 - Tag slow tests with `{ tag: "@slow" }` so `verify:fast` can skip them.
+- The Worker rate-limits failures (wrong login tokens, download passwords,
+  bearer tokens) per client IP, taken from `CF-Connecting-IP`, which
+  `wrangler dev` passes through. A test that makes failed attempts sends its
+  own `clientIp()`; browser tests get a unique one automatically. Requests
+  without the header all count as 127.0.0.1.
+- A test that needs a differently configured server (another token, a short
+  token, `SENTRY_DSN`) starts its own with `startServer()` and stops it in a
+  `finally`.
 
 ## Helper API (`lib/`)
 
@@ -202,7 +210,15 @@ All exported from `lib/index.ts`.
 
 - `api(path, init?)` → `Response`: fetch with `Authorization: Bearer <token>`;
   `path` is from the origin (`api("/api/uploads")`). `init.token`: `null` sends
-  no token, a string sends that one.
+  no token, a string sends that one; `init.ip` sets `CF-Connecting-IP`;
+  `init.baseURL` targets another server.
+- `clientIp()` → a random 10.x.x.x address for `CF-Connecting-IP`.
+- `postLogin(token, { ip?, baseURL?, headers? })` → the raw `POST /login`
+  response, sent like a same-origin form (Origin, `Sec-Fetch-Site: same-origin`).
+  `loginCookie(opts?)` → the `yeet_session=…` pair; `cookiePair(setCookie)`.
+- `sessionFetch(path, cookie, init?)`: fetch as the logged-in page would
+  (cookie, Origin, `Sec-Fetch-Site`); `init.headers` overrides or removes
+  (`undefined`) headers.
 - `apiJson(path, init?)`: parsed JSON, throws on non-2xx; sets the JSON content
   type for string bodies.
 - `listUploads()`, `deleteUpload(id)`, `idFromUrl(shareUrl)`.
@@ -210,8 +226,8 @@ All exported from `lib/index.ts`.
   uploads like the CLI does but with expiry in seconds (the CLI's minimum is 1 minute).
 - `startUpload({ filename, size, expiresInSeconds? })` → id of an upload left
   pending (POST /api/uploads only, real R2 multipart upload).
-- `submitDownloadForm(shareUrl, password?)` → the raw 303/401/404 response.
-  Without `password` the form has no password field.
+- `submitDownloadForm(shareUrl, password?, { ip?, cookie? })` → the raw
+  303/401/404/429 response. Without `password` the form has no password field.
 - `signedDownloadUrl(shareUrl, password?)` → the `/_dl/<id>?expires=&sig=` link.
 - `downloadBytes(shareUrl, password?)` → `Buffer`; `downloadSha256(shareUrl,
 password?)` → `{ sha256, size }`, streaming, for large files.
@@ -249,6 +265,18 @@ These talk to wrangler's Local Explorer API
 - `FILENAMES.spaces`, `FILENAMES.unicode` (accents, CJK, emoji, en dash),
   `FILENAMES.punctuation` (`'()#&%!`).
 - `sha256(pathOrBytes)` → hex digest.
+
+### Extra servers — `servers.ts`
+
+- `startServer({ token, persistDir?, vars? })` → `{ baseURL, token, persistDir,
+logPath, stop() }`: another `wrangler dev` of the Worker, with its own ports,
+  `UPLOAD_TOKEN` and vars (`SENTRY_DSN` empty unless given). Pass the
+  `persistDir` of a stopped instance to restart on the same bucket, e.g. with
+  a rotated token. Takes a few seconds to start.
+- Each instance runs in its own process group, registered in
+  `<tmpRoot>/extra-servers/`; `verify` stops whatever is still running there on
+  teardown, and a later run does so for a killed one, like its own wrangler.
+- `putObject(key, body, { baseURL })` seeds another server's bucket.
 
 ### Utilities — `util.ts`
 
