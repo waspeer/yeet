@@ -356,11 +356,10 @@ api.post("/uploads/:id/complete", async (c) => {
   if (meta.file_size === undefined) {
     const { sizes, keys } = await uploads.readPartSizes(id);
     partRecords = keys;
+    const missing = parts.find(({ partNumber }) => !sizes.has(partNumber));
+    if (missing) return c.json({ error: `Part ${missing.partNumber} was not uploaded` }, 400);
     for (const { partNumber } of parts) {
-      const size = sizes.get(partNumber);
-      if (size === undefined) {
-        return c.json({ error: `Part ${partNumber} was not uploaded` }, 400);
-      }
+      const size = sizes.get(partNumber)!;
       if (partNumber < parts.length && size !== PART_SIZE) {
         return c.json(
           {
