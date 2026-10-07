@@ -361,8 +361,9 @@ function toDosDateTime(date: Date): [number, number] {
   return [time, day];
 }
 
+/** UT mtime is read as signed 32-bit by Info-ZIP and others: clamp to 1970..2038-01-19. */
 function utcSeconds(mtime: number): number {
-  return Math.min(Math.max(Math.floor(mtime / 1000), 0), MAX32);
+  return Math.min(Math.max(Math.floor(mtime / 1000), 0), 0x7fffffff);
 }
 
 function localHeader(r: Record, zeroSizes: boolean): Uint8Array {
@@ -384,13 +385,15 @@ function localHeader(r: Record, zeroSizes: boolean): Uint8Array {
   v.setUint16(26, r.name.length, true);
   v.setUint16(28, extraLength, true);
   out.set(r.name, 30);
+  // The ZIP64 extra goes first: Windows 7 Explorer reportedly only finds it there.
   let p = 30 + r.name.length;
-  p = writeUt(v, p, r.mtime);
   if (r.zip64Local) {
     v.setUint16(p, EXTRA_ZIP64, true);
     v.setUint16(p + 2, 16, true);
     // size and compressed size: zero, the real values follow in the data descriptor
+    p += 20;
   }
+  writeUt(v, p, r.mtime);
   return out;
 }
 
@@ -442,8 +445,9 @@ function centralHeader(r: Record, forceZip64Sizes: boolean): Uint8Array {
   v.setUint32(38, ((mode << 16) | (r.directory ? 0x10 : 0)) >>> 0, true);
   v.setUint32(42, offsetOver ? MAX32 : r.offset, true);
   out.set(r.name, 46);
-  let p = writeUt(v, 46 + r.name.length, r.mtime);
+  let p = 46 + r.name.length;
   if (zip64Length) {
+    // First extra field (see localHeader).
     v.setUint16(p, EXTRA_ZIP64, true);
     v.setUint16(p + 2, zip64Length, true);
     p += 4;
@@ -453,8 +457,12 @@ function centralHeader(r: Record, forceZip64Sizes: boolean): Uint8Array {
       setUint64(v, p + 8, r.compressedSize);
       p += 16;
     }
-    if (offsetOver) setUint64(v, p, r.offset);
+    if (offsetOver) {
+      setUint64(v, p, r.offset);
+      p += 8;
+    }
   }
+  writeUt(v, p, r.mtime);
   return out;
 }
 
