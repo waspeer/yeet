@@ -2,6 +2,7 @@
 // HOME and XDG_CONFIG_HOME point into the run's temp directory and inherited
 // YEET_* variables are dropped, so ~/.config/yeet is never read or written.
 
+import { expect } from "@playwright/test";
 import { spawn } from "node:child_process";
 import { mkdtemp } from "node:fs/promises";
 import { join } from "node:path";
@@ -21,6 +22,8 @@ export interface CliOptions {
 }
 
 export interface CliResult {
+  /** The arguments the CLI was run with (for messages). */
+  args: string[];
   code: number | null;
   signal: NodeJS.Signals | null;
   stdout: string;
@@ -45,6 +48,9 @@ export async function cli(args: string[], opts: CliOptions = {}): Promise<CliRes
   }
   env.HOME = configHome;
   env.XDG_CONFIG_HOME = configHome;
+  // Plain output. Playwright sets FORCE_COLOR for its workers, and Node warns
+  // when both are set, so drop it.
+  delete env.FORCE_COLOR;
   env.NO_COLOR = "1";
   if (opts.auth) {
     env.YEET_URL = server.baseURL;
@@ -79,6 +85,7 @@ export async function cli(args: string[], opts: CliOptions = {}): Promise<CliRes
 
   if (signal === "SIGKILL") stderr += `\n[cli helper] killed after ${timeoutMs} ms`;
   return {
+    args,
     code,
     signal,
     stdout,
@@ -99,12 +106,26 @@ export async function cliUpload(
   opts: CliOptions = {},
 ): Promise<{ url: string; id: string; result: CliResult }> {
   const result = await cli(["upload", file, ...args], { auth: true, ...opts });
+  expectExitCode(result, 0);
   const lines = result.stdout.split("\n").filter(Boolean);
-  if (result.code !== 0 || lines.length !== 1) {
-    throw new Error(
-      `yeet upload exited ${result.code} with stdout ${JSON.stringify(result.stdout)}, stderr ${JSON.stringify(result.stderr)}`,
-    );
+  if (lines.length !== 1 || !/^https?:\/\/\S+$/.test(lines[0]!)) {
+    throw new Error(`stdout was not exactly one URL: ${JSON.stringify(result.stdout)}`);
   }
   const url = lines[0]!;
   return { url, id: new URL(url).pathname.split("/")[1]!, result };
+}
+
+/** A readable dump of a CLI run, for assertion messages. */
+export function describeRun(result: CliResult): string {
+  return [
+    `yeet ${result.args.join(" ")} exited with code ${result.code}` +
+      (result.signal ? ` (signal ${result.signal})` : ""),
+    `--- stdout ---\n${result.stdout || "(empty)"}`,
+    `--- stderr ---\n${result.stderr || "(empty)"}`,
+  ].join("\n");
+}
+
+/** Assert the exit code; on failure the message shows stdout and stderr. */
+export function expectExitCode(result: CliResult, code: number): void {
+  expect(result.code, `expected exit code ${code}\n${describeRun(result)}`).toBe(code);
 }
