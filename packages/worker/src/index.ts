@@ -584,6 +584,7 @@ app.get("/:id/:filename?", async (c) => {
 
   return c.html(
     downloadPage({
+      id,
       filename: meta.filename,
       fileSize: meta.file_size ?? 0,
       expiresAt: meta.expires_at,
@@ -631,6 +632,7 @@ app.post("/:id/download", async (c) => {
       const page = (status: 401 | 429, errorMessage: string) =>
         c.html(
           downloadPage({
+            id,
             filename: meta.filename,
             fileSize: meta.file_size ?? 0,
             expiresAt: meta.expires_at,
