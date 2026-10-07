@@ -122,8 +122,9 @@ Rules of thumb:
 - Use the `tmp` fixture for files; it is removed after the test, and the run's
   temp root after the run. Delete large files as soon as you have their hash.
 - The Worker's cleanup only runs when a test calls `triggerCron()`, and it deletes
-  every expired upload. Keep cron-triggering tests in `tests/node/cron.spec.ts`,
-  which runs its tests one at a time, and give uploads in other tests expiries of
+  every expired upload. Wrap any test that triggers the cron, or needs an expired
+  upload to stay in the bucket for a while, in `exclusive("cron", async () => …)`
+  (see `tests/node/cron.spec.ts`), and give uploads in other tests expiries of
   minutes or more.
 - Opening the page of an expired upload deletes it, so do not visit an upload
   whose removal by the cron you want to observe.
@@ -197,7 +198,8 @@ These talk to wrangler's Local Explorer API
 ### Utilities — `util.ts`
 
 `eventually(check, { timeoutMs?, intervalMs?, message? })` polls until `check`
-returns a truthy value; `sleep(ms)`; `makeTempDir(prefix?)`; `serverLog()`
+returns a truthy value; `exclusive(name, fn, { timeoutMs? })` runs `fn` under a
+lock shared by all workers of the run; `sleep(ms)`; `makeTempDir(prefix?)`; `serverLog()`
 returns wrangler's output so far (e.g. to count `PUT …/parts/N` requests).
 
 ## Known limits

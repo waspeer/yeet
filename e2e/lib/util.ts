@@ -1,4 +1,4 @@
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { server } from "./env.js";
 
@@ -16,6 +16,37 @@ export function serverLog(): Promise<string> {
 /** A fresh directory inside the run's temp root (removed when the run ends). */
 export function makeTempDir(prefix = "tmp-"): Promise<string> {
   return mkdtemp(join(server.tmpRoot, prefix));
+}
+
+/**
+ * Run `fn` while holding a run-wide lock called `name`, shared by all
+ * Playwright workers (a directory in the run's temp root; mkdir is atomic).
+ * Use it for tests that would disturb each other through shared server state,
+ * such as the cron, which cleans up every expired upload at once.
+ */
+export async function exclusive<T>(
+  name: string,
+  fn: () => Promise<T>,
+  { timeoutMs = 60_000 } = {},
+): Promise<T> {
+  await mkdir(join(server.tmpRoot, "locks"), { recursive: true });
+  const lock = join(server.tmpRoot, "locks", name);
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    try {
+      await mkdir(lock);
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      if (Date.now() > deadline) throw new Error(`Timed out waiting for lock "${name}"`);
+      await sleep(100);
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    await rm(lock, { recursive: true, force: true });
+  }
 }
 
 type Truthy<T> = Exclude<T, null | undefined | false | 0 | "">;
