@@ -296,6 +296,23 @@ Evaluated on the Free plan:
 - **Rate-limited:** the page shows the form with "Too many attempts. Try again
   in N seconds." (`429`, `Retry-After`).
 
+### Range requests on `/_dl/:id`
+
+The Worker parses `Range` itself and only passes R2 a range it accepted, as
+a normalized header. Following RFC 9110 §14:
+
+- **Served (206):** one range, `bytes=<first>-<last>`, `bytes=<first>-` or
+  `bytes=-<suffix>` (unit case-insensitive). A last position past the end is
+  clamped, a suffix longer than the file is the whole file. `Content-Range`
+  and `Content-Length` describe exactly the bytes sent.
+- **Ignored (200 with the whole file, no `Content-Range`):** anything else —
+  invalid syntax (`bytes=abc`, `bytes=-`), a last position before the first
+  (`bytes=3-1`), several ranges (`bytes=0-1,3-4`, not supported) or another
+  unit. Also a suffix range on an empty file, which has no bytes to address.
+- **Unsatisfiable (416, `Content-Range: bytes */<size>`):** a first position
+  at or past the end (`bytes=5-` on a 5-byte file, any first position on an
+  empty file), or `bytes=-0`.
+
 ### Sentry
 
 - **Loading:** `@sentry/cloudflare` is imported dynamically. The bundle
