@@ -1,5 +1,7 @@
-// Password hashing, upload-token checks and signed download links. Everything
-// here uses WebCrypto, which is native to Workers and cheap on CPU time.
+// Password hashing, upload-token checks, and everything signed with keys
+// derived from the token: download links, browser sessions and download
+// passes. Everything here uses WebCrypto, which is native to Workers and cheap
+// on CPU time.
 
 const encoder = new TextEncoder();
 
@@ -67,29 +69,80 @@ export async function verifyPassword(password: string, stored: string): Promise<
 // Upload token
 // ---------------------------------------------------------------------------
 
+export const MIN_TOKEN_LENGTH = 16;
+
+export const TOKEN_TOO_SHORT = `UPLOAD_TOKEN must be set and at least ${MIN_TOKEN_LENGTH} characters long`;
+
+/** A missing or short token is refused outright: everything else is derived from it. */
+export function isUsableToken(token: string | undefined): token is string {
+  return typeof token === "string" && token.length >= MIN_TOKEN_LENGTH;
+}
+
 /** Check an `Authorization: Bearer <token>` header against the UPLOAD_TOKEN secret. */
 export async function isAuthorized(header: string | undefined, token: string): Promise<boolean> {
   if (!header?.startsWith("Bearer ")) return false;
   return safeEqual(header.slice("Bearer ".length), token);
 }
 
+/** Constant-time check of a token typed into the login form. */
+export function isCorrectToken(candidate: string, token: string): Promise<boolean> {
+  return safeEqual(candidate, token);
+}
+
+// ---------------------------------------------------------------------------
+// Keys derived from the token
+// ---------------------------------------------------------------------------
+
+// Every signature uses its own HMAC key derived from UPLOAD_TOKEN, so there is
+// no second secret to configure, and rotating the token invalidates sessions,
+// download passes and open download links at once:
+//
+//   key(label) = SHA-256("yeet-" + label + ":" + UPLOAD_TOKEN)
+
+type KeyLabel = "download" | "session" | "dlpass";
+
+// Imported keys are reused within an isolate; deriving them costs a digest and an import.
+const keyCache = new Map<string, Promise<CryptoKey>>();
+
+function signingKey(token: string, label: KeyLabel): Promise<CryptoKey> {
+  const cacheKey = `${label}:${token}`;
+  let key = keyCache.get(cacheKey);
+  if (!key) {
+    key = crypto.subtle
+      .digest("SHA-256", encoder.encode(`yeet-${label}:${token}`))
+      .then((material) =>
+        crypto.subtle.importKey("raw", material, { name: "HMAC", hash: "SHA-256" }, false, [
+          "sign",
+        ]),
+      );
+    // A rotated token leaves at most a few stale entries behind.
+    if (keyCache.size > 16) keyCache.clear();
+    keyCache.set(cacheKey, key);
+  }
+  return key;
+}
+
+async function sign(token: string, label: KeyLabel, message: string): Promise<string> {
+  const key = await signingKey(token, label);
+  return toBase64Url(await crypto.subtle.sign("HMAC", key, encoder.encode(message)));
+}
+
+/** Seconds since the epoch, as an integer. */
+export function nowSeconds(): number {
+  return Math.floor(Date.now() / 1000);
+}
+
+/** A decimal integer of at most 12 digits, as used for expiry timestamps. */
+function parseExpiry(value: string | undefined): number | null {
+  return value && /^\d{1,12}$/.test(value) ? Number(value) : null;
+}
+
 // ---------------------------------------------------------------------------
 // Signed download links
 // ---------------------------------------------------------------------------
 
-// Download links are signed with a key derived from UPLOAD_TOKEN, so there is
-// no second secret to configure. Rotating the token invalidates open links.
-async function signingKey(token: string): Promise<CryptoKey> {
-  const material = await crypto.subtle.digest("SHA-256", encoder.encode(`yeet-download:${token}`));
-  return crypto.subtle.importKey("raw", material, { name: "HMAC", hash: "SHA-256" }, false, [
-    "sign",
-  ]);
-}
-
-export async function signDownload(token: string, id: string, expires: number): Promise<string> {
-  const key = await signingKey(token);
-  const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(`${id}:${expires}`));
-  return toBase64Url(signature);
+export function signDownload(token: string, id: string, expires: number): Promise<string> {
+  return sign(token, "download", `${id}:${expires}`);
 }
 
 export async function verifyDownload(
@@ -100,4 +153,47 @@ export async function verifyDownload(
 ): Promise<boolean> {
   if (!Number.isFinite(expires) || expires * 1000 < Date.now()) return false;
   return safeEqual(await signDownload(token, id, expires), signature);
+}
+
+// ---------------------------------------------------------------------------
+// Browser sessions: v1.<expires>.<base64url(HMAC(key("session"), "session:v1:" + expires))>
+// ---------------------------------------------------------------------------
+
+export const SESSION_MAX_AGE = 90 * 24 * 60 * 60;
+
+export async function createSession(token: string): Promise<string> {
+  const expires = nowSeconds() + SESSION_MAX_AGE;
+  return `v1.${expires}.${await sign(token, "session", `session:v1:${expires}`)}`;
+}
+
+export async function verifySession(token: string, value: string | undefined): Promise<boolean> {
+  const [version, rawExpires, signature, ...rest] = (value ?? "").split(".");
+  const expires = parseExpiry(rawExpires);
+  if (version !== "v1" || expires === null || !signature || rest.length > 0) return false;
+  if (expires <= nowSeconds()) return false;
+  return safeEqual(await sign(token, "session", `session:v1:${expires}`), signature);
+}
+
+// ---------------------------------------------------------------------------
+// Download passes: <expires>.<base64url(HMAC(key("dlpass"), id + ":" + expires))>
+// ---------------------------------------------------------------------------
+
+export async function createDownloadPass(
+  token: string,
+  id: string,
+  expires: number,
+): Promise<string> {
+  return `${expires}.${await sign(token, "dlpass", `${id}:${expires}`)}`;
+}
+
+export async function verifyDownloadPass(
+  token: string,
+  id: string,
+  value: string | undefined,
+): Promise<boolean> {
+  const [rawExpires, signature, ...rest] = (value ?? "").split(".");
+  const expires = parseExpiry(rawExpires);
+  if (expires === null || !signature || rest.length > 0) return false;
+  if (expires <= nowSeconds()) return false;
+  return safeEqual(await sign(token, "dlpass", `${id}:${expires}`), signature);
 }
