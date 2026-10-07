@@ -8,7 +8,7 @@ import { Duplex, Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import zlib from "node:zlib";
 import { fixtureEntries, generatedStream } from "../fixtures.ts";
-import { createZip, type ZipEntry, type ZipOptions } from "../zip.ts";
+import { createZip, sanitizeForWindows, type ZipEntry, type ZipOptions } from "../zip.ts";
 import { manifestOf, printResults, validateZip, type Manifest } from "./validate.ts";
 
 const zlibDeflate = (level: number) => () =>
@@ -98,6 +98,16 @@ const cases: Case[] = [
     entries: () => [],
     expectFail: ["unzip -t", "unzip -x", "ditto -x -k", "7za x"],
   },
+  // Boundary: 65,534 entries fit the classic EOCD; 65,535 (0xFFFF) needs ZIP64.
+  // check.py asserts the ZIP64 end record's presence/absence structurally.
+  ...[65_534, 65_535].map(
+    (n): Case => ({
+      label: `${n} entries (ZIP64 end record boundary)`,
+      entries: () => many(n),
+      mtime: MTIME,
+      readers: ["unzip -t", "python zipfile", "7za t", "structural"],
+    }),
+  ),
   {
     label: "70,000 entries (ZIP64 end record by count)",
     entries: () => many(70_000),
@@ -152,6 +162,52 @@ async function main() {
         { path: "../etc/passwd", stream: () => generatedStream(0, () => {}) },
       ]),
     );
+    // Filename policy: NFC, case-insensitive duplicates, literal backslash.
+    const empty = (path: string): ZipEntry => ({
+      path,
+      size: 0,
+      lastModified: MTIME,
+      stream: () => generatedStream(0, () => {}),
+    });
+    await expectError("NFC duplicate (é composed vs decomposed)", () =>
+      writeZip(join(dir, "x.zip"), [empty("café.txt"), empty("café.txt")]),
+    );
+    await expectError("case-insensitive duplicate", () =>
+      writeZip(join(dir, "x.zip"), [empty("Readme.TXT"), empty("readme.txt")]),
+    );
+    {
+      const path = join(dir, "names.zip");
+      await writeZip(path, [empty("back\\slash.txt"), empty("café-nfd.txt")]);
+      const { execFileSync } = await import("node:child_process");
+      const names = JSON.parse(
+        execFileSync("python3", [
+          "-c",
+          "import json,sys,zipfile; print(json.dumps(zipfile.ZipFile(sys.argv[1]).namelist()))",
+          path,
+        ]).toString(),
+      ) as string[];
+      const ok = names.includes("back\\slash.txt") && names.includes("café-nfd.txt");
+      console.log(
+        `  ${ok ? "PASS" : "FAIL"}  backslash kept literal, NFD stored as NFC: ${JSON.stringify(names)}`,
+      );
+      allOk &&= ok;
+    }
+    const sanitizeCases: [string, string][] = [
+      ["a:b?.txt", "a_b_.txt"],
+      ["CON.txt", "_CON.txt"],
+      ["dir./name ", "dir/name"],
+      ["nul", "_nul"],
+      ["back\\slash", "back_slash"],
+      ["ok/Ünïcödé.wav", "ok/Ünïcödé.wav"],
+      ["...", "_"],
+    ];
+    for (const [input, want] of sanitizeCases) {
+      const got = sanitizeForWindows(input);
+      console.log(
+        `  ${got === want ? "PASS" : "FAIL"}  sanitizeForWindows(${JSON.stringify(input)}) = ${JSON.stringify(got)}`,
+      );
+      allOk &&= got === want;
+    }
     await expectError("source stream error", () =>
       writeZip(join(dir, "x.zip"), [
         {

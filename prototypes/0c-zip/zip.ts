@@ -210,8 +210,13 @@ async function* generate(
 
   for await (const entry of entries) {
     const path = normalizePath(entry.path);
-    if (seen.has(path)) throw new Error(`zip: duplicate path ${JSON.stringify(path)}`);
-    seen.add(path);
+    // Case-insensitive: such entries overwrite each other when extracted on
+    // macOS (default APFS) and Windows.
+    const key = path.toLowerCase();
+    if (seen.has(key)) {
+      throw new Error(`zip: duplicate path ${JSON.stringify(path)} (NFC, case-insensitive)`);
+    }
+    seen.add(key);
     const name = encoder.encode(path);
     if (name.length > MAX16) throw new Error(`zip: path too long ${JSON.stringify(path)}`);
 
@@ -334,20 +339,44 @@ function defaultDeflateRaw(): ByteTransform {
   return new CompressionStream("deflate-raw") as unknown as ByteTransform;
 }
 
+/**
+ * NFC-normalize and validate a path. "/" is the only separator; a backslash
+ * is an ordinary filename character (legal on macOS and Linux). It is
+ * replaced only by `sanitizeForWindows`, never silently turned into a separator.
+ */
 function normalizePath(path: string): string {
-  const normalized = path.replace(/\\/g, "/");
-  const parts = normalized.split("/");
+  const normalized = path.normalize("NFC");
   const directory = normalized.endsWith("/");
-  const kept = parts.filter((part) => part !== "" && part !== ".");
-  if (
-    kept.length === 0 ||
-    kept.includes("..") ||
-    normalized.startsWith("/") ||
-    /^[A-Za-z]:/.test(normalized)
-  ) {
+  const kept = normalized.split("/").filter((part) => part !== "" && part !== ".");
+  if (kept.length === 0 || kept.includes("..") || normalized.startsWith("/")) {
     throw new Error(`zip: invalid path ${JSON.stringify(path)}`);
   }
   return kept.join("/") + (directory ? "/" : "");
+}
+
+const WINDOWS_ILLEGAL = /[<>:"\\|?*\u0000-\u001f]/g; // oxlint-disable-line no-control-regex
+const WINDOWS_RESERVED = /^(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³])(\.|$)/i;
+
+/**
+ * Make a "/"-separated path extractable by Windows Explorer: replaces
+ * < > : " \ | ? * and control characters with "_", strips trailing dots and
+ * spaces from each segment, and prefixes reserved device names (CON, NUL,
+ * COM1, LPT1, also with an extension) with "_". Not applied by createZip;
+ * callers opt in. Collisions it creates are caught by createZip's duplicate
+ * check. Paths of 260+ characters are left alone (report them instead).
+ */
+export function sanitizeForWindows(path: string): string {
+  const directory = path.endsWith("/");
+  const segments = path
+    .split("/")
+    .filter((segment) => segment !== "")
+    .map((segment) => {
+      let s = segment.replace(WINDOWS_ILLEGAL, "_").replace(/[. ]+$/, "");
+      if (s === "") s = "_";
+      if (WINDOWS_RESERVED.test(s)) s = "_" + s;
+      return s;
+    });
+  return segments.join("/") + (directory ? "/" : "");
 }
 
 /** DOS date/time from a Date already shifted to the target zone (read with UTC getters), clamped to 1980..2107. */
