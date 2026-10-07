@@ -710,7 +710,7 @@ app.post("/:id/download", async (c) => {
 
   // Record the download without holding up the redirect.
   c.executionCtx.waitUntil(
-    uploads.recordDownload(id, meta).catch((err) => {
+    uploads.recordDownload(id).catch((err) => {
       console.error(`[download] Failed to record download for ${id}:`, err);
     }),
   );
@@ -736,7 +736,8 @@ app.onError((err, c) => {
 
 async function runCleanup(env: Env): Promise<void> {
   const uploads = new Uploads(env.BUCKET, env.UPLOADS_PREFIX || "uploads");
-  const stale = (await uploads.listAll()).filter(({ meta }) => {
+  const stale = (await uploads.listAll()).filter(({ meta, stray }) => {
+    if (stray) return true; // download records without an upload
     if (!meta) return false; // unreadable sidecar: leave it for a human
     const abandoned =
       !!meta.pending_upload_id &&
