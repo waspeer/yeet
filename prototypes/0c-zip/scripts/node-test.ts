@@ -34,6 +34,8 @@ interface Case {
   options?: ZipOptions;
   mtime?: number;
   readers?: string[];
+  /** Readers known to reject this variant (documented in docs/design/zip.md). */
+  expectFail?: string[];
 }
 
 const many = (n: number): ZipEntry[] =>
@@ -66,12 +68,14 @@ const cases: Case[] = [
     label: "zip64 always",
     entries: () => fixtureEntries({ sizes: "known" }),
     options: { zip64: "always" },
+    expectFail: ["ditto -x -k"],
     mtime: MTIME,
   },
   {
     label: "sizes unknown, central ZIP64 mirrors local (experimental)",
     entries: () => fixtureEntries({ sizes: "unknown" }),
     options: { experimental: { centralZip64: "mirror" } },
+    expectFail: ["ditto -x -k"],
     mtime: MTIME,
   },
   {
@@ -86,7 +90,11 @@ const cases: Case[] = [
     options: { compress: false },
     mtime: MTIME,
   },
-  { label: "empty archive", entries: () => [] },
+  {
+    label: "empty archive (byte-identical to Python's empty ZipFile)",
+    entries: () => [],
+    expectFail: ["unzip -t", "unzip -x", "ditto -x -k", "7za x"],
+  },
   {
     label: "70,000 entries (ZIP64 end record by count)",
     entries: () => many(70_000),
@@ -117,7 +125,9 @@ async function main() {
       const size = await writeZip(path, c.entries(), c.options);
       const ms = performance.now() - t0;
       const results = await validateZip(path, manifest, { mtime: c.mtime, readers: c.readers });
-      allOk = printResults(`${c.label} — ${size} bytes in ${ms.toFixed(0)} ms`, results) && allOk;
+      allOk =
+        printResults(`${c.label} — ${size} bytes in ${ms.toFixed(0)} ms`, results, c.expectFail) &&
+        allOk;
     }
     // Error paths
     console.log("\n## error paths");

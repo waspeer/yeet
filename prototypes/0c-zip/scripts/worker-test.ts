@@ -59,7 +59,8 @@ try {
     const size = (await stat(path)).size;
     const manifest = await manifestOf(fixtureEntries({ sizes }));
     const results = await validateZip(path, manifest, { mtime: MTIME });
-    allOk = printResults(`workerd /zip?${query} — ${size} bytes`, results) && allOk;
+    const expectFail = query.includes("zip64=always") ? ["ditto -x -k"] : [];
+    allOk = printResults(`workerd /zip?${query} — ${size} bytes`, results, expectFail) && allOk;
   }
 } finally {
   wrangler.kill("SIGINT");

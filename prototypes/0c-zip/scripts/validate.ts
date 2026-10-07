@@ -63,7 +63,7 @@ async function walk(dir: string): Promise<string[]> {
 }
 
 /** Compare an extraction directory against the manifest. */
-async function compareDir(
+export async function compareDir(
   dir: string,
   manifest: Manifest,
   mtime?: number,
@@ -225,12 +225,19 @@ export async function validateZip(
   return results;
 }
 
-export function printResults(label: string, results: Record<string, ReaderResult>): boolean {
+/** Print results; readers in `expectFail` print XFAIL/XPASS and do not fail the run. */
+export function printResults(
+  label: string,
+  results: Record<string, ReaderResult>,
+  expectFail: string[] = [],
+): boolean {
   let all = true;
   console.log(`\n## ${label}`);
   for (const [reader, r] of Object.entries(results)) {
-    all &&= r.ok;
-    console.log(`  ${r.ok ? "PASS" : "FAIL"}  ${reader.padEnd(16)} ${r.detail}`);
+    const expected = expectFail.includes(reader);
+    if (!expected) all &&= r.ok;
+    const status = expected ? (r.ok ? "XPASS" : "XFAIL") : r.ok ? "PASS" : "FAIL";
+    console.log(`  ${status.padEnd(5)} ${reader.padEnd(16)} ${r.detail}`);
   }
   return all;
 }
