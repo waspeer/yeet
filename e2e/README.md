@@ -87,8 +87,13 @@ Projects:
 | `webkit`   | `tests/browser/*` | download + upload pages in Playwright's WebKit (Desktop Safari)   |
 | `firefox`  | `tests/browser/*` | download + upload pages in Playwright's Firefox (Desktop Firefox) |
 
-Environment knobs: `YEET_E2E_WORKERS=<n>` (parallel workers, default 4),
+Environment knobs: `YEET_E2E_WORKERS=<n>` (parallel Playwright workers,
+default 2 so a run does not max out a laptop; raise it on a bigger machine),
 `YEET_E2E_KEEP=1` (keep the temp directory with the R2 state and print its path).
+
+Agents (and humans) iterate with `npm run verify:fast` and subsets
+(`--grep`, `--project`, one file), and run the full strict `npm run verify`
+once at the end. Never run several harness instances at the same time.
 
 ## Output
 

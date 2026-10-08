@@ -15,7 +15,8 @@ export default defineConfig({
   // If you pass --retries, such tests are reported as FLAKY and fail the run.
   retries: 0,
   failOnFlakyTests: true,
-  workers: Number(process.env.YEET_E2E_WORKERS) || 4,
+  // Two workers by default keeps the laptop quiet; YEET_E2E_WORKERS=N overrides.
+  workers: Number(process.env.YEET_E2E_WORKERS) || 2,
   reporter: [["list"], ["./lib/summary-reporter.ts"]],
   use: {
     baseURL,
