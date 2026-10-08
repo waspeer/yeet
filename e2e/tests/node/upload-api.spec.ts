@@ -238,7 +238,10 @@ test.describe("upload API", () => {
     // directly; wrangler dev itself does not enforce the Free plan's 50.
     const id = await create({ filename: "many-parts.bin" });
     const one = await putPartJson(id, 1, randomBytes(10));
-    const keys = Array.from({ length: 4100 }, (_, i) => `${server.uploadsPrefix}/${id}/.parts/${i + 2}`);
+    const keys = Array.from(
+      { length: 4100 },
+      (_, i) => `${server.uploadsPrefix}/${id}/.parts/${i + 2}`,
+    );
     for (let i = 0; i < keys.length; i += 50) {
       await Promise.all(
         keys.slice(i, i + 50).map((key) => putObject(key, "", { customMetadata: { size: "10" } })),

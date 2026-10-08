@@ -191,12 +191,20 @@ test.describe("daily cleanup (cron)", () => {
       // Valid JSON, but not a sidecar yeet can summarise (hand-edited, say).
       const bad = randomId();
       await putObject(`${prefix}/${bad}/odd.bin`, "abc");
-      await putObject(`${prefix}/${bad}/.meta.json`, JSON.stringify({ ...base, downloads: 5 }), json);
+      await putObject(
+        `${prefix}/${bad}/.meta.json`,
+        JSON.stringify({ ...base, downloads: 5 }),
+        json,
+      );
       // A valid sidecar whose summary would exceed the custom metadata R2
       // accepts (wrangler dev refuses over 8,192 bytes).
       const big = randomId();
       const long = "x".repeat(9000);
-      await putObject(`${prefix}/${big}/.meta.json`, JSON.stringify({ ...base, filename: long }), json);
+      await putObject(
+        `${prefix}/${big}/.meta.json`,
+        JSON.stringify({ ...base, filename: long }),
+        json,
+      );
       const control = await expiredControl();
 
       // The cleanup gets past both: it deletes the expired control and the

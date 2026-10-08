@@ -1,4 +1,8 @@
-import { CLEANUP_BUDGET, CLEANUP_LIST_BUDGET, runCleanup } from "../../../packages/worker/src/cleanup.js";
+import {
+  CLEANUP_BUDGET,
+  CLEANUP_LIST_BUDGET,
+  runCleanup,
+} from "../../../packages/worker/src/cleanup.js";
 import {
   LIST_BUDGET,
   PART_RECORDS_BUDGET,
@@ -188,7 +192,8 @@ test.describe("R2 calls of a listing", () => {
     // Fully listed records without a sidecar or file are stray; the cron
     // deletes them as such.
     const stray = new FakeBucket();
-    for (let r = 0; r < 30; r++) stray.seed(`${PREFIX}/s0stray/.downloads/2026-06-01T00:00:00.${r}Z_0`);
+    for (let r = 0; r < 30; r++)
+      stray.seed(`${PREFIX}/s0stray/.downloads/2026-06-01T00:00:00.${r}Z_0`);
     seedUpload(stray, idOf(1));
     const listed = await listing(stray);
     expect(listed.uploads.map((u) => [u.id, u.complete, u.stray])).toEqual([
@@ -352,7 +357,9 @@ test.describe("R2 calls of the cron", () => {
     const ids = Array.from({ length: 200 }, (_, i) => `m${String(i).padStart(4, "0")}`);
     for (const id of ids) seedUpload(bucket, id, { legacySidecar: true });
     const unsummarized = () =>
-      ids.filter((id) => !bucket.objects.get(`${PREFIX}/${id}/.meta.json`)!.customMetadata["summary"]);
+      ids.filter(
+        (id) => !bucket.objects.get(`${PREFIX}/${id}/.meta.json`)!.customMetadata["summary"],
+      );
     for (let run = 0; run < 60 && unsummarized().length > 0; run++) {
       bucket.resetCalls();
       const report = await runCleanup(bucket, PREFIX, NOW);
