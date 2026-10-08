@@ -1,4 +1,4 @@
-import { CLEANUP_BUDGET, runCleanup } from "../../../packages/worker/src/cleanup.js";
+import { CLEANUP_BUDGET, CLEANUP_LIST_BUDGET, runCleanup } from "../../../packages/worker/src/cleanup.js";
 import {
   LIST_BUDGET,
   RECORD_ATTEMPTS,
@@ -152,6 +152,31 @@ test.describe("R2 calls of a listing", () => {
     expect(resumed.truncated).toBe(false);
     expect(resumed.uploads.map((u) => u.id)).toEqual(["zzzzzz"]);
   });
+
+  test("junk pages, then sidecars without a summary: resuming skips no upload", async () => {
+    // 39 pages of keys that are no upload use all but one call; the 40th page
+    // holds 50 uploads that each need a read the budget has no room for. The
+    // next listing must start before the first of them, not after the page.
+    const bucket = new FakeBucket();
+    for (let i = 0; i < (LIST_BUDGET - 1) * 100; i++) bucket.seed(`${PREFIX}/a${i}.junk`);
+    const ids = Array.from({ length: 200 }, (_, i) => `m${String(i).padStart(4, "0")}`);
+    for (const id of ids) seedUpload(bucket, id, { legacySidecar: true });
+    const seen: string[] = [];
+    let after: string | undefined;
+    for (let round = 0; round < 20; round++) {
+      const result = await listing(bucket, after);
+      expect(result.subrequests).toBeLessThanOrEqual(LIST_BUDGET);
+      for (const upload of result.uploads) {
+        // A resumed listing never starts inside an upload.
+        expect(upload.keys, upload.id).toEqual(bucket.keys(`${PREFIX}/${upload.id}/`));
+      }
+      seen.push(...result.uploads.map((u) => u.id));
+      if (!result.truncated) break;
+      expect(result.resumeAfter).not.toBe(after);
+      after = result.resumeAfter;
+    }
+    expect(seen).toEqual(ids);
+  });
 });
 
 test.describe("R2 calls of the cron", () => {
@@ -233,6 +258,23 @@ test.describe("R2 calls of the cron", () => {
     }
     expect(cursors.at(-1)).toBeNull();
     expect(new Set(cursors).size).toBe(cursors.length); // always further, never stuck
+  });
+
+  test("junk pages, then sidecars without a summary: the cron gets to all of them", async () => {
+    const bucket = new FakeBucket();
+    // The listing's last page holds 50 junk keys and the first 25 uploads.
+    for (let i = 0; i < (CLEANUP_LIST_BUDGET - 1) * 100 + 50; i++)
+      bucket.seed(`${PREFIX}/a${i}.junk`);
+    const ids = Array.from({ length: 200 }, (_, i) => `m${String(i).padStart(4, "0")}`);
+    for (const id of ids) seedUpload(bucket, id, { legacySidecar: true });
+    const unsummarized = () =>
+      ids.filter((id) => !bucket.objects.get(`${PREFIX}/${id}/.meta.json`)!.customMetadata["summary"]);
+    for (let run = 0; run < 60 && unsummarized().length > 0; run++) {
+      bucket.resetCalls();
+      const report = await runCleanup(bucket, PREFIX, NOW);
+      expect(report.subrequests).toBeLessThanOrEqual(CLEANUP_BUDGET);
+    }
+    expect(unsummarized()).toEqual([]);
   });
 
   test("a small bucket: one run does everything and leaves no cursor", async () => {

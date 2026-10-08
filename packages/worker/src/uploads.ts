@@ -350,7 +350,8 @@ export class Uploads {
    *
    * Stops when the budget is spent, and then returns the uploads listed so
    * far (never a partly listed last one) with `truncated: true` and the
-   * key to continue after (`resumeAfter`), which `after` takes.
+   * key to continue after (`resumeAfter`), which `after` takes: right before
+   * the first upload it leaves out, so a resumed listing skips none.
    */
   async listAll(opts: { budget?: number; after?: string } = {}): Promise<Listing> {
     const budget = opts.budget ?? LIST_BUDGET;
@@ -358,13 +359,16 @@ export class Uploads {
     interface Group extends Omit<ListedUpload, "stray" | "unsummarized"> {
       sidecar: boolean;
       others: number;
+      /** A key right before this upload's first, or undefined for the start of the bucket. */
+      before: string | undefined;
     }
     const groups: Group[] = [];
     let calls = 0;
     let truncated = false;
+    const start = opts.after !== undefined && opts.after.startsWith(base) ? opts.after : undefined;
     let next: { cursor?: string; startAfter?: string } =
-      opts.after !== undefined && opts.after.startsWith(base) ? { startAfter: opts.after } : {};
-    let lastKey = next.startAfter;
+      start !== undefined ? { startAfter: start } : {};
+    let lastKey = start; // the last key listed
     const readsNeeded = (list: Group[]) => list.filter((g) => g.sidecar && !g.meta).length;
 
     for (;;) {
@@ -376,6 +380,8 @@ export class Uploads {
       const page = await this.bucket.list({ prefix: base, ...next, include: ["customMetadata"] });
       calls++;
       for (const object of page.objects) {
+        const previousKey = lastKey;
+        lastKey = object.key;
         const [id, ...rest] = object.key.slice(base.length).split("/");
         if (!id || !isValidId(id) || rest.length === 0) continue;
         let group = groups.at(-1);
@@ -388,6 +394,9 @@ export class Uploads {
             legacyRecords: false,
             sidecar: false,
             others: 0,
+            // After the previous upload rather than its last key listed,
+            // which may lie inside a run the listing jumped over.
+            before: group ? this.keyAfter(group.id) : previousKey,
           };
           groups.push(group);
         }
@@ -407,7 +416,6 @@ export class Uploads {
       // A page that ends inside an upload's `.downloads/` or `.parts/` run:
       // continue after the run. Its keys (times, hex, digits) sort before '~'.
       const last = page.objects.at(-1)?.key ?? "";
-      if (last) lastKey = last;
       const [lastId, ...lastRest] = last.slice(base.length).split("/");
       const bulk = BULK_DIRS.find((dir) => lastRest.join("/").startsWith(dir));
       if (bulk && lastId && isValidId(lastId)) {
@@ -420,17 +428,12 @@ export class Uploads {
 
     // Keys of one upload are contiguous, so every upload but the last is
     // listed completely; the last only if the listing reached the end.
-    let listed = truncated && groups.length > 1 ? groups.slice(0, -1) : groups;
-    if (truncated && groups.length === 1) {
-      // One upload with more keys than the budget lists: not a yeet upload
-      // (those have a handful plus the runs skipped above). Report it as
-      // incomplete so the cron moves past it rather than stalling.
-      groups[0]!.complete = false;
-    }
+    if (truncated && groups.length > 0) groups.at(-1)!.complete = false;
+    const candidates = truncated ? groups.slice(0, -1) : groups;
     // The reads of old sidecars, as far as the budget goes.
     let reads = 0;
     const kept: Group[] = [];
-    for (const group of listed) {
+    for (const group of candidates) {
       const read = group.sidecar && !group.meta ? 1 : 0;
       if (calls + reads + read > budget) {
         truncated = true;
@@ -439,34 +442,43 @@ export class Uploads {
       reads += read;
       kept.push(group);
     }
-    listed = kept;
+
+    // Resume right before the first upload left out, or after the last key
+    // listed if none was (the budget went on keys that are no upload).
+    let resumeAfter: string | undefined;
+    let unread: Group | undefined;
+    if (truncated) {
+      const firstLeft = groups[kept.length];
+      resumeAfter = firstLeft ? firstLeft.before : lastKey;
+      if (firstLeft && resumeAfter === start) {
+        // Nothing before it was listed: the budget does not stretch to this
+        // one upload (more keys than it lists, not a yeet upload). Return it
+        // unread, and incomplete if partly listed, so that the next listing
+        // gets past it rather than stalling.
+        unread = firstLeft;
+        kept.push(firstLeft);
+        resumeAfter = this.keyAfter(firstLeft.id);
+      }
+    }
 
     const uploads = await Promise.all(
-      listed.map(async ({ sidecar, others, ...group }): Promise<ListedUpload> => {
-        let meta = group.meta;
-        if (sidecar && !meta) {
+      kept.map(async (group): Promise<ListedUpload> => {
+        const { sidecar, others, before: _, ...listed } = group;
+        let meta = listed.meta;
+        if (sidecar && !meta && group !== unread) {
           calls++;
-          const full = await this.readMeta(group.id).catch(() => null);
+          const full = await this.readMeta(listed.id).catch(() => null);
           meta = full && summarize(full);
         }
         return {
-          ...group,
+          ...listed,
           meta,
           stray: !sidecar && others === 0,
-          unsummarized: sidecar && !group.meta,
+          unsummarized: sidecar && !listed.meta,
         };
       }),
     );
-    const lastListed = uploads.at(-1)?.id;
-    return {
-      uploads,
-      truncated,
-      subrequests: calls,
-      // After the last upload listed or, if there is none (the budget went
-      // on keys that are no upload), after the last key seen, so the next
-      // listing always gets further.
-      ...(truncated ? { resumeAfter: lastListed ? this.keyAfter(lastListed) : lastKey } : {}),
-    };
+    return { uploads, truncated, subrequests: calls, ...(truncated ? { resumeAfter } : {}) };
   }
 
   /**
