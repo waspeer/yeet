@@ -362,11 +362,29 @@ Numbers that are signed or used as keys must be spelled one way only:
       `400 {"error": "Part <n> is <s> bytes but is followed by more parts: …"}`.
   - **The records:** deleted once the upload completes, and with the upload
     otherwise (delete, cleanup).
-  - **Limit (not enforced):** `complete` reads the records with one list
-    call per 100 parts (`readPartSizes()`, with metadata), without a budget.
-    Above roughly 4,400 parts that passes the Free plan's 50 subrequests and
-    the request fails. The CLI and the upload page always send the size, so
-    they never take this path; only a hand-made client could.
+  - **Limit:** `complete` makes 4 subrequests besides the records (the
+    Bearer rate-limit call, the sidecar read, the multipart complete, the
+    sidecar write), reads the records with one list call per page
+    (`readPartSizes()`, with metadata) and deletes them afterwards, one
+    call per 1,000. That must fit in the Free plan's 50: at 100 records per
+    list call, 4 + ceil(n / 100) + ceil(n / 1,000) ≤ 50, so at most
+    **4,100 parts** (exactly 50 subrequests). With more records it stops
+    listing as soon as they cannot fit (`PART_RECORDS_BUDGET`, 46 calls)
+    and answers `400 {"error": "Too many parts to complete an upload of
+    unknown size in one request; start the upload again with its size"}`
+    before completing anything; the upload stays pending. Records of parts
+    not in the request count too. If R2 returns fewer records per list
+    call the limit is lower; more, higher. Counted on the in-memory bucket
+    (`e2e/tests/node/r2-budget.spec.ts`); before this check, 4,101 to
+    4,700 parts failed *after* the multipart complete (from 4,601 even
+    before the sidecar write, leaving a completed file under a pending
+    sidecar). The CLI and the upload page always send the size, so they
+    never take this path; only a hand-made client could. Not covered: a
+    size given at `complete` that does not match the stored object makes
+    the request delete the upload too (a listing and deletes of all its
+    keys), which by the same count passes 50 above about 3,800 parts
+    (computed, not measured); the request then fails half-way, and the cron
+    deletes the rest after 24 hours.
   - **Why not check per part:** with the size unknown, a short part is only
     wrong once a higher one exists. That would cost a bucket listing on every
     `PUT`.
@@ -414,6 +432,9 @@ written back. On a failure it reads again after a random wait (up to
   whole `POST /:id/download` makes at most 9 subrequests: the sidecar read,
   2 rate-limit calls for a protected file (`reserve` + `refund`) and the 6.
   The waits are wall time, not CPU.
+- **A sidecar that is not shaped like one** (see "Sidecars that never get
+  a summary" below) is not counted and not written: `recordDownload()`
+  returns false instead of throwing in `waitUntil`.
 - **Why not one object per download** (the design of 1D/1E): every download
   added an object to the listing, and listing them was bounded only by
   assuming 1,000 objects per list call. With metadata a list call returns at
@@ -463,6 +484,29 @@ in-memory bucket by `e2e/tests/node/r2-capacity.spec.ts`:
   bucket of nothing but such sidecars shows **39** (one list call, then 39
   reads). The cron adds the missing summaries, 21 per run (below); the
   one-time script below adds them all at once.
+- **Sidecars that never get a summary cost that read for good**, in every
+  `GET /api/uploads` and (2 calls reserved, 1 spent) in every cron run
+  that lists them: neither the cron nor the script writes one for
+  - a sidecar that is not valid JSON, or valid JSON not shaped like a
+    sidecar (`parseUploadMeta()`: e.g. `{}`, `"downloads": 5`, a
+    `download_count` that is a string). Such an upload is treated as
+    unreadable everywhere: left out of `GET /api/uploads`, its downloads
+    not counted, never deleted by the cron. It never stops a listing or a
+    cron run. (The download page reads the sidecar on its own: it fails
+    on invalid JSON, and works as long as the fields it uses are usable.)
+  - a sidecar whose summary would take more than 2,048 bytes of custom
+    metadata (`MAX_SUMMARY_BYTES`; only with a filename or download times
+    far longer than yeet writes). It is listed, counted and cleaned up
+    normally, just read each time. R2 refuses custom metadata over its
+    own limit (`wrangler dev`: 8,192 bytes), which used to make the cron
+    throw on such a sidecar; `writeMeta()` now leaves the summary out.
+
+  The fix is by hand: repair the sidecar's JSON (it is the upload's
+  `<prefix>/<id>/.meta.json`, see `UploadMeta` in `uploads.ts`), after
+  which the next cron run or the script adds the summary, or delete the
+  upload (`yeet delete <id>`, `DELETE /api/uploads/:id`, or its objects in
+  the dashboard). The script's `unreadable` and `tooLarge` counts, with
+  `--verbose`, name them.
 - **Each upload whose `.parts/` or legacy `.downloads/` run ends a page**
   costs one more call. Pending uploads of unknown size and legacy records
   also take room in the pages they share.
@@ -471,8 +515,8 @@ in-memory bucket by `e2e/tests/node/r2-capacity.spec.ts`:
 
 `e2e/tests/node/r2-budget.spec.ts` counts the calls on the Worker's own
 modules with an in-memory bucket that returns at most 100 objects per call
-and, like the Free plan, throws past 50. `r2-adversarial.spec.ts` and
-`r2-orphans.spec.ts` add a stricter bucket (`e2e/lib/strict-r2.ts`: short
+and, like the Free plan, throws past 50. `r2-adversarial.spec.ts`,
+`r2-adversarial-1g.spec.ts` and `r2-orphans.spec.ts` add a stricter bucket (`e2e/lib/strict-r2.ts`: short
 and empty pages, junk keys, IDs that are prefixes of each other).
 
 ### Cleanup (cron)
@@ -511,6 +555,16 @@ calls**:
 upload: when a run's calls (or a `DELETE /api/uploads/:id`) stop half-way,
 what is left still has its sidecar, and the next run finds it stale and
 goes on. Keys left without a sidecar would never be cleaned up.
+
+**Never cleaned up by the cron:** uploads whose sidecar it cannot read
+(not valid JSON or not shaped like one, see the listing above; such a
+sidecar never stops a run), and an upload directory with more keys that
+yeet does not write sorting before its `.meta.json` than a run lists
+(outside `.downloads/` and `.parts/`, which the listing jumps over; about
+2,500 at 100 per list call): no run reaches its sidecar, so none sees it
+as stale; each returns it unread and goes on after it instead of
+stalling (`e2e/tests/node/r2-adversarial-1g.spec.ts`, with 30,000 such
+keys). yeet itself never writes such keys.
 
 So the order is stable across runs and each run continues where the last
 one stopped: a bucket of N uploads is gone through in about N / 1,249 days,
@@ -560,20 +614,29 @@ node scripts/backfill-summaries.mjs --remote --bucket <bucket_name> --apply  # w
   `wrangler dev` first). One of the two is required. `--prefix` defaults to
   `uploads`; pass your `UPLOADS_PREFIX` if you changed it.
 - **What it touches:** only `<prefix>/<id>/.meta.json` objects without a
-  readable `summary` custom metadata. Each is read and written back with
-  the same JSON content, plus the summary and `Content-Type:
-  application/json`. Files, part records, legacy records and other keys are
-  only listed.
+  usable `summary` custom metadata (missing, not JSON, or not shaped like
+  a summary such as `"null"`: the listing's own check). Each is read and
+  written back with the same JSON content, plus the summary and
+  `Content-Type: application/json`. Files, part records, legacy records
+  and other keys are only listed.
+- **Other custom metadata and HTTP metadata of the sidecar are dropped:**
+  the write replaces the object, and `writeMeta()` sets only `summary` and
+  the content type, so e.g. the `mtime` rclone stores in custom metadata
+  is gone afterwards. yeet does not read it; the cron's summary step does
+  the same. The JSON body is unchanged.
 - **Safe:** a dry run unless `--apply`. Idempotent: a second run finds
   nothing to do. Each write is conditional on the etag it read, so a
   download counted (or an upload deleted) in between is never overwritten;
   it is reported as `changed`, and the Worker wrote that sidecar's summary
-  itself. Sidecars that are not valid JSON are left alone (`unreadable`).
+  itself. Sidecars that are not valid JSON or not shaped like a sidecar
+  (`{}`, `[]`, `"downloads": 5`, …) are left alone (`unreadable`), and so
+  are ones whose summary would exceed 2,048 bytes (`tooLarge`); see
+  "Sidecars that never get a summary" above.
 - **Cost:** one list call per page of objects, plus a get and a put per
   sidecar written. These are API calls from your machine, not Worker
   subrequests.
 - **Output:** one JSON line, e.g.
-  `{"apply":true,"sidecars":120,"missing":118,"written":118,"changed":0,"unreadable":0}`;
+  `{"apply":true,"sidecars":120,"missing":118,"written":118,"changed":0,"unreadable":0,"tooLarge":0}`;
   `--verbose` names each key on stderr.
 - **Tested** on the in-memory bucket and, end to end, on a `wrangler dev`
   bucket (`e2e/tests/node/backfill.spec.ts`). Not yet run against real R2:

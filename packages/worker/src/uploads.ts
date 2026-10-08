@@ -81,6 +81,15 @@ export const RECORD_ATTEMPTS = 3;
 export const LIST_BUDGET = 40;
 
 /**
+ * R2 calls `POST /api/uploads/:id/complete` of an upload of unknown size may
+ * spend on its part records (readPartSizes() and their deletion): the Free
+ * plan's 50 subrequests minus its 4 other ones (the Bearer rate-limit call,
+ * the sidecar read, the multipart complete and the sidecar write). With 100
+ * records per list call that is 4,100 parts.
+ */
+export const PART_RECORDS_BUDGET = 50 - 4;
+
+/**
  * Upload IDs are base64url. Anything else — in particular dot-segments
  * smuggled in via %2F — must never be turned into an object key, where it
  * could address objects outside the uploads prefix.
@@ -112,7 +121,15 @@ export function generateId(): string {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").slice(0, 6);
 }
 
-/** What listing and cleanup need, stored as R2 custom metadata (2 KB max). */
+/**
+ * The most bytes (keys plus values, UTF-8) of summary custom metadata yeet
+ * writes. R2 refuses custom metadata above its own limit (miniflare enforces
+ * 8,192 bytes); 2,048 keeps well clear of it. A summary that does not fit is
+ * not written (see toCustomMetadata()).
+ */
+export const MAX_SUMMARY_BYTES = 2048;
+
+/** What listing and cleanup need, stored as R2 custom metadata (see MAX_SUMMARY_BYTES). */
 export interface UploadSummary {
   filename: string;
   file_size: number;
@@ -125,6 +142,56 @@ export interface UploadSummary {
   recent_downloads: string[];
 }
 
+const isString = (value: unknown): value is string => typeof value === "string";
+const isCount = (value: unknown): value is number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+const isObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+const optional = <T>(value: unknown, check: (value: unknown) => value is T): boolean =>
+  value === undefined || check(value);
+
+/**
+ * The body of a sidecar as an UploadMeta, or null if it does not have that
+ * shape: the fields summarize() and the cron read must have their types. A
+ * sidecar that fails this (e.g. a hand-edited `"downloads": 5`) is treated
+ * like one that is not valid JSON: not listed, not counted, not cleaned up,
+ * and never allowed to stop a listing or a cron run.
+ */
+export function parseUploadMeta(value: unknown): UploadMeta | null {
+  if (!isObject(value)) return null;
+  const { downloads, recent_downloads } = value;
+  const ok =
+    isString(value.filename) &&
+    isString(value.uploaded_at) &&
+    isString(value.expires_at) &&
+    optional(value.file_size, isCount) &&
+    optional(value.password_hash, isString) &&
+    optional(value.pending_upload_id, isString) &&
+    optional(value.download_count, isCount) &&
+    (recent_downloads === undefined ||
+      (Array.isArray(recent_downloads) && recent_downloads.every(isString))) &&
+    (downloads === undefined ||
+      (Array.isArray(downloads) && downloads.every((d) => isObject(d) && isString(d.at))));
+  return ok ? (value as unknown as UploadMeta) : null;
+}
+
+/** A summary read back from custom metadata, or null if it does not have the shape written. */
+export function parseSummary(value: unknown): UploadSummary | null {
+  if (!isObject(value)) return null;
+  const ok =
+    isString(value.filename) &&
+    isCount(value.file_size) &&
+    isString(value.uploaded_at) &&
+    isString(value.expires_at) &&
+    typeof value.has_password === "boolean" &&
+    optional(value.pending_upload_id, isString) &&
+    isCount(value.download_count) &&
+    Array.isArray(value.recent_downloads) &&
+    value.recent_downloads.every(isString);
+  return ok ? (value as unknown as UploadSummary) : null;
+}
+
+/** Only for a sidecar parseUploadMeta() accepts; anything else may throw. */
 export function summarize(meta: UploadMeta): UploadSummary {
   const downloads = meta.downloads ?? [];
   return {
@@ -187,14 +254,38 @@ export interface Listing {
   resumeAfter?: string;
 }
 
+const utf8Length = (text: string) => new TextEncoder().encode(text).length;
+
+/**
+ * The summary custom metadata of a sidecar, or none if the sidecar is not
+ * shaped like one (parseUploadMeta()) or its summary would take more than
+ * MAX_SUMMARY_BYTES (a filename or download times far longer than yeet
+ * writes). Without it the sidecar is written all the same, and listings
+ * read its body instead, as for a sidecar of yeet < 0.2.
+ */
 function toCustomMetadata(meta: UploadMeta): Record<string, string> {
-  return { summary: JSON.stringify(summarize(meta)) };
+  const valid = parseUploadMeta(meta);
+  if (!valid) return {};
+  const summary = JSON.stringify(summarize(valid));
+  return utf8Length("summary") + utf8Length(summary) <= MAX_SUMMARY_BYTES ? { summary } : {};
 }
 
-function fromCustomMetadata(custom: Record<string, string> | undefined): UploadSummary | null {
+/** Whether a sidecar's summary fits in its custom metadata (see toCustomMetadata()). */
+export function canStoreSummary(meta: UploadMeta): boolean {
+  return "summary" in toCustomMetadata(meta);
+}
+
+/**
+ * The summary in a sidecar's custom metadata, or null without a usable one
+ * (missing, not JSON, or not shaped like a summary, `"null"` included). The
+ * listing and the migration script (backfill.ts) both decide with this.
+ */
+export function summaryFromCustomMetadata(
+  custom: Record<string, string> | undefined,
+): UploadSummary | null {
   if (!custom?.summary) return null;
   try {
-    return JSON.parse(custom.summary) as UploadSummary;
+    return parseSummary(JSON.parse(custom.summary));
   } catch {
     return null;
   }
@@ -237,11 +328,27 @@ export class Uploads {
     return `${this.dir(id).slice(0, -1)}0`;
   }
 
-  /** Read the metadata sidecar, or null if the upload does not exist. */
+  /**
+   * Read the metadata sidecar, or null if the upload does not exist. Throws
+   * if it is not valid JSON; its shape is not checked (the pages need only a
+   * few of its fields). Listing, counting and cleanup use readSidecar().
+   */
   async readMeta(id: string): Promise<UploadMeta | null> {
     const object = await this.bucket.get(this.dir(id) + ".meta.json");
     if (!object) return null;
     return object.json<UploadMeta>();
+  }
+
+  /**
+   * Read the metadata sidecar (1 R2 call) for code that must not stop on a
+   * bad one: `meta` is null if it is missing, not valid JSON, or not shaped
+   * like a sidecar (parseUploadMeta()); `etag` is set whenever it exists.
+   */
+  async readSidecar(id: string): Promise<{ etag: string | null; meta: UploadMeta | null }> {
+    const object = await this.bucket.get(this.dir(id) + ".meta.json");
+    if (!object) return { etag: null, meta: null };
+    const body = await object.json<unknown>().catch(() => null);
+    return { etag: object.etag, meta: parseUploadMeta(body) };
   }
 
   /**
@@ -279,13 +386,27 @@ export class Uploads {
     });
   }
 
-  /** The recorded part sizes of an upload, and the keys of their records. */
-  async readPartSizes(id: string): Promise<{ sizes: Map<number, number>; keys: string[] }> {
+  /**
+   * The recorded part sizes of an upload, and the keys of their records, or
+   * null if listing them (one call per page, with metadata) and deleting
+   * them afterwards (deleteKeys(): one call per 1,000) would take more than
+   * `budget` R2 calls. It stops listing as soon as that is certain, so it
+   * makes at most `budget` calls itself.
+   */
+  async readPartSizes(
+    id: string,
+    budget = Infinity,
+  ): Promise<{ sizes: Map<number, number>; keys: string[] } | null> {
     const prefix = `${this.dir(id)}.parts/`;
     const sizes = new Map<number, number>();
     const keys: string[] = [];
     let cursor: string | undefined;
+    let calls = 0;
+    const deletes = () => Math.ceil(keys.length / 1000);
     do {
+      // This call, and at least the deletes of the records found so far.
+      if (calls + 1 + deletes() > budget) return null;
+      calls++;
       const page = await this.bucket.list({ prefix, cursor, include: ["customMetadata"] });
       for (const object of page.objects) {
         keys.push(object.key);
@@ -295,7 +416,7 @@ export class Uploads {
       }
       cursor = page.truncated ? page.cursor : undefined;
     } while (cursor);
-    return { sizes, keys };
+    return calls + deletes() > budget ? null : { sizes, keys };
   }
 
   async exists(id: string): Promise<boolean> {
@@ -317,14 +438,12 @@ export class Uploads {
    * waitUntil(), after the response. Returns whether it counted.
    */
   async recordDownload(id: string, at: string): Promise<boolean> {
-    const key = this.dir(id) + ".meta.json";
     for (let attempt = 1; ; attempt++) {
       const started = Date.now();
-      const object = await this.bucket.get(key);
-      if (!object) return false;
-      const meta = await object.json<UploadMeta>();
-      if (meta.pending_upload_id) return false;
-      if (await this.writeMeta(id, withDownload(meta, at), { etagMatches: object.etag })) {
+      const { etag, meta } = await this.readSidecar(id);
+      // Gone, pending, or a sidecar that cannot be counted in (see readSidecar()).
+      if (!etag || !meta || meta.pending_upload_id) return false;
+      if (await this.writeMeta(id, withDownload(meta, at), { etagMatches: etag })) {
         return true;
       }
       if (attempt >= RECORD_ATTEMPTS) return false;
@@ -421,7 +540,7 @@ export class Uploads {
         group.others++;
         if (name === ".meta.json") {
           group.sidecar = true;
-          group.meta = fromCustomMetadata(object.customMetadata);
+          group.meta = summaryFromCustomMetadata(object.customMetadata);
         }
       }
       if (!page.truncated) break;
@@ -479,8 +598,11 @@ export class Uploads {
         let meta = listed.meta;
         if (sidecar && !meta && group !== unread && opts.deferReads === undefined) {
           calls++;
-          const full = await this.readMeta(listed.id).catch(() => null);
-          meta = full && summarize(full);
+          // A sidecar that is unreadable or not shaped like one is listed
+          // without a summary (left out of GET /api/uploads, left alone by
+          // the cron), never an error that stops the listing.
+          const full = await this.readSidecar(listed.id).catch(() => null);
+          meta = full?.meta ? summarize(full.meta) : null;
         }
         return {
           ...listed,
@@ -499,16 +621,19 @@ export class Uploads {
    * custom metadata, so listings read it from their pages instead of one
    * read each. Conditional on the sidecar being unchanged since read, so it
    * never overwrites a download counted meanwhile (which writes the summary
-   * itself). Returns the sidecar read (null if gone or unreadable), whether
-   * it wrote, and the R2 calls made: 2, or 1 without a sidecar to write.
+   * itself). Returns the sidecar read (null if gone, unreadable or not
+   * shaped like a sidecar, see readSidecar()), whether it wrote, and the R2
+   * calls made: 2, or 1 without a summary to write. A sidecar whose summary
+   * does not fit (MAX_SUMMARY_BYTES) is returned but not written: it stays
+   * without one, and costs a read in every listing.
    */
   async addSummary(
     id: string,
   ): Promise<{ meta: UploadMeta | null; written: boolean; calls: number }> {
-    const object = await this.bucket.get(this.dir(id) + ".meta.json");
-    const meta = await object?.json<UploadMeta>().catch(() => null);
-    if (!object || !meta) return { meta: null, written: false, calls: 1 };
-    const written = await this.writeMeta(id, meta, { etagMatches: object.etag });
+    const { etag, meta } = await this.readSidecar(id);
+    if (!etag || !meta) return { meta: null, written: false, calls: 1 };
+    if (!canStoreSummary(meta)) return { meta, written: false, calls: 1 };
+    const written = await this.writeMeta(id, meta, { etagMatches: etag });
     return { meta, written, calls: 2 };
   }
 
@@ -535,22 +660,33 @@ export class Uploads {
       throw new Error(`Unsafe prefix: ${JSON.stringify(prefix)}`);
     }
     let calls = 0;
+    // The sidecars seen, kept until everything else is gone.
+    const sidecars = new Set<string>();
+    // Set after a page that held nothing but sidecars (see below).
+    let startAfter: string | undefined;
     while (calls + 2 <= maxCalls) {
-      const page = await this.bucket.list({ prefix });
+      const page = await this.bucket.list({ prefix, ...(startAfter ? { startAfter } : {}) });
       calls++;
+      startAfter = undefined;
       const keys = page.objects.map((object) => object.key);
       const others = keys.filter((key) => !this.isSidecarKey(key));
-      const sidecars = keys.filter((key) => this.isSidecarKey(key));
+      for (const key of keys) if (this.isSidecarKey(key)) sidecars.add(key);
       if (others.length > 0) {
         await this.bucket.delete(others);
         calls++;
       }
-      // More to list (each round lists from the start, minus what is gone).
-      if (page.truncated) continue;
+      if (page.truncated) {
+        // More to list. Each round lists from the start, minus what is
+        // gone, except after a page with nothing to delete (only the
+        // sidecar, on a short page): listing from the start would return it
+        // again, so the next round starts after it instead.
+        if (others.length === 0) startAfter = keys.at(-1);
+        continue;
+      }
       // Everything else is gone: only the sidecar may be left.
-      if (sidecars.length === 0) return { calls, done: true };
+      if (sidecars.size === 0) return { calls, done: true };
       if (calls + 1 > maxCalls) break;
-      await this.bucket.delete(sidecars);
+      await this.bucket.delete([...sidecars]);
       calls++;
       return { calls, done: true };
     }

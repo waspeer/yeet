@@ -185,12 +185,12 @@ test("the migration script on a local wrangler dev bucket: dry run, apply, idemp
 
   const dry = await runScript(target);
   expect(dry.code, dry.stderr).toBe(0);
-  expect(counts(dry)).toEqual({ apply: false, sidecars: 4, missing: 3, written: 0, changed: 0, unreadable: 0 });
+  expect(counts(dry)).toEqual({ apply: false, sidecars: 4, missing: 3, written: 0, changed: 0, unreadable: 0, tooLarge: 0 });
 
   // The dry run wrote nothing: --apply still finds all three.
   const apply = await runScript([...target, "--apply"]);
   expect(apply.code, apply.stderr).toBe(0);
-  expect(counts(apply)).toEqual({ apply: true, sidecars: 4, missing: 3, written: 3, changed: 0, unreadable: 0 });
+  expect(counts(apply)).toEqual({ apply: true, sidecars: 4, missing: 3, written: 3, changed: 0, unreadable: 0, tooLarge: 0 });
 
   const again = await runScript([...target, "--apply"]);
   expect(again.code, again.stderr).toBe(0);
