@@ -183,6 +183,20 @@ test.describe("R2 calls of a listing", () => {
     expect(result.uploads.map((u) => [u.id, u.complete, u.stray])).toEqual([
       [idOf(0), false, false],
     ]);
+
+    // Fully listed records without a sidecar or file are stray; the cron
+    // deletes them as such.
+    const stray = new FakeBucket();
+    for (let r = 0; r < 30; r++) stray.seed(`${PREFIX}/s0stray/.downloads/2026-06-01T00:00:00.${r}Z_0`);
+    seedUpload(stray, idOf(1));
+    const listed = await listing(stray);
+    expect(listed.uploads.map((u) => [u.id, u.complete, u.stray])).toEqual([
+      ["s0stray", true, true],
+      [idOf(1), true, false],
+    ]);
+    stray.resetCalls();
+    expect(await runCleanup(stray, PREFIX, NOW)).toMatchObject({ deleted: 1, recordsCleared: 0 });
+    expect(stray.keys(`${PREFIX}/s0stray/`)).toEqual([]);
   });
 
   test("junk pages, then sidecars without a summary: resuming skips no upload", async () => {
