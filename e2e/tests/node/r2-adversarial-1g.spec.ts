@@ -1,11 +1,22 @@
 import { CLEANUP_BUDGET, runCleanup } from "../../../packages/worker/src/cleanup.js";
 import { backfillSummaries } from "../../../packages/worker/src/backfill.js";
-import { LIST_BUDGET, summarize, Uploads, withDownload, type UploadMeta } from "../../../packages/worker/src/uploads.js";
+import {
+  LIST_BUDGET,
+  MAX_SUMMARY_BYTES,
+  summarize,
+  Uploads,
+  withDownload,
+  type UploadMeta,
+} from "../../../packages/worker/src/uploads.js";
 import { expect, test } from "../../lib/index.js";
 import { StrictBucket, seededRandom } from "../../lib/strict-r2.js";
 
-// Independent verifier of round 1G: adversarial checks of the resume logic,
-// sidecar-last deletion, stray detection, summary-first cron and backfill.
+// Written by the independent verifier of round 1G (adversarial checks of the
+// resume logic, sidecar-last deletion, stray detection, summary-first cron
+// and backfill) on the stricter bucket of lib/strict-r2.ts, and adopted in
+// round 1H: what the verifier only logged is asserted here, as fixed or
+// as documented in docs/design/api.md. Round 1H added the malformed and
+// oversized sidecar cases.
 
 const P = "uploads";
 const DAY = 86_400_000;
@@ -302,23 +313,166 @@ test.describe("1G verifier: backfill", () => {
     expect(JSON.parse(b.objects.get(`${P}/race/.meta.json`)!.body).download_count).toBe(1);
   });
 
-  test("summary 'null': backfill and listing disagree", async () => {
-    const b = new StrictBucket({ maxCalls: Infinity });
+  test("a summary that is not one ('null', '5', '{}'): backfill and listing agree it is missing", async () => {
     const meta: UploadMeta = { filename: "f", file_size: 1, uploaded_at: new Date(NOW).toISOString(), expires_at: new Date(NOW + DAY).toISOString() };
-    b.seed(`${P}/a/.meta.json`, JSON.stringify(meta), { summary: "null" });
-    const rep = await backfillSummaries(b, P, { apply: true });
-    const l = await new Uploads(b, P).listAll();
-    console.log(`summary null: backfill missing=${rep.missing}; listing unsummarized=${l.uploads[0]!.unsummarized}`);
+    for (const summary of ["null", "5", "{}", '"x"', "[]"]) {
+      const b = new StrictBucket({ maxCalls: Infinity });
+      b.seed(`${P}/a/.meta.json`, JSON.stringify(meta), { summary });
+      const l = await new Uploads(b, P).listAll();
+      expect(l.uploads[0]!.unsummarized, summary).toBe(true);
+      expect(l.uploads[0]!.meta, summary).toEqual(summarize(meta)); // read from the body
+      const rep = await backfillSummaries(b, P, { apply: true });
+      expect(rep, summary).toMatchObject({ missing: 1, written: 1 });
+      expect(JSON.parse(b.objects.get(`${P}/a/.meta.json`)!.meta.summary!)).toEqual(summarize(meta));
+      expect((await new Uploads(b, P).listAll()).uploads[0]!.unsummarized, summary).toBe(false);
+    }
   });
 
-  test("malformed legacy sidecar (downloads: 5): does the cron survive?", async () => {
-    const b = new StrictBucket({ maxCalls: 45 });
-    const bad = { filename: "f", file_size: 1, uploaded_at: new Date(NOW).toISOString(), expires_at: new Date(NOW - 1).toISOString(), downloads: 5 };
-    b.seed(`${P}/a/.meta.json`, JSON.stringify(bad));
-    seedUpload(b, "b", { expired: true });
-    let error = "";
-    for (let r = 0; r < 3; r++) await runCleanup(b, P, NOW).catch((e) => { error = String(e); });
-    console.log(`malformed sidecar: cron error=${error || "none"}; b left=${b.sorted(`${P}/b/`).length}`);
+  test("valid JSON that is not a sidecar ({}, [], 5, \"x\") gets no summary", async () => {
+    const b = new StrictBucket({ maxCalls: Infinity });
+    const bodies = ["{}", "[]", "5", '"x"', "null", '{"filename":"f"}'];
+    bodies.forEach((body, i) => b.seed(`${P}/n${i}/.meta.json`, body));
+    const before = new Map([...b.objects].map(([k, o]) => [k, { ...o }]));
+    const rep = await backfillSummaries(b, P, { apply: true });
+    expect(rep).toMatchObject({ sidecars: bodies.length, missing: bodies.length, written: 0, unreadable: bodies.length });
+    expect(new Map([...b.objects].map(([k, o]) => [k, { ...o }]))).toEqual(before);
+  });
+});
+
+/** Sidecar bodies that are valid JSON but cannot be summarised. */
+const MALFORMED: Record<string, unknown> = {
+  "downloads: 5": { downloads: 5 },
+  "downloads: string": { downloads: "many" },
+  "downloads: [null]": { downloads: [null] },
+  "downloads: [{at: 1}]": { downloads: [{ at: 1 }] },
+  "recent_downloads: 5": { recent_downloads: 5 },
+  "download_count: '3'": { download_count: "3" },
+  "file_size: '1'": { file_size: "1" },
+  "filename: 7": { filename: 7 },
+  "no expires_at": { expires_at: undefined },
+};
+
+function malformedBody(fields: unknown, expired = true): string {
+  return JSON.stringify({
+    filename: "f.bin",
+    file_size: 1,
+    uploaded_at: new Date(NOW - DAY).toISOString(),
+    expires_at: new Date(expired ? NOW - 1 : NOW + DAY).toISOString(),
+    ...(fields as object),
+  });
+}
+
+test.describe("1H: sidecars that cannot be summarised never stop a run or a listing", () => {
+  for (const [name, fields] of Object.entries(MALFORMED)) {
+    test(`malformed legacy sidecar (${name}): the cron proceeds past it, the listing works`, async () => {
+      const b = new CheckedBucket({ maxCalls: CLEANUP_BUDGET });
+      b.seed(`${P}/a/.meta.json`, malformedBody(fields));
+      b.seed(`${P}/a/f.bin`, "x");
+      seedUpload(b, "b", { expired: true });
+      seedUpload(b, "c", { expired: true, legacy: true });
+      seedUpload(b, "d", { legacy: true });
+      b.live.add("d");
+      const before = { ...b.objects.get(`${P}/a/.meta.json`)! };
+
+      // GET /api/uploads: listAll() returns, the bad one without a summary.
+      const listing = await new Uploads(b, P).listAll();
+      expect(listing.uploads.map((u) => [u.id, u.meta === null])).toEqual([
+        ["a", true],
+        ["b", false],
+        ["c", false],
+        ["d", false],
+      ]);
+
+      // The cron: never throws, deletes the stale ones after it, saves its
+      // cursor, and leaves the bad sidecar as it was (left for a human).
+      for (let run = 0; run < 3; run++) {
+        b.reset();
+        const report = await runCleanup(b, P, NOW);
+        expect(report.subrequests).toBe(b.total);
+        if (run === 0) expect(report).toMatchObject({ deleted: 2, summarized: 2, cursor: null });
+      }
+      expect(b.sorted(`${P}/b/`)).toEqual([]);
+      expect(b.sorted(`${P}/c/`)).toEqual([]);
+      expect(b.objects.get(`${P}/d/.meta.json`)!.meta.summary).toBeTruthy();
+      expect(b.objects.get(`${P}/a/.meta.json`)).toEqual(before);
+      expect(b.violations).toEqual([]);
+
+      // A download of it is not counted, and nothing is written.
+      b.reset();
+      expect(await new Uploads(b, P).recordDownload("a", new Date(NOW).toISOString())).toBe(false);
+      expect(b.calls.put ?? 0).toBe(0);
+
+      // The migration script leaves it alone.
+      const rep = await backfillSummaries(b, P, { apply: true });
+      expect(rep).toMatchObject({ missing: 1, unreadable: 1, written: 0 });
+      expect(b.objects.get(`${P}/a/.meta.json`)).toEqual(before);
+    });
+  }
+
+  /** Like R2 (miniflare's limit): custom metadata over 8,192 bytes is refused. */
+  class MetadataLimitBucket extends CheckedBucket {
+    override async put(key: string, value: string, options: Parameters<StrictBucket["put"]>[2] = {}) {
+      const size = Object.entries(options.customMetadata ?? {}).reduce(
+        (sum, [k, v]) => sum + Buffer.byteLength(k) + Buffer.byteLength(v),
+        0,
+      );
+      if (size > 8192) throw new Error("MetadataTooLarge: custom metadata over 8,192 bytes");
+      return super.put(key, value, options);
+    }
+  }
+
+  test("a sidecar whose summary would exceed the limit: written without one, listed by a read, cleaned up", async () => {
+    const b = new MetadataLimitBucket({ maxCalls: CLEANUP_BUDGET });
+    const long = "é".repeat(5000); // 10,000 bytes in UTF-8
+    const big = (expired: boolean) => malformedBody({ filename: long }, expired);
+    b.seed(`${P}/a/.meta.json`, big(true)); // expired
+    b.seed(`${P}/k/.meta.json`, big(false)); // current
+    seedUpload(b, "z", { expired: true, legacy: true });
+    b.live.add("k");
+
+    const listing = await new Uploads(b, P).listAll();
+    expect(listing.uploads.map((u) => [u.id, u.meta?.filename.length])).toEqual([
+      ["a", 5000],
+      ["k", 5000],
+      ["z", 8],
+    ]);
+
+    b.reset();
+    const report = await runCleanup(b, P, NOW);
+    expect(report).toMatchObject({ deleted: 2, summarized: 1, cursor: null });
+    expect(report.subrequests).toBe(b.total);
+    expect(b.sorted(`${P}/a/`)).toEqual([]);
+    expect(b.sorted(`${P}/z/`)).toEqual([]);
+    // The current one is kept, still without a summary (not written at all).
+    expect(b.objects.get(`${P}/k/.meta.json`)!.meta).toEqual({});
+    expect(b.calls.put).toBe(1); // z's summary only
+
+    // A download of it is counted; the sidecar is written without a summary.
+    b.reset();
+    expect(await new Uploads(b, P).recordDownload("k", new Date(NOW).toISOString())).toBe(true);
+    const stored = b.objects.get(`${P}/k/.meta.json`)!;
+    expect(JSON.parse(stored.body).download_count).toBe(1);
+    expect(stored.meta).toEqual({});
+
+    // The migration script reports it and writes nothing.
+    const rep = await backfillSummaries(b, P, { apply: true });
+    expect(rep).toMatchObject({ missing: 1, tooLarge: 1, written: 0 });
+  });
+
+  test(`a summary of up to ${MAX_SUMMARY_BYTES} bytes is stored; one byte more is not`, async () => {
+    const meta = (filename: string): UploadMeta => ({
+      filename,
+      file_size: 1,
+      uploaded_at: new Date(NOW).toISOString(),
+      expires_at: new Date(NOW + DAY).toISOString(),
+    });
+    const bytes = (m: UploadMeta) => "summary".length + JSON.stringify(summarize(m)).length;
+    const fits = "x".repeat(MAX_SUMMARY_BYTES - bytes(meta("")));
+    for (const [filename, stored] of [[fits, true], [fits + "x", false]] as const) {
+      const b = new StrictBucket({ maxCalls: Infinity });
+      expect(await new Uploads(b, P).writeMeta("a", meta(filename))).toBe(true);
+      expect(!!b.objects.get(`${P}/a/.meta.json`)!.meta.summary).toBe(stored);
+    }
   });
 });
 

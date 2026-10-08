@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import {
+  api,
   deleteUpload,
   downloadBytes,
   eventually,
@@ -179,6 +180,58 @@ test.describe("daily cleanup (cron)", () => {
       // The same run kept the upload that is still in progress.
       expect(await uploadObjects(recent)).toHaveLength(1);
       expect((await deleteUpload(recent)).status).toBe(200);
+    }));
+
+  test("a malformed or oversized legacy sidecar stops neither the cleanup nor the listing", () =>
+    exclusive("cron", async () => {
+      const prefix = server.uploadsPrefix;
+      const past = new Date(Date.now() - 60_000).toISOString();
+      const base = { filename: "odd.bin", file_size: 3, uploaded_at: past, expires_at: past };
+      const json = { contentType: "application/json" };
+      // Valid JSON, but not a sidecar yeet can summarise (hand-edited, say).
+      const bad = randomId();
+      await putObject(`${prefix}/${bad}/odd.bin`, "abc");
+      await putObject(`${prefix}/${bad}/.meta.json`, JSON.stringify({ ...base, downloads: 5 }), json);
+      // A valid sidecar whose summary would exceed the custom metadata R2
+      // accepts (wrangler dev refuses over 8,192 bytes).
+      const big = randomId();
+      const long = "x".repeat(9000);
+      await putObject(`${prefix}/${big}/.meta.json`, JSON.stringify({ ...base, filename: long }), json);
+      const control = await expiredControl();
+
+      // The cleanup gets past both: it deletes the expired control and the
+      // expired oversized one, and leaves the malformed one for a human.
+      await triggerCron();
+      await eventually(gone(control.id), { message: "the cron run to remove the control" });
+      await eventually(gone(big), { message: "the cron run to remove the oversized sidecar" });
+      expect((await uploadObjects(bad)).map((o) => o.key).sort()).toEqual([
+        `${prefix}/${bad}/.meta.json`,
+        `${prefix}/${bad}/odd.bin`,
+      ]);
+
+      // The listing still answers, without the malformed one.
+      const res = await api("/api/uploads");
+      expect(res.status, await res.clone().text()).toBe(200);
+      const { uploads } = (await res.json()) as { uploads: { id: string }[] };
+      expect(uploads.map((u) => u.id)).not.toContain(bad);
+
+      // An upload that is not expired with an oversized sidecar is listed
+      // (its sidecar read) and keeps no summary after a cron run.
+      const kept = randomId();
+      const future = new Date(Date.now() + 86_400_000).toISOString();
+      await putObject(
+        `${prefix}/${kept}/.meta.json`,
+        JSON.stringify({ ...base, filename: long, expires_at: future }),
+        json,
+      );
+      const listed = (await listUploads()).find((u) => u.id === kept);
+      expect(listed?.filename).toBe(long);
+      const control2 = await expiredControl();
+      await triggerCron();
+      await eventually(gone(control2.id), { message: "the second cron run to remove its control" });
+      expect((await headObject(`${prefix}/${kept}/.meta.json`))?.custom_metadata).toEqual({});
+
+      for (const id of [bad, kept]) expect((await deleteUpload(id)).status).toBe(200);
     }));
 
   test("keeps a valid legacy (rclone-style) upload, which still downloads", () =>

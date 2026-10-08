@@ -6,16 +6,25 @@
 // the Worker, so it is tested on the in-memory buckets of e2e/.
 //
 // - Dry run unless `apply`: then it only counts.
-// - Idempotent: it writes only sidecars without a (readable) summary, so a
-//   second run finds nothing to do.
+// - Idempotent: it writes only sidecars without a usable summary (the same
+//   check as the listing's, summaryFromCustomMetadata()), so a second run
+//   finds nothing to do.
 // - Safe next to a running Worker: each write is conditional on the etag
 //   read (`onlyIf: { etagMatches }`), like the download count's. A sidecar
 //   changed in between (a download counted, an upload deleted) is not
 //   overwritten; whoever changed it wrote its summary too.
 // - Touches nothing but `<prefix>/<id>/.meta.json` objects, rewriting the
-//   same JSON body with the summary added (writeMeta()).
+//   same JSON body with the summary added (writeMeta()). Sidecars that are
+//   not valid JSON or not shaped like one (parseUploadMeta()), and ones whose
+//   summary would not fit (canStoreSummary()), are left alone.
 
-import { isValidId, Uploads, type Bucket, type UploadMeta } from "./uploads.js";
+import {
+  canStoreSummary,
+  isValidId,
+  summaryFromCustomMetadata,
+  Uploads,
+  type Bucket,
+} from "./uploads.js";
 
 export interface BackfillReport {
   /** Sidecars found. */
@@ -26,19 +35,15 @@ export interface BackfillReport {
   written: number;
   /** Not written: the sidecar changed or went away between read and write. */
   changed: number;
-  /** Not written: the sidecar is not valid JSON. */
+  /**
+   * Not written: the sidecar is not valid JSON, or not shaped like a sidecar
+   * (parseUploadMeta(): `{}`, `[]`, `"downloads": 5`, …).
+   */
   unreadable: number;
+  /** Not written: its summary would exceed MAX_SUMMARY_BYTES (see toCustomMetadata()). */
+  tooLarge: number;
   /** IDs of the sidecars without a summary (all of them; also in a dry run). */
   ids: string[];
-}
-
-function hasSummary(custom: Record<string, string> | undefined): boolean {
-  if (!custom?.summary) return false;
-  try {
-    return typeof JSON.parse(custom.summary) === "object";
-  } catch {
-    return false;
-  }
 }
 
 export async function backfillSummaries(
@@ -55,6 +60,7 @@ export async function backfillSummaries(
     written: 0,
     changed: 0,
     unreadable: 0,
+    tooLarge: 0,
     ids: [],
   };
 
@@ -67,26 +73,30 @@ export async function backfillSummaries(
       const id = object.key.slice(base.length).split("/")[0]!;
       if (!isValidId(id)) continue;
       report.sidecars++;
-      if (hasSummary(object.customMetadata)) continue;
+      if (summaryFromCustomMetadata(object.customMetadata)) continue;
       report.missing++;
       report.ids.push(id);
       if (!opts.apply) {
         log(`would add a summary: ${object.key}`);
         continue;
       }
-      const read = await bucket.get(object.key);
-      if (!read) {
+      const { etag, meta } = await uploads.readSidecar(id);
+      if (!etag) {
         report.changed++;
         log(`gone meanwhile: ${object.key}`);
         continue;
       }
-      const meta = await read.json<UploadMeta>().catch(() => null);
-      if (!meta || typeof meta !== "object") {
+      if (!meta) {
         report.unreadable++;
-        log(`not valid JSON, left alone: ${object.key}`);
+        log(`not valid JSON or not a sidecar, left alone: ${object.key}`);
         continue;
       }
-      if (await uploads.writeMeta(id, meta, { etagMatches: read.etag })) {
+      if (!canStoreSummary(meta)) {
+        report.tooLarge++;
+        log(`summary too large for custom metadata, left alone: ${object.key}`);
+        continue;
+      }
+      if (await uploads.writeMeta(id, meta, { etagMatches: etag })) {
         report.written++;
         log(`added a summary: ${object.key}`);
       } else {
