@@ -263,7 +263,7 @@ test.describe("1G verifier: deleteUnder sidecar-last", () => {
     }
   });
 
-  test("short page holding only the sidecar, truncated: how many calls are wasted", async () => {
+  test("short page holding only the sidecar, truncated: no calls wasted, everything deleted", async () => {
     // A bucket that returns one object per list without metadata.
     class OnePerPage extends StrictBucket {
       override async list(o: Parameters<StrictBucket["list"]>[0]) {
@@ -276,7 +276,9 @@ test.describe("1G verifier: deleteUnder sidecar-last", () => {
     const b = new OnePerPage();
     seedUpload(b, "x", { filename: "zz.bin" }); // sidecar sorts first
     const r = await new Uploads(b, P).deleteUnder(`${P}/x/`, 10);
-    console.log(`one-per-page deleteUnder: ${JSON.stringify(r)}, left ${b.sorted(`${P}/x/`).length}`);
+    // list (sidecar only), list after it + delete the file, delete the sidecar.
+    expect(r).toEqual({ calls: 4, done: true });
+    expect(b.sorted(`${P}/x/`)).toEqual([]);
   });
 });
 

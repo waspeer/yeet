@@ -660,22 +660,33 @@ export class Uploads {
       throw new Error(`Unsafe prefix: ${JSON.stringify(prefix)}`);
     }
     let calls = 0;
+    // The sidecars seen, kept until everything else is gone.
+    const sidecars = new Set<string>();
+    // Set after a page that held nothing but sidecars (see below).
+    let startAfter: string | undefined;
     while (calls + 2 <= maxCalls) {
-      const page = await this.bucket.list({ prefix });
+      const page = await this.bucket.list({ prefix, ...(startAfter ? { startAfter } : {}) });
       calls++;
+      startAfter = undefined;
       const keys = page.objects.map((object) => object.key);
       const others = keys.filter((key) => !this.isSidecarKey(key));
-      const sidecars = keys.filter((key) => this.isSidecarKey(key));
+      for (const key of keys) if (this.isSidecarKey(key)) sidecars.add(key);
       if (others.length > 0) {
         await this.bucket.delete(others);
         calls++;
       }
-      // More to list (each round lists from the start, minus what is gone).
-      if (page.truncated) continue;
+      if (page.truncated) {
+        // More to list. Each round lists from the start, minus what is
+        // gone, except after a page with nothing to delete (only the
+        // sidecar, on a short page): listing from the start would return it
+        // again, so the next round starts after it instead.
+        if (others.length === 0) startAfter = keys.at(-1);
+        continue;
+      }
       // Everything else is gone: only the sidecar may be left.
-      if (sidecars.length === 0) return { calls, done: true };
+      if (sidecars.size === 0) return { calls, done: true };
       if (calls + 1 > maxCalls) break;
-      await this.bucket.delete(sidecars);
+      await this.bucket.delete([...sidecars]);
       calls++;
       return { calls, done: true };
     }
