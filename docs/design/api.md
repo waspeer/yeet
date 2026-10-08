@@ -362,6 +362,11 @@ Numbers that are signed or used as keys must be spelled one way only:
       `400 {"error": "Part <n> is <s> bytes but is followed by more parts: …"}`.
   - **The records:** deleted once the upload completes, and with the upload
     otherwise (delete, cleanup).
+  - **Limit (not enforced):** `complete` reads the records with one list
+    call per 100 parts (`readPartSizes()`, with metadata), without a budget.
+    Above roughly 4,400 parts that passes the Free plan's 50 subrequests and
+    the request fails. The CLI and the upload page always send the size, so
+    they never take this path; only a hand-made client could.
   - **Why not check per part:** with the size unknown, a short part is only
     wrong once a higher one exists. That would cost a bucket listing on every
     `PUT`.
@@ -401,8 +406,10 @@ written back. On a failure it reads again after a random wait (up to
   of one file at the same moment may conflict; each retries, and one that
   finds the sidecar changed on all 3 attempts is not counted (logged). So
   under heavy concurrency the count can be too low, never too high. Locally
-  (`wrangler dev`), 20 downloads at once are counted as 20;
-  `e2e/tests/node/download-flow.spec.ts` requires at least 15.
+  (`wrangler dev`), the verification of round 1F measured 18 to 20 of 20
+  simultaneous downloads counted; `e2e/tests/node/download-flow.spec.ts`
+  requires at least 15 and at most 20. On real R2, with longer round trips,
+  more may be missed; not measured yet.
 - **Cost:** at most 6 R2 calls per download (3 × get + put), usually 2. A
   whole `POST /:id/download` makes at most 9 subrequests: the sidecar read,
   2 rate-limit calls for a protected file (`reserve` + `refund`) and the 6.
@@ -421,7 +428,7 @@ written back. On a failure it reads again after a random wait (up to
 
 `listAll()` lists `<prefix>/` with custom metadata, one page after the
 other, and stops at a budget: **40 R2 calls** for `GET /api/uploads` (plus
-its one rate-limit call: 41 subrequests), 25 for the cron. Sidecars of
+its one rate-limit call: 41 subrequests); the cron's is below. Sidecars of
 yeet < 0.2 carry no summary and cost one read each, counted in the budget.
 `.downloads/` and `.parts/` runs are jumped over: a page that ends inside
 one is followed by a call with `startAfter: <prefix>/<id>/<run>/~`, so each
@@ -432,13 +439,30 @@ order (never a partly listed last one), with `truncated: true`, and
 `GET /api/uploads` passes the flag on. `yeet list` then prints a note that
 only part of the uploads is shown.
 
+- **Which uploads a truncated listing shows:** the first part of the bucket
+  in key order, so the uploads with the lowest IDs (sorted newest first, as
+  always). IDs are random, so that is an arbitrary selection, not the
+  newest uploads.
+- **Resuming** (the cron): the listing returns the key to continue after
+  (`resumeAfter`), right before the first upload it left out (one with no
+  room left for its sidecar read, or partly listed). If nothing before that
+  upload was listed (its keys alone fill the budget, so it is no yeet
+  upload), it is returned unread, and incomplete if partly listed, and the
+  listing resumes after it, so the next one always gets further.
+- **Stray records** (legacy `.downloads/` keys without an upload) are only
+  reported when every key of that upload ID was listed: a partly listed
+  upload may have its sidecar after the records.
+
 **Capacity** (uploads one `GET /api/uploads` lists), assuming 100 objects
-per list call with metadata, as miniflare returns:
+per list call with metadata, as miniflare returns; measured on the
+in-memory bucket by `e2e/tests/node/r2-capacity.spec.ts`:
 
 - **Finished uploads with a summary** (2 objects each): 40 calls × 50 =
   2,000, minus the last, partly listed one: **1,999**.
-- **Each sidecar without a summary** costs one call, so 50 fewer uploads.
-  The cron adds the missing summaries (below), so this is transient.
+- **Each sidecar without a summary** costs one call, so 50 fewer uploads. A
+  bucket of nothing but such sidecars shows **39** (one list call, then 39
+  reads). The cron adds the missing summaries, 21 per run (below); the
+  one-time script below adds them all at once.
 - **Each upload whose `.parts/` or legacy `.downloads/` run ends a page**
   costs one more call. Pending uploads of unknown size and legacy records
   also take room in the pages they share.
@@ -447,7 +471,9 @@ per list call with metadata, as miniflare returns:
 
 `e2e/tests/node/r2-budget.spec.ts` counts the calls on the Worker's own
 modules with an in-memory bucket that returns at most 100 objects per call
-and, like the Free plan, throws past 50.
+and, like the Free plan, throws past 50. `r2-adversarial.spec.ts` and
+`r2-orphans.spec.ts` add a stricter bucket (`e2e/lib/strict-r2.ts`: short
+and empty pages, junk keys, IDs that are prefixes of each other).
 
 ### Cleanup (cron)
 
@@ -456,27 +482,102 @@ calls**:
 
 1. **Reads its cursor**, `<prefix>/.cleanup-cursor` (1 call): the key to
    start after, or none for the beginning of the bucket.
-2. **Lists from there**, with a budget of 25 calls (about 1,249 uploads).
-3. **Handles the uploads in key order** while the rest of the budget lasts
-   (keeping one call for step 4):
-   - **Expired, and pending for over 24 hours:** their keys go into one
-     batch delete (1,000 keys per call); a pending one first gets its
-     multipart upload aborted (1 call).
+2. **Lists from there**, at most 25 list calls (about 1,249 uploads). It
+   leaves sidecars without a summary unread and reserves 2 calls for each
+   out of the 43 it may use together with steps 3 and 4, so it lists no
+   further than the run can handle: a page of 50 such sidecars stops the
+   listing after one call.
+3. **Gives sidecars without a summary theirs first**, before any other
+   work: a get and a conditional put (`onlyIf: { etagMatches }`), 2 calls
+   each, at most **21 per run** ((45 − cursor read − cursor write − one list
+   call) / 2). The get also tells the run whether the upload is stale.
+   Stale ones get their summary too, so that a later run deletes them from
+   the listing alone.
+4. **Handles the uploads in key order** while the rest of the budget lasts
+   (keeping one call for step 5):
+   - **Expired, and pending for over 24 hours:** their keys go into batch
+     deletes (1,000 keys per call), the sidecars in batches of their own
+     after all other keys; a pending one first gets its multipart upload
+     aborted (1 call).
    - **Uploads whose keys the listing jumped over, and legacy records:**
      listed and deleted under `<prefix>/<id>/` (or only `.downloads/` for a
-     current upload), 2 calls per 1,000 objects.
-   - **Sidecars without a summary:** rewritten with it (a get and a
-     conditional put, 2 calls).
-4. **Saves the cursor** (1 call, only if it changed): after the last upload
+     current upload), 2 calls per 1,000 objects, plus 1 for the sidecar,
+     deleted on its own once everything else is gone.
+5. **Saves the cursor** (1 call, only if it changed): after the last upload
    it finished. If it reached the end of the bucket, the next run starts at
    the beginning.
+
+**The sidecar goes last** because it is what makes the listing see an
+upload: when a run's calls (or a `DELETE /api/uploads/:id`) stop half-way,
+what is left still has its sidecar, and the next run finds it stale and
+goes on. Keys left without a sidecar would never be cleaned up.
 
 So the order is stable across runs and each run continues where the last
 one stopped: a bucket of N uploads is gone through in about N / 1,249 days,
 longer when a run has more to delete than its budget allows (it then stops
-at that upload and goes on from there the next day). Expired files are refused at request time
-regardless (the page, the form and `/_dl` check `expires_at`), so a later
-deletion costs only storage; `yeet list` shows them as expired until then.
+at that upload and goes on from there the next day). Expired files are
+refused at request time regardless (the page, the form and `/_dl` check
+`expires_at`), so a later deletion costs only storage; `yeet list` shows
+them as expired until then.
+
+Measured on the in-memory bucket (`e2e/tests/node/r2-capacity.spec.ts`):
+5,000 uploads, every tenth expired, cron runs until nothing expired and no
+sidecar without a summary is left.
+
+| bucket                     | first run                     | runs |
+| -------------------------- | ----------------------------- | ---- |
+| with summaries             | 124 deleted, 29 calls         | 5    |
+| sidecars without a summary | 21 summaries, 45 calls        | 350  |
+| the same, none expired     | 21 summaries, 45 calls        | 239  |
+
+Without summaries the deletions wait: step 3 takes the whole budget, and a
+run stops at the first stale upload it has no calls left to delete. Hence
+the one-time script below for a bucket of yeet < 0.2 uploads.
+
+### Migrating a bucket of yeet < 0.2 (one-time)
+
+`packages/worker/scripts/backfill-summaries.mjs` gives every sidecar
+without a summary its summary in one go, from your machine rather than
+within a Worker's 50 calls. It lives in `packages/worker` because it needs
+direct access to the bucket (through wrangler, a dev dependency there) and
+the Worker's own `writeMeta()` and `summarize()`, so it writes exactly the
+summary the Worker would; the CLI only talks HTTP to the Worker and has no
+dependencies. The logic is `packages/worker/src/backfill.ts` (not part of
+the deployed Worker); the script bundles it with esbuild and binds the
+bucket.
+
+```sh
+cd packages/worker
+npm install
+npx wrangler whoami                                                    # the bucket's account?
+node scripts/backfill-summaries.mjs --remote --bucket <bucket_name>          # dry run: counts only
+node scripts/backfill-summaries.mjs --remote --bucket <bucket_name> --apply  # writes
+```
+
+- **Targets:** `--remote` binds the bucket through wrangler's remote
+  bindings (`getPlatformProxy()`, so it needs `wrangler login`); `--local
+  [--persist-to <dir>]` uses a `wrangler dev` bucket on disk (stop
+  `wrangler dev` first). One of the two is required. `--prefix` defaults to
+  `uploads`; pass your `UPLOADS_PREFIX` if you changed it.
+- **What it touches:** only `<prefix>/<id>/.meta.json` objects without a
+  readable `summary` custom metadata. Each is read and written back with
+  the same JSON content, plus the summary and `Content-Type:
+  application/json`. Files, part records, legacy records and other keys are
+  only listed.
+- **Safe:** a dry run unless `--apply`. Idempotent: a second run finds
+  nothing to do. Each write is conditional on the etag it read, so a
+  download counted (or an upload deleted) in between is never overwritten;
+  it is reported as `changed`, and the Worker wrote that sidecar's summary
+  itself. Sidecars that are not valid JSON are left alone (`unreadable`).
+- **Cost:** one list call per page of objects, plus a get and a put per
+  sidecar written. These are API calls from your machine, not Worker
+  subrequests.
+- **Output:** one JSON line, e.g.
+  `{"apply":true,"sidecars":120,"missing":118,"written":118,"changed":0,"unreadable":0}`;
+  `--verbose` names each key on stderr.
+- **Tested** on the in-memory bucket and, end to end, on a `wrangler dev`
+  bucket (`e2e/tests/node/backfill.spec.ts`). Not yet run against real R2:
+  start with a dry run.
 
 ### Legacy download records (1D/1E)
 

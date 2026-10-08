@@ -172,13 +172,19 @@ Rules of thumb:
   minutes or more. The cleanup also deletes legacy `.downloads/` records and
   adds the summary custom metadata to sidecars without one, so a test that
   seeds or inspects either holds the same lock. (In the test bucket one cron
-  run gets through everything; with more uploads than its R2 call budget
-  lists, it would continue the next run.)
+  run gets through everything as long as it holds at most 21 sidecars
+  without a summary; with more, or more uploads than its R2 call budget
+  lists, it continues the next run.)
 - Code that has to stay within the Free plan's 50 subrequests (the listing,
   the cron, the download count) is unit-tested on the Worker's modules with
   the in-memory bucket of `lib/fake-r2.ts`, which counts R2 calls, returns at
   most 100 objects per list call with metadata and throws past 50 calls
   (`tests/node/r2-budget.spec.ts`); `wrangler dev` enforces neither.
+  `lib/strict-r2.ts` is a second, stricter one, written independently by a
+  verifier: random short and empty pages from a seeded generator, opaque
+  cursors, hooks to change the bucket during a run
+  (`tests/node/r2-adversarial.spec.ts`, `r2-orphans.spec.ts`,
+  `r2-capacity.spec.ts`, whose figures are quoted in `docs/design/api.md`).
 - Opening the page of an expired upload deletes it, so do not visit an upload
   whose removal by the cron you want to observe.
 - Tag slow tests with `{ tag: "@slow" }` so `verify:fast` can skip them.
@@ -256,7 +262,9 @@ These talk to wrangler's Local Explorer API
 
 - `listObjects(prefix?)`, `uploadObjects(id)` → `{ key, size, etag, http_metadata, custom_metadata }[]`
   (the explorer's listing leaves both metadata fields empty; `headObject(key)` returns them).
-- `putObject(key, body, { contentType?, customMetadata? })`, `getObject(key)`.
+- `putObject(key, body, { contentType?, customMetadata?, baseURL? })`,
+  `getObject(key, { baseURL? })`, `headObject(key, { baseURL? })`
+  (`baseURL`: another server's bucket, see `servers.ts`).
 - `seedLegacyUpload({ filename, data, id?, meta?, contentType? })` →
   `{ id, url, meta }`: an upload as yeet < 0.2 / rclone left it — the file plus
   `.meta.json`, neither with R2 custom metadata. `meta` overrides fields of the

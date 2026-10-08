@@ -5,19 +5,27 @@
 //
 // A run lists the bucket from where the previous one stopped (a key in
 // `<prefix>/.cleanup-cursor`), in key order, as far as its listing budget
-// goes; handles the uploads listed in that order until its budget is spent;
-// and saves the key after the last upload it finished as the next start. When it
-// reaches the end of the bucket, the next run starts at the beginning again.
-// So every upload is visited, in a stable order, at least once every
+// goes; first gives the sidecars without a summary among them theirs, then
+// handles the uploads in key order until its budget is spent; and saves the
+// key after the last upload it finished as the next start. When it reaches
+// the end of the bucket, the next run starts at the beginning again. So
+// every upload is visited, in a stable order, at least once every
 // ceil(uploads / uploads per run) runs.
 
-import { isExpired, Uploads, type Bucket, type ListedUpload } from "./uploads.js";
+import { isExpired, summarize, Uploads, type Bucket, type ListedUpload } from "./uploads.js";
 
 /** R2 calls a cleanup run may make: the free plan allows 50 per invocation, minus a margin. */
 export const CLEANUP_BUDGET = 45;
 
-/** Of those, what the listing may use (sidecar reads of old uploads included). */
+/** Of those, the list calls the listing may make. */
 export const CLEANUP_LIST_BUDGET = 25;
+
+/**
+ * R2 calls of giving one sidecar its summary: a read and a conditional
+ * write. The listing reserves them, so it lists no further than the run
+ * can give summaries to.
+ */
+const SUMMARY_CALLS = 2;
 
 /** Uploads still pending after this long are considered abandoned. */
 export const ABANDONED_AFTER_MS = 24 * 60 * 60 * 1000;
@@ -57,18 +65,32 @@ export async function runCleanup(
   const parsed = await saved?.json<{ after?: unknown }>().catch(() => null);
   const start = typeof parsed?.after === "string" ? parsed.after : null;
 
-  const listing = await uploads.listAll({ budget: CLEANUP_LIST_BUDGET, after: start ?? undefined });
+  // Everything but the cursor's read and write; the summaries are written
+  // below, in the calls the listing reserves for them.
+  const listing = await uploads.listAll({
+    budget: CLEANUP_BUDGET - 2,
+    maxListCalls: CLEANUP_LIST_BUDGET,
+    deferReads: SUMMARY_CALLS,
+    after: start ?? undefined,
+  });
   calls += listing.subrequests;
   // What is left, keeping one call to save the cursor.
   const budget = CLEANUP_BUDGET - calls - 1;
 
   let spent = 0;
-  let pending: string[] = []; // keys of finished work, deleted in batches of 1000
-  const batches = (n: number) => Math.ceil(n / 1000);
+  // Keys of finished work, deleted in batches of 1000 with the sidecars
+  // last, in batches of their own (see deleteKeys()).
+  let pending: string[] = [];
+  let pendingSidecars = 0;
+  const deleteCalls = (keys: number, sidecars: number) =>
+    Math.ceil((keys - sidecars) / 1000) + Math.ceil(sidecars / 1000);
+  const flushCost = () => deleteCalls(pending.length, pendingSidecars);
   const flush = async () => {
-    await uploads.deleteKeys(pending);
-    spent += batches(pending.length);
+    const keys = pending;
+    spent += flushCost();
     pending = [];
+    pendingSidecars = 0;
+    await uploads.deleteKeys(keys);
   };
 
   let deleted = 0;
@@ -76,17 +98,28 @@ export async function runCleanup(
   let summarized = 0;
   let lastDone: string | undefined;
   let stopped = false;
-  for (const upload of listing.uploads) {
-    const stale = isStale(upload, now);
-    if (!stale && upload.unsummarized) {
-      // A get and a conditional put; the listings after it save a read.
-      if (spent + batches(pending.length) + 2 > budget) {
-        stopped = true;
-        break;
-      }
-      spent += 2;
-      if (await uploads.addSummary(upload.id)) summarized++;
+
+  // First the summaries, as many as the budget allows: until a sidecar has
+  // one, every listing costs a read for it (GET /api/uploads shows only 39
+  // of a bucket of old sidecars). Stale ones get theirs too, so that the
+  // next run knows them from the listing even if this one cannot delete
+  // them. Uploads from the first one left without on wait for the next run.
+  let known = listing.uploads.length;
+  for (const [i, upload] of listing.uploads.entries()) {
+    if (!upload.unsummarized) continue;
+    if (spent + SUMMARY_CALLS > budget) {
+      known = i;
+      break;
     }
+    const result = await uploads.addSummary(upload.id);
+    spent += result.calls;
+    upload.meta = result.meta && summarize(result.meta);
+    if (result.written) summarized++;
+  }
+
+  // Then, in key order, the deletions.
+  for (const upload of listing.uploads.slice(0, known)) {
+    const stale = isStale(upload, now);
     if (!stale && !upload.legacyRecords) {
       lastDone = upload.id;
       continue;
@@ -95,9 +128,10 @@ export async function runCleanup(
     const dir = `${prefix.replace(/^\/+|\/+$/g, "")}/${upload.id}/`;
 
     if (stale && upload.complete) {
-      // Every key is known: delete them with the others in one batch.
-      const extra = batches(pending.length + upload.keys.length) - batches(pending.length);
-      if (spent + batches(pending.length) + abort + extra > budget) {
+      // Every key is known: delete them in batches with the others.
+      const sidecars = upload.keys.filter((key) => uploads.isSidecarKey(key)).length;
+      const cost = deleteCalls(pending.length + upload.keys.length, pendingSidecars + sidecars);
+      if (spent + cost + abort > budget) {
         stopped = true;
         break;
       }
@@ -110,6 +144,7 @@ export async function runCleanup(
         spent++;
       }
       pending.push(...upload.keys);
+      pendingSidecars += sidecars;
       deleted++;
       lastDone = upload.id;
       continue;
@@ -117,7 +152,7 @@ export async function runCleanup(
 
     // Keys the listing jumped over, or legacy records of a current upload:
     // list and delete them (the whole upload if stale, else its records).
-    if (spent + batches(pending.length) + abort + 2 > budget) {
+    if (spent + flushCost() + abort + 2 > budget) {
       stopped = true;
       break;
     }
@@ -136,6 +171,7 @@ export async function runCleanup(
     else recordsCleared++;
     lastDone = upload.id;
   }
+  if (known < listing.uploads.length) stopped = true;
   await flush();
   calls += spent;
 

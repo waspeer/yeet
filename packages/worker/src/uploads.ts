@@ -167,7 +167,10 @@ export interface ListedUpload {
   meta: UploadSummary | null;
   /** It has legacy `.downloads/` records (yeet 1D/1E), which the cron deletes. */
   legacyRecords: boolean;
-  /** Legacy download records without an upload (no sidecar, nothing else). */
+  /**
+   * Legacy download records without an upload: every key was listed, and
+   * there is no sidecar or anything else.
+   */
   stray: boolean;
   /** Its sidecar has no summary custom metadata (yeet < 0.2): read separately. */
   unsummarized: boolean;
@@ -341,7 +344,10 @@ export class Uploads {
    * may return fewer than asked). A finished upload is 2 objects (file and
    * sidecar) whose summary comes from the sidecar's custom metadata, so a
    * call covers about 50 uploads. A sidecar of yeet < 0.2 has no summary and
-   * costs one read, counted in the budget.
+   * costs one read, counted in the budget. With `deferReads: n` such
+   * sidecars are left unread (`meta` null, `unsummarized`) for the caller,
+   * which reserves n calls of the budget for each; `maxListCalls` caps the
+   * list calls on top of the budget.
    *
    * `.downloads/` (legacy) and `.parts/` keys can be many per upload. When a
    * page ends inside such a run, the next call starts after it
@@ -350,32 +356,44 @@ export class Uploads {
    *
    * Stops when the budget is spent, and then returns the uploads listed so
    * far (never a partly listed last one) with `truncated: true` and the
-   * key to continue after (`resumeAfter`), which `after` takes.
+   * key to continue after (`resumeAfter`), which `after` takes: right before
+   * the first upload it leaves out, so a resumed listing skips none.
    */
-  async listAll(opts: { budget?: number; after?: string } = {}): Promise<Listing> {
+  async listAll(
+    opts: { budget?: number; after?: string; deferReads?: number; maxListCalls?: number } = {},
+  ): Promise<Listing> {
     const budget = opts.budget ?? LIST_BUDGET;
+    const maxListCalls = opts.maxListCalls ?? budget;
+    // What a sidecar without a summary costs: a read, here or by the caller.
+    const readCost = opts.deferReads ?? 1;
     const base = `${this.prefix}/`;
     interface Group extends Omit<ListedUpload, "stray" | "unsummarized"> {
       sidecar: boolean;
       others: number;
+      /** A key right before this upload's first, or undefined for the start of the bucket. */
+      before: string | undefined;
     }
     const groups: Group[] = [];
     let calls = 0;
     let truncated = false;
+    const start = opts.after !== undefined && opts.after.startsWith(base) ? opts.after : undefined;
     let next: { cursor?: string; startAfter?: string } =
-      opts.after !== undefined && opts.after.startsWith(base) ? { startAfter: opts.after } : {};
-    let lastKey = next.startAfter;
-    const readsNeeded = (list: Group[]) => list.filter((g) => g.sidecar && !g.meta).length;
+      start !== undefined ? { startAfter: start } : {};
+    let lastKey = start; // the last key listed
+    const readsNeeded = (list: Group[]) =>
+      readCost * list.filter((g) => g.sidecar && !g.meta).length;
 
     for (;;) {
       // Room for this call, and for the reads of the uploads listed so far.
-      if (calls + 1 + readsNeeded(groups) > budget) {
+      if (calls + 1 > maxListCalls || calls + 1 + readsNeeded(groups) > budget) {
         truncated = true;
         break;
       }
       const page = await this.bucket.list({ prefix: base, ...next, include: ["customMetadata"] });
       calls++;
       for (const object of page.objects) {
+        const previousKey = lastKey;
+        lastKey = object.key;
         const [id, ...rest] = object.key.slice(base.length).split("/");
         if (!id || !isValidId(id) || rest.length === 0) continue;
         let group = groups.at(-1);
@@ -388,6 +406,9 @@ export class Uploads {
             legacyRecords: false,
             sidecar: false,
             others: 0,
+            // After the previous upload rather than its last key listed,
+            // which may lie inside a run the listing jumped over.
+            before: group ? this.keyAfter(group.id) : previousKey,
           };
           groups.push(group);
         }
@@ -407,7 +428,6 @@ export class Uploads {
       // A page that ends inside an upload's `.downloads/` or `.parts/` run:
       // continue after the run. Its keys (times, hex, digits) sort before '~'.
       const last = page.objects.at(-1)?.key ?? "";
-      if (last) lastKey = last;
       const [lastId, ...lastRest] = last.slice(base.length).split("/");
       const bulk = BULK_DIRS.find((dir) => lastRest.join("/").startsWith(dir));
       if (bulk && lastId && isValidId(lastId)) {
@@ -420,18 +440,13 @@ export class Uploads {
 
     // Keys of one upload are contiguous, so every upload but the last is
     // listed completely; the last only if the listing reached the end.
-    let listed = truncated && groups.length > 1 ? groups.slice(0, -1) : groups;
-    if (truncated && groups.length === 1) {
-      // One upload with more keys than the budget lists: not a yeet upload
-      // (those have a handful plus the runs skipped above). Report it as
-      // incomplete so the cron moves past it rather than stalling.
-      groups[0]!.complete = false;
-    }
+    if (truncated && groups.length > 0) groups.at(-1)!.complete = false;
+    const candidates = truncated ? groups.slice(0, -1) : groups;
     // The reads of old sidecars, as far as the budget goes.
     let reads = 0;
     const kept: Group[] = [];
-    for (const group of listed) {
-      const read = group.sidecar && !group.meta ? 1 : 0;
+    for (const group of candidates) {
+      const read = group.sidecar && !group.meta ? readCost : 0;
       if (calls + reads + read > budget) {
         truncated = true;
         break;
@@ -439,52 +454,81 @@ export class Uploads {
       reads += read;
       kept.push(group);
     }
-    listed = kept;
+
+    // Resume right before the first upload left out, or after the last key
+    // listed if none was (the budget went on keys that are no upload).
+    let resumeAfter: string | undefined;
+    let unread: Group | undefined;
+    if (truncated) {
+      const firstLeft = groups[kept.length];
+      resumeAfter = firstLeft ? firstLeft.before : lastKey;
+      if (firstLeft && resumeAfter === start) {
+        // Nothing before it was listed: the budget does not stretch to this
+        // one upload (more keys than it lists, not a yeet upload). Return it
+        // unread, and incomplete if partly listed, so that the next listing
+        // gets past it rather than stalling.
+        unread = firstLeft;
+        kept.push(firstLeft);
+        resumeAfter = this.keyAfter(firstLeft.id);
+      }
+    }
 
     const uploads = await Promise.all(
-      listed.map(async ({ sidecar, others, ...group }): Promise<ListedUpload> => {
-        let meta = group.meta;
-        if (sidecar && !meta) {
+      kept.map(async (group): Promise<ListedUpload> => {
+        const { sidecar, others, before: _, ...listed } = group;
+        let meta = listed.meta;
+        if (sidecar && !meta && group !== unread && opts.deferReads === undefined) {
           calls++;
-          const full = await this.readMeta(group.id).catch(() => null);
+          const full = await this.readMeta(listed.id).catch(() => null);
           meta = full && summarize(full);
         }
         return {
-          ...group,
+          ...listed,
           meta,
-          stray: !sidecar && others === 0,
-          unsummarized: sidecar && !group.meta,
+          // Only if every key was listed: a sidecar may follow the records.
+          stray: listed.complete && !sidecar && others === 0,
+          unsummarized: sidecar && !listed.meta,
         };
       }),
     );
-    const lastListed = uploads.at(-1)?.id;
-    return {
-      uploads,
-      truncated,
-      subrequests: calls,
-      // After the last upload listed or, if there is none (the budget went
-      // on keys that are no upload), after the last key seen, so the next
-      // listing always gets further.
-      ...(truncated ? { resumeAfter: lastListed ? this.keyAfter(lastListed) : lastKey } : {}),
-    };
+    return { uploads, truncated, subrequests: calls, ...(truncated ? { resumeAfter } : {}) };
   }
 
   /**
    * Give a sidecar written without one (yeet < 0.2, rclone) its summary
    * custom metadata, so listings read it from their pages instead of one
-   * read each. Conditional on the sidecar being unchanged since read. Two R2
-   * calls; returns whether it wrote.
+   * read each. Conditional on the sidecar being unchanged since read, so it
+   * never overwrites a download counted meanwhile (which writes the summary
+   * itself). Returns the sidecar read (null if gone or unreadable), whether
+   * it wrote, and the R2 calls made: 2, or 1 without a sidecar to write.
    */
-  async addSummary(id: string): Promise<boolean> {
+  async addSummary(
+    id: string,
+  ): Promise<{ meta: UploadMeta | null; written: boolean; calls: number }> {
     const object = await this.bucket.get(this.dir(id) + ".meta.json");
-    if (!object) return false;
-    return this.writeMeta(id, await object.json<UploadMeta>(), { etagMatches: object.etag });
+    const meta = await object?.json<UploadMeta>().catch(() => null);
+    if (!object || !meta) return { meta: null, written: false, calls: 1 };
+    const written = await this.writeMeta(id, meta, { etagMatches: object.etag });
+    return { meta, written, calls: 2 };
+  }
+
+  /** Whether `key` is the sidecar of an upload, `<prefix>/<id>/.meta.json`. */
+  isSidecarKey(key: string): boolean {
+    const [id, name, ...rest] = key.slice(this.prefix.length + 1).split("/");
+    return key.startsWith(`${this.prefix}/`) && !!id && name === ".meta.json" && rest.length === 0;
   }
 
   /**
-   * Delete every object under `prefix` (a directory of an upload) in at most
-   * `maxCalls` R2 calls: a list (up to 1,000 keys without metadata) and a
-   * delete per round. Returns the calls made and whether nothing is left.
+   * Delete every object under `prefix` (an upload's directory, or a
+   * directory in it) in at most `maxCalls` R2 calls: a list (up to 1,000
+   * keys without metadata) and a delete per round, and the upload's sidecar
+   * in a call of its own once everything else is gone. Returns the calls
+   * made and whether nothing is left.
+   *
+   * The sidecar goes last because it is what makes the listing (and so the
+   * cron) see an upload: if the calls run out half-way, what is left is
+   * still an upload that the next run finds and deletes, not keys without a
+   * sidecar that nothing would ever clean up.
    */
   async deleteUnder(prefix: string, maxCalls: number): Promise<{ calls: number; done: boolean }> {
     if (!prefix.startsWith(`${this.prefix}/`) || !prefix.endsWith("/")) {
@@ -494,18 +538,36 @@ export class Uploads {
     while (calls + 2 <= maxCalls) {
       const page = await this.bucket.list({ prefix });
       calls++;
-      if (page.objects.length === 0) return { calls, done: true };
-      await this.bucket.delete(page.objects.map((object) => object.key));
+      const keys = page.objects.map((object) => object.key);
+      const others = keys.filter((key) => !this.isSidecarKey(key));
+      const sidecars = keys.filter((key) => this.isSidecarKey(key));
+      if (others.length > 0) {
+        await this.bucket.delete(others);
+        calls++;
+      }
+      // More to list (each round lists from the start, minus what is gone).
+      if (page.truncated) continue;
+      // Everything else is gone: only the sidecar may be left.
+      if (sidecars.length === 0) return { calls, done: true };
+      if (calls + 1 > maxCalls) break;
+      await this.bucket.delete(sidecars);
       calls++;
-      if (!page.truncated) return { calls, done: true };
+      return { calls, done: true };
     }
     return { calls, done: false };
   }
 
-  /** Delete objects by key, in batches of the 1000 R2 accepts per call. */
+  /**
+   * Delete objects by key, in batches of the 1000 R2 accepts per call, the
+   * sidecars after every other key (see deleteUnder()).
+   */
   async deleteKeys(keys: string[]): Promise<void> {
-    for (let i = 0; i < keys.length; i += 1000) {
-      await this.bucket.delete(keys.slice(i, i + 1000));
+    const others = keys.filter((key) => !this.isSidecarKey(key));
+    const sidecars = keys.filter((key) => this.isSidecarKey(key));
+    for (const batch of [others, sidecars]) {
+      for (let i = 0; i < batch.length; i += 1000) {
+        await this.bucket.delete(batch.slice(i, i + 1000));
+      }
     }
   }
 
