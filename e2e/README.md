@@ -172,9 +172,13 @@ Rules of thumb:
   minutes or more. The cleanup also deletes legacy `.downloads/` records and
   adds the summary custom metadata to sidecars without one, so a test that
   seeds or inspects either holds the same lock. (In the test bucket one cron
-  run gets through everything as long as it holds at most 21 sidecars
-  without a summary; with more, or more uploads than its R2 call budget
-  lists, it continues the next run.)
+  run gets through everything as long as it holds at most 20 sidecars
+  without a summary: a run gives at most 21 their summary, but 21 take its
+  whole budget, so anything else, deletions included, waits for the next
+  run. The same happens with more uploads than its R2 call budget lists.
+  Measured in `tests/node/r2-adversarial-1g.spec.ts`. Sidecars the cron
+  cannot read, or whose summary is too large, never get one, so leave none
+  behind; `docs/design/api.md` has the details.)
 - Code that has to stay within the Free plan's 50 subrequests (the listing,
   the cron, the download count) is unit-tested on the Worker's modules with
   the in-memory bucket of `lib/fake-r2.ts`, which counts R2 calls, returns at
@@ -183,8 +187,9 @@ Rules of thumb:
   `lib/strict-r2.ts` is a second, stricter one, written independently by a
   verifier: random short and empty pages from a seeded generator, opaque
   cursors, hooks to change the bucket during a run
-  (`tests/node/r2-adversarial.spec.ts`, `r2-orphans.spec.ts`,
-  `r2-capacity.spec.ts`, whose figures are quoted in `docs/design/api.md`).
+  (`tests/node/r2-adversarial.spec.ts`, `r2-adversarial-1g.spec.ts`,
+  `r2-orphans.spec.ts`, `r2-capacity.spec.ts`, whose figures are quoted in
+  `docs/design/api.md`).
 - Opening the page of an expired upload deletes it, so do not visit an upload
   whose removal by the cron you want to observe.
 - Tag slow tests with `{ tag: "@slow" }` so `verify:fast` can skip them.

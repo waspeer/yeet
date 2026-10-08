@@ -184,10 +184,13 @@ test.describe("1G verifier: cron on adversarial buckets", () => {
     seedUpload(b, "big", { expired: true, junkBefore: 30000 });
     seedUpload(b, "next", { expired: true });
     const { run } = await runUntil(b, 30, () => b.sorted(`${P}/big/`).length === 0);
-    console.log(`junk-before stale upload: gone after ${run} runs; keys left ${b.sorted(`${P}/big/`).length}; next left ${b.sorted(`${P}/next/`).length}`);
     // Next upload must still be reached.
     expect(b.sorted(`${P}/next/`).length).toBe(0);
-    // Document (not assert) whether the big one is ever cleaned up.
+    // As documented (api.md, Cleanup): more non-yeet keys before the sidecar
+    // than a run lists means the run never sees the sidecar, so this one is
+    // never cleaned up; it is jumped over instead of stalling the cron.
+    expect(run).toBe(Infinity);
+    expect(b.sorted(`${P}/big/`)).toHaveLength(30_002);
   });
 
   test("cron summary step never clobbers a download counted between its get and put", async () => {
@@ -209,16 +212,19 @@ test.describe("1G verifier: cron on adversarial buckets", () => {
     }
   });
 
-  test("e2e/README claim: <=21 unsummarized sidecars plus one expired upload in one run?", async () => {
-    const out: string[] = [];
+  test("e2e/README claim: one run does everything with at most 20 unsummarized sidecars", async () => {
+    const results: Record<number, { summarized: number; deleted: number; cursor: string | null }> = {};
     for (const k of [19, 20, 21]) {
       const b = new CheckedBucket();
       for (let i = 0; i < k; i++) seedUpload(b, `a${String(i).padStart(3, "0")}`, { legacy: true });
       seedUpload(b, "zexp", { expired: true });
-      const r = await runCleanup(b, P, NOW);
-      out.push(`${k} unsummarized + 1 expired: summarized ${r.summarized}, deleted ${r.deleted}, cursor ${r.cursor}`);
+      const { summarized, deleted, cursor } = await runCleanup(b, P, NOW);
+      results[k] = { summarized, deleted, cursor };
     }
-    console.log(out.join("\n"));
+    expect(results[19]).toEqual({ summarized: 19, deleted: 1, cursor: null });
+    expect(results[20]).toEqual({ summarized: 20, deleted: 1, cursor: null });
+    // 21 summaries take the whole budget: the deletion waits for the next run.
+    expect(results[21]).toEqual({ summarized: 21, deleted: 0, cursor: `${P}/a0200` });
   });
 
   test("stall branch: listing of a single huge upload returns it once and resumes after it", async () => {
