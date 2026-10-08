@@ -287,6 +287,13 @@ Evaluated on the Free plan:
   `Cache-Control: no-store`. A wrong token is never echoed back in the page.
 - **Cross-origin `/login` or `/logout`:** `403` with an HTML error page
   "Cross-origin request refused".
+- **No framing:** every Worker response (so `/upload`, `/login`, the
+  download pages and their error pages) carries
+  `Content-Security-Policy: frame-ancestors 'none'` and, for browsers without
+  CSP Level 2, `X-Frame-Options: DENY`, so another site cannot frame the
+  login, upload or download forms (clickjacking). Static assets (`public/`)
+  are served before the Worker and do not get them; they are scripts and
+  images, not pages.
 
 ### Missing or short token
 

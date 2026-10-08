@@ -96,6 +96,11 @@ const app = new Hono<AppEnv>();
 app.use("*", async (c, next) => {
   c.set("uploads", new Uploads(c.env.BUCKET, c.env.UPLOADS_PREFIX || "uploads"));
   await next();
+  // No other site may frame a page of ours (clickjacking of the login,
+  // upload and download forms): CSP for current browsers, X-Frame-Options
+  // for older ones. Harmless on everything else, so set on every response.
+  c.res.headers.set("Content-Security-Policy", "frame-ancestors 'none'");
+  c.res.headers.set("X-Frame-Options", "DENY");
 });
 
 function shareUrl(origin: string, id: string, filename: string): string {
