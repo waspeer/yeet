@@ -22,6 +22,7 @@ import {
   resetStats,
   serverLog,
   shareLink,
+  sleep,
   test,
   uploadObjects,
 } from "../../lib/index.js";
@@ -435,6 +436,64 @@ test.describe("upload page", () => {
     await page.getByRole("button", { name: "Retry" }).click();
     const url = await shareLink(page);
     expect(await downloadSha256(url)).toEqual({ sha256: file.sha256, size: file.size });
+  });
+
+  // One Web Worker per upload, terminated once the upload has ended, however
+  // it ended: no worker (and the File it holds) outlives its upload.
+  test.describe("the upload's Web Worker is terminated", () => {
+    /** Resolves when the next worker the page starts has been terminated. */
+    function nextWorkerClosed(page: Page): Promise<void> {
+      return new Promise((resolve) => {
+        page.once("worker", (worker) => worker.once("close", () => resolve()));
+      });
+    }
+
+    async function expectNoWorkers(page: Page, closed: Promise<void>): Promise<void> {
+      await Promise.race([
+        closed,
+        sleep(5000).then(() => {
+          throw new Error(`the upload's worker is still running (${page.workers().length} live)`);
+        }),
+      ]);
+      expect(page.workers()).toHaveLength(0);
+    }
+
+    test("after success", async ({ page, tmp }) => {
+      const file = await randomFile(tmp, 10 * KiB, "worker done.bin");
+      await logIn(page);
+      expect(page.workers()).toHaveLength(0);
+      const closed = nextWorkerClosed(page);
+      await choose(page, "input", file.path);
+      await shareLink(page);
+      await expectNoWorkers(page, closed);
+    });
+
+    test("after a failure", async ({ page, tmp }) => {
+      const file = await randomFile(tmp, 10 * KiB, "worker failed.bin");
+      await logIn(page);
+      await page.route("**/api/uploads/**", (route) =>
+        isPart(route.request())
+          ? route.fulfill({ status: 413, json: { error: "Part larger than part_size" } })
+          : route.fallback(),
+      );
+      const closed = nextWorkerClosed(page);
+      await choose(page, "input", file.path);
+      await expect(page.getByRole("button", { name: "Retry" })).toBeVisible();
+      await expectNoWorkers(page, closed);
+    });
+
+    test("after Cancel", async ({ page, tmp }) => {
+      const file = await randomFile(tmp, 300 * KiB, "worker cancelled.bin");
+      await logIn(page);
+      const held = await hold(page, (request) => isPart(request));
+      const closed = nextWorkerClosed(page);
+      await choose(page, "input", file.path);
+      await eventually(() => held.length > 0, { message: "a part request" });
+      await page.getByRole("button", { name: "Cancel" }).click();
+      await expect(page.locator("#idle-note")).toHaveText("Upload cancelled.");
+      // Terminated once its delete is done, well before the 10 s fallback.
+      await expectNoWorkers(page, closed);
+    });
   });
 
   test("Log out ends the session", async ({ page }) => {
