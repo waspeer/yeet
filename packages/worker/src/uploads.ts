@@ -7,7 +7,8 @@
 //                                unknown size is pending
 //   <prefix>/<id>/.downloads/<at>_<random>
 //                                one empty object per download (after 0.2),
-//                                <at> the ISO 8601 time; see recordDownload()
+//                                <at> the ISO 8601 time; see recordDownload().
+//                                The daily cron folds them into the sidecar.
 
 export interface DownloadRecord {
   at: string; // ISO 8601
@@ -25,9 +26,30 @@ export interface UploadMeta {
    * download (and kept the last 50). Newer downloads are `.downloads/` objects.
    */
   downloads?: DownloadRecord[];
+  /**
+   * Downloads folded in from `.downloads/` records by the daily cron (see
+   * foldDownloads()); `downloads` is folded in too and dropped then.
+   */
+  download_count?: number;
+  /** The last five download times, folded in with download_count. */
+  recent_downloads?: string[];
   /** Set while the file is still being uploaded; holds the R2 multipart upload ID. */
   pending_upload_id?: string;
 }
+
+/**
+ * Download records written per upload between two folds. Past it a download
+ * is not recorded (the count stops growing until the next fold), so scripted
+ * downloads of one link cannot fill the bucket and the listing.
+ */
+export const RECORD_CAP = 1000;
+
+/**
+ * Records of one upload counted by a listing. Past it the listing skips the
+ * rest of that upload's records, so it never pages through more than this per
+ * upload; normally there are at most RECORD_CAP (one day's worth).
+ */
+export const LISTED_RECORDS_LIMIT = 2 * RECORD_CAP;
 
 /**
  * Upload IDs are base64url. Anything else — in particular dot-segments
@@ -83,8 +105,8 @@ export function summarize(meta: UploadMeta): UploadSummary {
     expires_at: meta.expires_at,
     has_password: !!meta.password_hash,
     ...(meta.pending_upload_id ? { pending_upload_id: meta.pending_upload_id } : {}),
-    download_count: downloads.length,
-    recent_downloads: downloads.slice(-5).map((download) => download.at),
+    download_count: meta.download_count ?? downloads.length,
+    recent_downloads: meta.recent_downloads ?? downloads.slice(-5).map((download) => download.at),
   };
 }
 
@@ -95,13 +117,29 @@ const DOWNLOADS = ".downloads/";
  * A summary with the download records counted in: the sidecar's own downloads
  * (yeet 0.2 and earlier) came before them.
  */
-function withDownloads(summary: UploadSummary, downloads: string[]): UploadSummary {
+function withDownloads<T extends { download_count: number; recent_downloads: string[] }>(
+  summary: T,
+  downloads: string[],
+): T {
   if (downloads.length === 0) return summary;
   return {
     ...summary,
     download_count: summary.download_count + downloads.length,
     recent_downloads: [...summary.recent_downloads, ...downloads.slice(-5)].sort().slice(-5),
   };
+}
+
+/** One upload as listAll() finds it. */
+export interface ListedUpload {
+  id: string;
+  /** Every key found, except records skipped past LISTED_RECORDS_LIMIT. */
+  keys: string[];
+  /** The summary with the counted records added, or null if unreadable. */
+  meta: UploadSummary | null;
+  /** Download records without an upload (no sidecar, nothing else). */
+  stray: boolean;
+  /** The keys and times of the records counted, for foldDownloads(). */
+  records: { keys: string[]; times: string[] };
 }
 
 function toCustomMetadata(meta: UploadMeta): Record<string, string> {
@@ -194,14 +232,21 @@ export class Uploads {
    * Record a download as a new empty object, `.downloads/<ISO time>_<random>`.
    * Never a read-modify-write of the sidecar: concurrent downloads each write
    * their own key, so none is lost. listAll() counts them in the same listing
-   * that reads the summaries; delete() and the cleanup remove them with the
-   * upload.
+   * that reads the summaries; the daily cron folds them into the sidecar;
+   * delete() and the cleanup remove them with the upload.
+   *
+   * At most RECORD_CAP records are written between two folds: one list call
+   * (of at most that many keys) checks first. Returns whether it recorded.
    */
-  async recordDownload(id: string): Promise<void> {
+  async recordDownload(id: string): Promise<boolean> {
+    const prefix = this.dir(id) + DOWNLOADS;
+    const existing = await this.bucket.list({ prefix, limit: RECORD_CAP });
+    if (existing.truncated || existing.objects.length >= RECORD_CAP) return false;
     const random = [...crypto.getRandomValues(new Uint8Array(4))]
       .map((byte) => byte.toString(16).padStart(2, "0"))
       .join("");
-    await this.bucket.put(`${this.dir(id)}${DOWNLOADS}${new Date().toISOString()}_${random}`, "");
+    await this.bucket.put(`${prefix}${new Date().toISOString()}_${random}`, "");
+    return true;
   }
 
   /**
@@ -210,50 +255,127 @@ export class Uploads {
    * individually. `stray` marks download records left without an upload (a
    * download that raced a delete): no sidecar is read for them, and the
    * cleanup removes them.
+   *
+   * Counts at most LISTED_RECORDS_LIMIT records per upload: past that the
+   * listing jumps over the rest of that upload's records (`startAfter`), so
+   * the number of list calls stays bounded however many there are. Returns
+   * the subrequests it made, for the cron's budget.
    */
-  async listAll(): Promise<
-    { id: string; keys: string[]; meta: UploadSummary | null; stray: boolean }[]
-  > {
+  async listAll(): Promise<{ uploads: ListedUpload[]; subrequests: number }> {
     const groups = new Map<
       string,
-      { keys: string[]; meta: UploadSummary | null; sidecar: boolean; downloads: string[] }
+      { keys: string[]; meta: UploadSummary | null; sidecar: boolean; others: number } & {
+        records: { keys: string[]; times: string[] };
+      }
     >();
+    let subrequests = 0;
     let cursor: string | undefined;
+    let startAfter: string | undefined;
     do {
       const page = await this.bucket.list({
         prefix: `${this.prefix}/`,
-        cursor,
+        ...(cursor ? { cursor } : startAfter ? { startAfter } : {}),
         include: ["customMetadata"],
       });
+      subrequests++;
+      let skipping: string | undefined;
       for (const object of page.objects) {
         const [id, ...rest] = object.key.slice(this.prefix.length + 1).split("/");
         if (!id || !isValidId(id) || rest.length === 0) continue;
         let group = groups.get(id);
-        if (!group)
-          groups.set(id, (group = { keys: [], meta: null, sidecar: false, downloads: [] }));
-        group.keys.push(object.key);
+        if (!group) {
+          group = {
+            keys: [],
+            meta: null,
+            sidecar: false,
+            others: 0,
+            records: { keys: [], times: [] },
+          };
+          groups.set(id, group);
+        }
         const name = rest.join("/");
+        if (name.startsWith(DOWNLOADS)) {
+          if (group.records.keys.length >= LISTED_RECORDS_LIMIT) {
+            skipping = id;
+            continue;
+          }
+          group.keys.push(object.key);
+          group.records.keys.push(object.key);
+          // Listed in key order, which for ISO 8601 times is time order.
+          group.records.times.push(name.slice(DOWNLOADS.length).split("_")[0]!);
+          continue;
+        }
+        group.keys.push(object.key);
+        group.others++;
         if (name === ".meta.json") {
           group.sidecar = true;
           group.meta = fromCustomMetadata(object.customMetadata);
-        } else if (name.startsWith(DOWNLOADS)) {
-          // Listed in key order, which for ISO 8601 times is time order.
-          group.downloads.push(name.slice(DOWNLOADS.length).split("_")[0]!);
         }
       }
-      cursor = page.truncated ? page.cursor : undefined;
-    } while (cursor);
+      const last = page.objects.at(-1)?.key;
+      const skipPrefix = skipping && `${this.prefix}/${skipping}/${DOWNLOADS}`;
+      if (page.truncated && skipPrefix && last?.startsWith(skipPrefix)) {
+        // Still inside the records being skipped: continue after all of them.
+        // Record keys are ISO times and hex digits, which all sort before "~".
+        cursor = undefined;
+        startAfter = `${skipPrefix}~`;
+      } else {
+        cursor = page.truncated ? page.cursor : undefined;
+        startAfter = undefined;
+      }
+    } while (cursor || startAfter);
 
-    return Promise.all(
-      [...groups].map(async ([id, { keys, meta, sidecar, downloads }]) => {
-        const stray = !sidecar && keys.length === downloads.length;
+    const uploads = await Promise.all(
+      [...groups].map(async ([id, { keys, meta, sidecar, others, records }]) => {
+        const stray = !sidecar && others === 0;
         if (!meta && !stray) {
+          subrequests++;
           const full = await this.readMeta(id).catch(() => null);
           meta = full && summarize(full);
         }
-        return { id, keys, meta: meta && withDownloads(meta, downloads), stray };
+        return { id, keys, meta: meta && withDownloads(meta, records.times), stray, records };
       }),
     );
+    return { uploads, subrequests };
+  }
+
+  /**
+   * Fold download records into the sidecar: add them to `download_count` and
+   * `recent_downloads` (which replace a legacy `downloads` array), write the
+   * sidecar and its summary, then delete the records. The sidecar is only
+   * written if it has not changed since it was read (an etag condition), so a
+   * concurrent delete or completion is never undone. Returns false if nothing
+   * was folded.
+   *
+   * A download recorded meanwhile is a key not in `records` and stays for the
+   * next fold. If deleting the records fails after the sidecar was written,
+   * they are counted again next time (logged by the caller).
+   */
+  async foldDownloads(id: string, records: { keys: string[]; times: string[] }): Promise<boolean> {
+    if (records.keys.length === 0) return false;
+    const object = await this.bucket.get(this.dir(id) + ".meta.json");
+    if (!object) return false;
+    const meta = await object.json<UploadMeta>();
+    if (meta.pending_upload_id) return false;
+    const { downloads: _, ...rest } = meta;
+    const counted = withDownloads(summarize(meta), records.times);
+    const folded: UploadMeta = {
+      ...rest,
+      download_count: counted.download_count,
+      recent_downloads: counted.recent_downloads,
+    };
+    const written = await this.bucket.put(
+      this.dir(id) + ".meta.json",
+      JSON.stringify(folded, null, 2),
+      {
+        httpMetadata: { contentType: "application/json" },
+        customMetadata: toCustomMetadata(folded),
+        onlyIf: { etagMatches: object.etag },
+      },
+    );
+    if (!written) return false;
+    await this.deleteKeys(records.keys);
+    return true;
   }
 
   /** Delete objects by key, in batches of the 1000 R2 accepts per call. */

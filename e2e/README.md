@@ -245,7 +245,8 @@ password?)` → `{ sha256, size }`, streaming, for large files.
 These talk to wrangler's Local Explorer API
 (`<baseURL>/cdn-cgi/local/explorer/api/r2/...`), bypassing the Worker.
 
-- `listObjects(prefix?)`, `uploadObjects(id)` → `{ key, size, etag, http_metadata, custom_metadata }[]`.
+- `listObjects(prefix?)`, `uploadObjects(id)` → `{ key, size, etag, http_metadata, custom_metadata }[]`
+  (the explorer's listing leaves both metadata fields empty; `headObject(key)` returns them).
 - `putObject(key, body, { contentType?, customMetadata? })`, `getObject(key)`.
 - `seedLegacyUpload({ filename, data, id?, meta?, contentType? })` →
   `{ id, url, meta }`: an upload as yeet < 0.2 / rclone left it — the file plus

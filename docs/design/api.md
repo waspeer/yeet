@@ -354,10 +354,8 @@ How the rest follows:
   `download_count` = the sidecar's count + the records, `recent_downloads` =
   the last five of both (keys list in time order). No extra subrequests per
   upload. The cost: each download is one more object in the listing, so 1000
-  downloads cost one more list call. Within the 50-subrequest budget this
-  allows roughly 49,000 objects (uploads × 2 plus downloads) before
-  `GET /api/uploads` or the cleanup would run out; ample for a personal
-  share service, and deleting or expiring an upload removes its records.
+  downloads cost one more list call. Records therefore must not pile up; see
+  "Keeping the records bounded" below.
 - **Delete and cleanup:** both already delete every object under
   `<prefix>/<id>/`, records included. Records without an upload (a download
   that raced a delete or expiry) are listed as `stray`: `listAll()` reads no
@@ -367,6 +365,51 @@ How the rest follows:
   records add to it; the cap of 50 no longer applies to new downloads. A file
   named `.downloads` is a different key (`<id>/.downloads`, no slash) and is
   not mistaken for a record.
+
+#### Keeping the records bounded
+
+Unprotected downloads need no credentials, so a script can download one link
+tens of thousands of times. Unbounded, ~49,000 records push `GET /api/uploads`
+and the cron past the 50-subrequest budget (and their CPU), and the cleanup
+stops for every upload. Three measures, together:
+
+1. **The cron folds the records into the sidecar** (`foldDownloads()`). For
+   each upload with records it reads the sidecar, adds them to the sidecar's
+   own `download_count` and `recent_downloads` (new fields, which replace a
+   legacy `downloads` array: its count and last five times are carried over
+   and the array dropped), writes the sidecar with its summary custom metadata
+   (`summarize()` reads the new fields, so the summary stays consistent), and
+   then deletes the records it counted. The sidecar write is conditional on
+   the etag read (`onlyIf: { etagMatches }`), so a sidecar deleted or changed
+   meanwhile is never written back. A download recorded during the fold has a
+   key the fold did not list; it stays for the next one. Cost per upload: a
+   get, a put and a delete per 1000 records. The cron spends at most 45
+   subrequests in all (list calls, aborts and deletes of stale uploads
+   first), folding the uploads with the most records first; the rest wait a
+   day. So the bucket holds about one day of records.
+   - If deleting the records fails after the sidecar was written, they are
+     counted again at the next fold (logged). The alternative order, deleting
+     first, would lose them instead.
+2. **At most 1,000 records per upload between two folds** (`RECORD_CAP`).
+   `recordDownload()` first lists the upload's records (one call, at most
+   1,000 keys) and writes nothing if there are 1,000. Normal use is counted
+   exactly; past 1,000 downloads of one upload in a day, the count stops
+   growing until the next fold (an undercount, never an overcount). That is a
+   second subrequest per download (in `waitUntil`, after the response) and a
+   class A operation, like the `put`.
+3. **The listing counts at most 2,000 records per upload**
+   (`LISTED_RECORDS_LIMIT`, two days' worth). Past it, `listAll()` jumps over
+   the rest of that upload's records with `startAfter`, so it never pages
+   through more than that per upload, whatever is in the bucket (e.g. records
+   written before this version). The count shown is then too low until the
+   folds catch up: each cron run folds (or, for an expired upload, deletes)
+   the records it counted, and the rest the next day; stray records left of
+   a deleted upload go the same way. `DELETE /api/uploads/:id` still deletes
+   them all (with the records bounded, a few list and delete calls).
+
+Not chosen: rate-limiting the recording per IP and upload. It would need a
+Durable Object call per download, against the daily quota the login and
+password limits rely on; the cap bounds the objects without it.
 
 ### Range requests on `/_dl/:id`
 

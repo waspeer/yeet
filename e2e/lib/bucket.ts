@@ -83,6 +83,22 @@ export async function putObject(
   );
 }
 
+/**
+ * An object's metadata, custom metadata included (listObjects() leaves it
+ * out), or null when it does not exist.
+ */
+export async function headObject(key: string): Promise<BucketObject | null> {
+  const res = await fetch(explorerUrl(objectPath(key)), {
+    headers: { "cf-metadata-only": "true" },
+  });
+  if (res.status === 404) return null;
+  const body = (await res.json()) as { success?: boolean; result?: BucketObject };
+  if (!res.ok || !body.success || !body.result) {
+    throw new Error(`Local explorer HEAD ${key} -> ${res.status}: ${JSON.stringify(body)}`);
+  }
+  return { ...body.result, custom_metadata: body.result.custom_metadata ?? {} };
+}
+
 /** Read an object's bytes, or null when it does not exist. */
 export async function getObject(key: string): Promise<Buffer | null> {
   const res = await fetch(explorerUrl(objectPath(key)));
@@ -155,6 +171,10 @@ export async function triggerCron(cron = "0 3 * * *"): Promise<void> {
 export interface UploadMeta extends LegacyMeta {
   /** Set while the file is still being uploaded: the R2 multipart upload ID. */
   pending_upload_id?: string;
+  /** Downloads folded in by the cron (replaces `downloads` once set). */
+  download_count?: number;
+  /** The last five download times, folded in with download_count. */
+  recent_downloads?: string[];
 }
 
 /**
@@ -171,8 +191,8 @@ export function summarize(meta: UploadMeta): Record<string, unknown> {
     expires_at: meta.expires_at,
     has_password: !!meta.password_hash,
     ...(meta.pending_upload_id ? { pending_upload_id: meta.pending_upload_id } : {}),
-    download_count: downloads.length,
-    recent_downloads: downloads.slice(-5).map((download) => download.at),
+    download_count: meta.download_count ?? downloads.length,
+    recent_downloads: meta.recent_downloads ?? downloads.slice(-5).map((download) => download.at),
   };
 }
 

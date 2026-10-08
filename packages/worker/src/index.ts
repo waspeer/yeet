@@ -36,7 +36,14 @@ import {
   tooManyAttempts,
 } from "./template.js";
 import { uploadPage } from "./upload-page.js";
-import { generateId, isExpired, isValidFilename, isValidId, Uploads } from "./uploads.js";
+import {
+  generateId,
+  isExpired,
+  isValidFilename,
+  isValidId,
+  Uploads,
+  type ListedUpload,
+} from "./uploads.js";
 
 export { RateLimiter };
 
@@ -198,7 +205,7 @@ api.get("/me", (c) => c.json({ ok: true }));
 // GET /api/uploads — every finished upload, newest first
 api.get("/uploads", async (c) => {
   const origin = new URL(c.req.url).origin;
-  const result = (await c.get("uploads").listAll())
+  const result = (await c.get("uploads").listAll()).uploads
     // Finished uploads only; their summaries carry no pending_upload_id.
     .flatMap(({ id, meta }) =>
       meta && !meta.pending_upload_id
@@ -740,25 +747,57 @@ app.onError((err, c) => {
 // Daily cleanup of expired and abandoned uploads
 // ---------------------------------------------------------------------------
 
+/**
+ * Subrequests the cleanup may make: the free plan allows 50 per invocation,
+ * minus a margin.
+ */
+const CLEANUP_SUBREQUESTS = 45;
+
 async function runCleanup(env: Env): Promise<void> {
   const uploads = new Uploads(env.BUCKET, env.UPLOADS_PREFIX || "uploads");
-  const stale = (await uploads.listAll()).filter(({ meta, stray }) => {
+  const listing = await uploads.listAll();
+  let subrequests = listing.subrequests;
+  const isStale = ({ meta, stray }: ListedUpload): boolean => {
     if (stray) return true; // download records without an upload
     if (!meta) return false; // unreadable sidecar: leave it for a human
     const abandoned =
       !!meta.pending_upload_id &&
       Date.now() - new Date(meta.uploaded_at).getTime() > ABANDONED_AFTER_MS;
     return isExpired(meta) || abandoned;
-  });
+  };
+  const stale = listing.uploads.filter(isStale);
 
   for (const { id, meta } of stale) {
-    if (meta?.pending_upload_id)
+    if (meta?.pending_upload_id) {
       await uploads.abortPending(id, meta.filename, meta.pending_upload_id);
+      subrequests++;
+    }
   }
-  await uploads.deleteKeys(stale.flatMap(({ keys }) => keys));
+  const staleKeys = stale.flatMap(({ keys }) => keys);
+  await uploads.deleteKeys(staleKeys);
+  subrequests += Math.ceil(staleKeys.length / 1000);
 
   if (stale.length > 0)
     console.log(`[cleanup] Deleted ${stale.length} expired or abandoned upload(s)`);
+
+  // Fold the download records of the remaining uploads into their sidecars,
+  // most records first, as far as the subrequest budget goes (a get, a put
+  // and a delete per 1000 records each); the rest wait for the next run.
+  const toFold = listing.uploads
+    .filter((upload) => !isStale(upload) && upload.meta && upload.records.keys.length > 0)
+    .sort((a, b) => b.records.keys.length - a.records.keys.length);
+  let folded = 0;
+  for (const { id, records } of toFold) {
+    const cost = 2 + Math.ceil(records.keys.length / 1000);
+    if (subrequests + cost > CLEANUP_SUBREQUESTS) break;
+    subrequests += cost;
+    try {
+      if (await uploads.foldDownloads(id, records)) folded++;
+    } catch (err) {
+      console.error(`[cleanup] Could not fold the download records of ${id}:`, err);
+    }
+  }
+  if (folded > 0) console.log(`[cleanup] Folded the download records of ${folded} upload(s)`);
 }
 
 export default withOptionalSentry<Env, Request, ScheduledController, ExecutionContext, Response>(
