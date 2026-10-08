@@ -18,7 +18,14 @@ import {
   verifyPassword,
   verifySession,
 } from "./crypto.js";
-import { rateLimit, RateLimiter, RULES, type RateLimitResult } from "./rate-limit.js";
+import {
+  rateLimit,
+  RateLimiter,
+  refundAttempt,
+  reserveAttempt,
+  RULES,
+  type RateLimitResult,
+} from "./rate-limit.js";
 import { withOptionalSentry } from "./sentry.js";
 import {
   downloadPage,
@@ -676,12 +683,15 @@ app.post("/:id/download", async (c) => {
           status,
         );
 
-      // Checked before hashing, so a client over the limit costs no PBKDF2.
+      // The attempt is counted as a failure before hashing, in the same step
+      // as the check, so a parallel burst gets no more than the limit through
+      // and a client over the limit costs no PBKDF2. A correct password
+      // refunds it below.
       const rateKey = `${clientIp(c)}:${id}`;
-      const before = await rateLimit(c.env.RATE_LIMITER, RULES.downloadPassword, rateKey, false);
-      if (!before.allowed) {
-        setRetryAfter(c, before);
-        return page(429, tooManyAttempts(before.retryAfter));
+      const reservation = await reserveAttempt(c.env.RATE_LIMITER, RULES.downloadPassword, rateKey);
+      if (!reservation.allowed) {
+        setRetryAfter(c, reservation);
+        return page(429, tooManyAttempts(reservation.retryAfter));
       }
 
       const body = await c.req.parseBody();
@@ -689,13 +699,9 @@ app.post("/:id/download", async (c) => {
       if (!(await verifyPassword(password, meta.password_hash))) {
         const S = sentryFor(c.env);
         S?.logger.warn(S.logger.fmt`Incorrect password attempt for file: ${id} (${meta.filename})`);
-        const after = await rateLimit(c.env.RATE_LIMITER, RULES.downloadPassword, rateKey, true);
-        if (!after.allowed) {
-          setRetryAfter(c, after);
-          return page(429, tooManyAttempts(after.retryAfter));
-        }
         return page(401, "Incorrect password. Please try again.");
       }
+      await refundAttempt(c.env.RATE_LIMITER, RULES.downloadPassword, rateKey, reservation);
 
       const maxAge = Math.min(DOWNLOAD_PASS_MAX_AGE, fileExpires - nowSeconds());
       if (maxAge > 0) {

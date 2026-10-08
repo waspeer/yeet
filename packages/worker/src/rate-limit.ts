@@ -8,6 +8,13 @@
 // *before* its result is given away: a client that is over the limit gets 429
 // whether its guess was right or wrong, so the limit cannot be used as an
 // oracle.
+//
+// Checks whose verdict is cheap (token compares) are decided first and sent
+// in one call, hit(failed). Download passwords need PBKDF2, which takes time;
+// a check followed by a separate count would let a parallel burst through
+// before any failure is counted. So they reserve(): the attempt counts as a
+// failure up front, atomically with the check, and a correct password gives
+// its slot back with refund().
 
 import { DurableObject } from "cloudflare:workers";
 
@@ -31,6 +38,11 @@ export interface RateLimitResult {
   retryAfter: number;
 }
 
+export interface Reservation extends RateLimitResult {
+  /** The entry reserved for this attempt, to refund() it; absent if refused (or failed open). */
+  at?: number;
+}
+
 /**
  * One counter: the times of the failures within the window (a sliding log of at
  * most `limit` entries). Stored, so a restart or eviction does not reset it.
@@ -41,6 +53,31 @@ export class RateLimiter extends DurableObject {
    * made while over the limit is refused and not counted.
    */
   hit(failed: boolean, limit: number, windowSeconds: number): RateLimitResult {
+    const { allowed, retryAfter } = this.check(failed, limit, windowSeconds);
+    return { allowed, retryAfter };
+  }
+
+  /**
+   * Check an attempt and, if it is allowed, count it as a failure right away,
+   * before its result is known. Check and count are one step (a Durable Object
+   * runs one call at a time, and this one never awaits), so of a parallel
+   * burst at most `limit` attempts are allowed. A successful attempt gives its
+   * entry back with refund().
+   */
+  reserve(limit: number, windowSeconds: number): Reservation {
+    return this.check(true, limit, windowSeconds);
+  }
+
+  /** Remove the entry a successful attempt reserved, so successes never use up the limit. */
+  refund(at: number): void {
+    const failures = this.ctx.storage.kv.get<number[]>("failures") ?? [];
+    const index = failures.indexOf(at);
+    if (index === -1) return; // already outside the window
+    failures.splice(index, 1);
+    this.ctx.storage.kv.put("failures", failures);
+  }
+
+  private check(count: boolean, limit: number, windowSeconds: number): Reservation {
     const now = Date.now();
     const windowMs = windowSeconds * 1000;
     const recent = (this.ctx.storage.kv.get<number[]>("failures") ?? []).filter(
@@ -54,13 +91,15 @@ export class RateLimiter extends DurableObject {
         retryAfter: Math.max(1, Math.ceil((oldest + windowMs - now) / 1000)),
       };
     }
-    if (failed) {
-      recent.push(now);
-      this.ctx.storage.kv.put("failures", recent.slice(-limit));
-      // Delete the counter once its window has passed, so idle keys leave no data.
-      void this.ctx.storage.setAlarm(now + windowMs + 1000);
-    }
-    return { allowed: true, retryAfter: 0 };
+    if (!count) return { allowed: true, retryAfter: 0 };
+    // Entries are unique, so refund() removes exactly the one it reserved.
+    let at = now;
+    while (recent.includes(at)) at++;
+    recent.push(at);
+    this.ctx.storage.kv.put("failures", recent.slice(-limit));
+    // Delete the counter once its window has passed, so idle keys leave no data.
+    void this.ctx.storage.setAlarm(at + windowMs + 1000);
+    return { allowed: true, retryAfter: 0, at };
   }
 
   async alarm(): Promise<void> {
@@ -96,5 +135,40 @@ export async function rateLimit(
   } catch (err) {
     console.error(`[rate-limit] ${rule.name} check failed, allowing the attempt:`, err);
     return { allowed: true, retryAfter: 0 };
+  }
+}
+
+/**
+ * Reserve an attempt for `key` under `rule` before an expensive check: it
+ * counts as a failure unless refundAttempt() gives it back. Fails open like
+ * rateLimit().
+ */
+export async function reserveAttempt(
+  namespace: DurableObjectNamespace<RateLimiter>,
+  rule: RateLimitRule,
+  key: string,
+): Promise<Reservation> {
+  try {
+    const stub = namespace.get(namespace.idFromName(`${rule.name}:${key}`));
+    return await stub.reserve(rule.limit, rule.windowSeconds);
+  } catch (err) {
+    console.error(`[rate-limit] ${rule.name} check failed, allowing the attempt:`, err);
+    return { allowed: true, retryAfter: 0 };
+  }
+}
+
+/** Give back a reserved attempt that succeeded. Best effort: an error is only logged. */
+export async function refundAttempt(
+  namespace: DurableObjectNamespace<RateLimiter>,
+  rule: RateLimitRule,
+  key: string,
+  reservation: Reservation,
+): Promise<void> {
+  if (reservation.at === undefined) return;
+  try {
+    const stub = namespace.get(namespace.idFromName(`${rule.name}:${key}`));
+    await stub.refund(reservation.at);
+  } catch (err) {
+    console.error(`[rate-limit] ${rule.name} refund failed:`, err);
   }
 }

@@ -113,7 +113,8 @@ stays the same as today; the CLI and the tests depend on it.
     p90 to about 10 ms. To be confirmed by the next measurement.
   - **Trade-off:** a stolen bucket's hashes are 2.5× cheaper to brute-force.
     Online guessing stays capped at 5 wrong passwords per minute per IP per
-    upload.
+    upload, parallel requests included: each attempt is counted before its
+    password is hashed (see "Check before reveal" below).
   - **Old links:** hashes with any other iteration count still verify.
 - **Download pass:** after a correct password, the response also sets
   `yeet_dl_<id>`:
@@ -207,22 +208,39 @@ Evaluated on the Free plan:
   per minute. An alarm deletes the object's data once its window has passed.
 - **Check before reveal:** the Worker evaluates the cheap checks (token
   compare) first and then makes one call, `hit(failed)`. It refuses (429) if
-  over the limit, whatever the result, and only counts failures. For download
-  passwords the check comes before PBKDF2 (`hit(false)`), and a wrong password
-  is counted afterwards (`hit(true)`), so a client over the limit costs no
-  hashing.
+  over the limit, whatever the result, and only counts failures.
+- **Download passwords: reserve, then refund.** PBKDF2 takes milliseconds, so
+  the check cannot wait for the result. At first the Worker checked
+  (`hit(false)`), hashed, and only then counted a failure (`hit(true)`): a
+  burst of parallel guesses all passed the check before the first failure was
+  counted, so every one was hashed and a right one among them got its 303.
+  Now one call, `reserve()`, checks and counts the attempt as a failure in a
+  single step (the object handles one call at a time and that call never
+  awaits). A wrong password needs no second call; a correct one gives its
+  entry back with `refund()` before the redirect. So:
+  - of a burst, at most 5 attempts per minute get as far as hashing; the rest
+    get 429 without any hashing, a correct password among them included (no
+    oracle: the same 429 as a wrong one);
+  - successes cost no budget once they have finished. While a correct
+    password is being hashed it holds a slot, and after its refund one more
+    wrong password may be checked within the minute: still at most 5 wrong
+    ones;
+  - if the refund call fails, the success stays counted as a failure for the
+    rest of the minute (logged; fails safe).
 - **Cost per request:**
   - **One Durable Object call:** every `/api/*` request with an
     `Authorization` header (the CLI, correct token included, see above) and
     every `POST /login`.
   - **One or two calls:** a `POST /:id/download` for a protected file without
-    a valid download pass.
+    a valid download pass: one for a wrong password or a refusal, two for a
+    correct password (`reserve` + `refund`).
   - **No calls:** session-cookie API requests (the browser upload page), page
     views, unprotected downloads.
 
   The Worker's own CPU for a call is an RPC round trip with tiny arguments; the
   object's CPU and storage are billed to the Durable Object. Failures write one
-  row each.
+  row each; a correct download password writes two (the reservation and its
+  refund).
 
 - **Fails open:** if the object cannot be reached (e.g. the daily Durable Object
   quota is used up), the attempt is allowed and an error is logged. The limit
