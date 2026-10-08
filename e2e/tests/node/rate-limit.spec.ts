@@ -192,6 +192,59 @@ test.describe("rate limits", () => {
     }
   });
 
+  // CPU protection: an attempt over the limit must be refused before its
+  // password is hashed, or a client over the limit could still make the
+  // Worker spend a PBKDF2 per request. The shipped Worker has no hook to
+  // count hashes, so this measures. Two uploads, one hashed with 100,000
+  // iterations (the most Workers allow, ~10 ms here) and one with a single
+  // iteration: whatever else a request costs is the same for both, so the
+  // difference in time between them is the hashing. For attempts within the
+  // limit it is the cost of a hash; for refused ones it must be about zero.
+  // Every round sends all four kinds, so drift in the machine's speed
+  // affects them alike, and medians drop outliers.
+  test("download passwords: attempts over the limit are refused without hashing", async () => {
+    const slow = await uploadViaApi({ filename: "slow.bin", data: randomBytes(16) });
+    const fast = await uploadViaApi({ filename: "fast.bin", data: randomBytes(16) });
+    for (const [upload, iterations] of [
+      [slow, 100_000],
+      [fast, 1],
+    ] as const) {
+      const meta = (await readUploadMeta(upload.id))!;
+      await writeUploadMeta(upload.id, { ...meta, password_hash: pbkdf2Hash("right", iterations) });
+    }
+    const timed = async (url: string, ip: string, expected: number) => {
+      const started = performance.now();
+      const res = await submitDownloadForm(url, "wrong", { ip });
+      const ms = performance.now() - started;
+      expect(res.status).toBe(expected);
+      return ms;
+    };
+    const median = (values: number[]) => [...values].sort((a, b) => a - b)[values.length >> 1]!;
+
+    const limited = clientIp();
+    for (const { url } of [slow, fast]) for (let i = 0; i < 5; i++) await timed(url, limited, 401);
+    const times = {
+      slowHashed: [] as number[],
+      fastHashed: [] as number[],
+      slowRefused: [] as number[],
+      fastRefused: [] as number[],
+    };
+    for (let i = 0; i < 21; i++) {
+      // A fresh client is within the limit: checked and hashed.
+      times.slowHashed.push(await timed(slow.url, clientIp(), 401));
+      times.slowRefused.push(await timed(slow.url, limited, 429));
+      times.fastHashed.push(await timed(fast.url, clientIp(), 401));
+      times.fastRefused.push(await timed(fast.url, limited, 429));
+    }
+    const hashCost = median(times.slowHashed) - median(times.fastHashed);
+    const refusedCost = median(times.slowRefused) - median(times.fastRefused);
+    const detail = Object.entries(times)
+      .map(([name, values]) => `${name}: ${values.map(Math.round).join(", ")} ms`)
+      .join("; ");
+    expect(hashCost, `a hash should take measurable time; ${detail}`).toBeGreaterThan(3);
+    expect(refusedCost, `refused attempts must not hash; ${detail}`).toBeLessThan(hashCost * 0.3);
+  });
+
   test("bearer: the 21st wrong token within a minute gets 429, even the right one", async () => {
     const ip = clientIp();
     for (let i = 1; i <= 20; i++) {
