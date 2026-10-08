@@ -11,6 +11,7 @@ import {
 } from "../../../packages/worker/src/uploads.js";
 import { expect, test } from "../../lib/index.js";
 import { StrictBucket } from "../../lib/strict-r2.js";
+import { FakeBucket } from "../../lib/fake-r2.js";
 
 // Written by the independent verifier of round 1H: every sidecar shape a
 // released or pre-release yeet ever wrote must still pass parseUploadMeta(),
@@ -338,5 +339,30 @@ test.describe("1H verifier: readPartSizes budget and deleteUnder on short pages"
     expect(b.sorted(`${P}/x/`)).toEqual([]);
     expect(b.violations).toEqual([]);
     console.log(`one-key pages: done in ${total} calls`);
+  });
+});
+
+test.describe("1H verifier: edges the first mutation run missed", () => {
+  test("readPartSizes: a last page that crosses a 1,000-record delete batch is refused", async () => {
+    // 71 records per list call: 42 calls hold 2,982 records (3 deletes,
+    // 42 + 1 + 3 = 46 lets the 43rd call through), which brings 3,010:
+    // 43 lists + 4 deletes = 47 > 46. 3,000 records still fit (43 + 3).
+    const run = async (parts: number) => {
+      const b = new FakeBucket({ pageSize: 71 });
+      for (let n = 1; n <= parts; n++) b.seed(`${P}/x/.parts/${n}`, "", { size: "5" });
+      b.resetCalls();
+      const r = await new Uploads(b, P).readPartSizes("x", PART_RECORDS_BUDGET);
+      return { ok: r !== null, lists: b.calls["list"] ?? 0 };
+    };
+    expect(await run(3000)).toEqual({ ok: true, lists: 43 });
+    expect(await run(3010)).toEqual({ ok: false, lists: 43 });
+  });
+
+  test("writeMeta of a malformed sidecar (e.g. a pending one completed) writes it without a summary instead of throwing", async () => {
+    const b = new StrictBucket();
+    const u = new Uploads(b, P);
+    const meta = { filename: "f", uploaded_at: iso(NOW), expires_at: iso(NOW + DAY), downloads: 5 } as unknown as UploadMeta;
+    expect(await u.writeMeta("x", meta)).toBe(true);
+    expect(b.objects.get(`${P}/x/.meta.json`)!.meta).toEqual({});
   });
 });
