@@ -176,8 +176,11 @@ set. Without it, requests do not pay any Sentry CPU cost.
 ## Unchanged
 
 Download links (`/_dl/:id`, Range support), the bucket layout and the
-custom-metadata summary, cleanup, and `GET /api/uploads` and
-`DELETE /api/uploads/:id` (beyond the auth changes above).
+custom-metadata summary, and `DELETE /api/uploads/:id` (beyond the auth
+changes above). `GET /api/uploads` and the cleanup keep their behaviour, but
+within a fixed number of R2 calls; for a bucket too large for that,
+`GET /api/uploads` adds `"truncated": true` (see "Listing within a fixed
+number of R2 calls" below).
 
 ## Implementation notes
 
@@ -241,13 +244,17 @@ Evaluated on the Free plan:
   single step (the object handles one call at a time and that call never
   awaits). A wrong password needs no second call; a correct one gives its
   entry back with `refund()` before the redirect. So:
-  - of a burst, at most 5 attempts per minute get as far as hashing; the rest
-    get 429 without any hashing, a correct password among them included (no
-    oracle: the same 429 as a wrong one);
-  - successes cost no budget once they have finished. While a correct
-    password is being hashed it holds a slot, and after its refund one more
-    wrong password may be checked within the minute: still at most 5 wrong
-    ones;
+  - per client and upload, at most 5 wrong passwords a minute are hashed,
+    plus any correct ones: a correct password is hashed in a slot of its own
+    and then refunds it, so after it one more attempt may be hashed (5 wrong
+    plus the refunded correct one). Every other attempt of a burst gets 429
+    without any hashing, a correct password among them included (no oracle:
+    the same 429 as a wrong one). `e2e/tests/node/rate-limit.spec.ts`
+    checks by timing that refused attempts are not hashed;
+  - successes cost no budget once they have finished, but while a correct
+    password is being hashed it holds a slot. So correct passwords sent in
+    parallel from one address (more than 5 at once) can be throttled too:
+    the ones beyond the free slots get 429 until the others have finished;
   - if the refund call fails, the success stays counted as a failure for the
     rest of the minute (logged; fails safe).
 - **Cost per request:**
@@ -375,91 +382,113 @@ Numbers that are signed or used as keys must be spelled one way only:
 - **Rate-limited:** the page shows the form with "Too many attempts. Try again
   in N seconds." (`429`, `Retry-After`).
 
-### Download count: one object per download
+### Download count: a conditional update of the sidecar
 
-`recordDownload` used to read `.meta.json`, append the download and write it
-back in `waitUntil`. Downloads close together read the same sidecar and
-overwrote each other's record (on real Cloudflare 6 downloads were counted as
-5; under `wrangler dev`, 10 at once as 2). It also kept only the last 50
-records, so the count never went past 50. Evaluated:
+The count lives in `.meta.json`: `download_count` and `recent_downloads`
+(the last five ISO 8601 times, oldest first), mirrored in the summary custom
+metadata. A legacy `downloads` array (yeet 0.2 and earlier) is read for both
+and replaced by them on the first download counted.
 
-- **Conditional writes** (`put` with `onlyIf: { etagMatches }`, re-read and
-  retry on a conflict). Exact only while the retries last: with n concurrent
-  downloads the last one needs up to n rounds of get + put, so a burst either
-  exceeds the 50-subrequest budget or, with a retry cap, loses counts again.
-- **A Durable Object per upload** that serializes the read-modify-write. Exact,
-  but a second DO class (and migration), one DO request per download against
-  the daily quota the rate limiter also uses, and the DO would still have to
-  write the sidecar, so listing stays as it is.
-- **One empty object per download** (chosen). `<prefix>/<id>/.downloads/<at>_<random>`,
-  with `<at>` the ISO 8601 time and 8 random hex digits. Every download writes
-  its own key, so nothing can be lost; it is one `put` (one subrequest, the
-  same as the old sidecar write, minus the read) and no extra CPU.
+`recordDownload()` runs in `waitUntil`, after the redirect: it reads the
+sidecar, adds the download and writes it back with
+`onlyIf: { etagMatches: <etag read> }`. R2 checks the condition and writes in
+one step, so a write based on a stale read fails (`put` returns null) instead
+of overwriting a newer count, and a sidecar deleted meanwhile is never
+written back. On a failure it reads again after a random wait (up to
+8 × the round trip just measured × the attempt number), at most 3 attempts.
 
-How the rest follows:
+- **Semantics:** downloads one after another are counted exactly. Downloads
+  of one file at the same moment may conflict; each retries, and one that
+  finds the sidecar changed on all 3 attempts is not counted (logged). So
+  under heavy concurrency the count can be too low, never too high. Locally
+  (`wrangler dev`), 20 downloads at once are counted as 20;
+  `e2e/tests/node/download-flow.spec.ts` requires at least 15.
+- **Cost:** at most 6 R2 calls per download (3 × get + put), usually 2. A
+  whole `POST /:id/download` makes at most 9 subrequests: the sidecar read,
+  2 rate-limit calls for a protected file (`reserve` + `refund`) and the 6.
+  The waits are wall time, not CPU.
+- **Why not one object per download** (the design of 1D/1E): every download
+  added an object to the listing, and listing them was bounded only by
+  assuming 1,000 objects per list call. With metadata a list call returns at
+  most 100 (miniflare caps it; Cloudflare says such lists may return fewer
+  than asked), so a few thousand records pushed `GET /api/uploads` and the
+  cron past 50 subrequests. The cap of 1,000 records per upload was also not
+  atomic, and overlapping folds could count records twice. A Durable Object
+  per upload would count exactly, but costs a DO request per download from
+  the daily quota the rate limits rely on.
 
-- **Listing:** `listAll()` already lists every object under the prefix (one
-  call per 1000 objects, with custom metadata). It counts each upload's
-  `.downloads/` objects in that same pass and adds them to the summary:
-  `download_count` = the sidecar's count + the records, `recent_downloads` =
-  the last five of both (keys list in time order). No extra subrequests per
-  upload. The cost: each download is one more object in the listing, so 1000
-  downloads cost one more list call. Records therefore must not pile up; see
-  "Keeping the records bounded" below.
-- **Delete and cleanup:** both already delete every object under
-  `<prefix>/<id>/`, records included. Records without an upload (a download
-  that raced a delete or expiry) are listed as `stray`: `listAll()` reads no
-  sidecar for them, `GET /api/uploads` omits them and the cleanup deletes them.
-- **Compatibility:** sidecars keep `downloads` from earlier versions, which is
-  no longer written. Their count still shows (summary or sidecar), and new
-  records add to it; the cap of 50 no longer applies to new downloads. A file
-  named `.downloads` is a different key (`<id>/.downloads`, no slash) and is
-  not mistaken for a record.
+### Listing within a fixed number of R2 calls
 
-#### Keeping the records bounded
+`listAll()` lists `<prefix>/` with custom metadata, one page after the
+other, and stops at a budget: **40 R2 calls** for `GET /api/uploads` (plus
+its one rate-limit call: 41 subrequests), 25 for the cron. Sidecars of
+yeet < 0.2 carry no summary and cost one read each, counted in the budget.
+`.downloads/` and `.parts/` runs are jumped over: a page that ends inside
+one is followed by a call with `startAfter: <prefix>/<id>/<run>/~`, so each
+costs at most one extra call, however many objects it holds.
 
-Unprotected downloads need no credentials, so a script can download one link
-tens of thousands of times. Unbounded, ~49,000 records push `GET /api/uploads`
-and the cron past the 50-subrequest budget (and their CPU), and the cleanup
-stops for every upload. Three measures, together:
+When the budget runs out, the listing returns the uploads it has, in ID
+order (never a partly listed last one), with `truncated: true`, and
+`GET /api/uploads` passes the flag on. `yeet list` then prints a note that
+only part of the uploads is shown.
 
-1. **The cron folds the records into the sidecar** (`foldDownloads()`). For
-   each upload with records it reads the sidecar, adds them to the sidecar's
-   own `download_count` and `recent_downloads` (new fields, which replace a
-   legacy `downloads` array: its count and last five times are carried over
-   and the array dropped), writes the sidecar with its summary custom metadata
-   (`summarize()` reads the new fields, so the summary stays consistent), and
-   then deletes the records it counted. The sidecar write is conditional on
-   the etag read (`onlyIf: { etagMatches }`), so a sidecar deleted or changed
-   meanwhile is never written back. A download recorded during the fold has a
-   key the fold did not list; it stays for the next one. Cost per upload: a
-   get, a put and a delete per 1000 records. The cron spends at most 45
-   subrequests in all (list calls, aborts and deletes of stale uploads
-   first), folding the uploads with the most records first; the rest wait a
-   day. So the bucket holds about one day of records.
-   - If deleting the records fails after the sidecar was written, they are
-     counted again at the next fold (logged). The alternative order, deleting
-     first, would lose them instead.
-2. **At most 1,000 records per upload between two folds** (`RECORD_CAP`).
-   `recordDownload()` first lists the upload's records (one call, at most
-   1,000 keys) and writes nothing if there are 1,000. Normal use is counted
-   exactly; past 1,000 downloads of one upload in a day, the count stops
-   growing until the next fold (an undercount, never an overcount). That is a
-   second subrequest per download (in `waitUntil`, after the response) and a
-   class A operation, like the `put`.
-3. **The listing counts at most 2,000 records per upload**
-   (`LISTED_RECORDS_LIMIT`, two days' worth). Past it, `listAll()` jumps over
-   the rest of that upload's records with `startAfter`, so it never pages
-   through more than that per upload, whatever is in the bucket (e.g. records
-   written before this version). The count shown is then too low until the
-   folds catch up: each cron run folds (or, for an expired upload, deletes)
-   the records it counted, and the rest the next day; stray records left of
-   a deleted upload go the same way. `DELETE /api/uploads/:id` still deletes
-   them all (with the records bounded, a few list and delete calls).
+**Capacity** (uploads one `GET /api/uploads` lists), assuming 100 objects
+per list call with metadata, as miniflare returns:
 
-Not chosen: rate-limiting the recording per IP and upload. It would need a
-Durable Object call per download, against the daily quota the login and
-password limits rely on; the cap bounds the objects without it.
+- **Finished uploads with a summary** (2 objects each): 40 calls × 50 =
+  2,000, minus the last, partly listed one: **1,999**.
+- **Each sidecar without a summary** costs one call, so 50 fewer uploads.
+  The cron adds the missing summaries (below), so this is transient.
+- **Each upload whose `.parts/` or legacy `.downloads/` run ends a page**
+  costs one more call. Pending uploads of unknown size and legacy records
+  also take room in the pages they share.
+- **If real R2 returns more per call** (up to 1,000), capacity grows to
+  match; if it returns fewer, it shrinks. To be measured on a real deploy.
+
+`e2e/tests/node/r2-budget.spec.ts` counts the calls on the Worker's own
+modules with an in-memory bucket that returns at most 100 objects per call
+and, like the Free plan, throws past 50.
+
+### Cleanup (cron)
+
+The daily run (`packages/worker/src/cleanup.ts`) makes at most **45 R2
+calls**:
+
+1. **Reads its cursor**, `<prefix>/.cleanup-cursor` (1 call): the key to
+   start after, or none for the beginning of the bucket.
+2. **Lists from there**, with a budget of 25 calls (about 1,249 uploads).
+3. **Handles the uploads in key order** while the rest of the budget lasts
+   (keeping one call for step 4):
+   - **Expired, and pending for over 24 hours:** their keys go into one
+     batch delete (1,000 keys per call); a pending one first gets its
+     multipart upload aborted (1 call).
+   - **Uploads whose keys the listing jumped over, and legacy records:**
+     listed and deleted under `<prefix>/<id>/` (or only `.downloads/` for a
+     current upload), 2 calls per 1,000 objects.
+   - **Sidecars without a summary:** rewritten with it (a get and a
+     conditional put, 2 calls).
+4. **Saves the cursor** (1 call, only if it changed): after the last upload
+   it finished. If it reached the end of the bucket, the next run starts at
+   the beginning.
+
+So the order is stable across runs and each run continues where the last
+one stopped: a bucket of N uploads is gone through in about N / 1,249 days,
+longer when a run has more to delete than its budget allows (it then stops
+at that upload and goes on from there the next day). Expired files are refused at request time
+regardless (the page, the form and `/_dl` check `expires_at`), so a later
+deletion costs only storage; `yeet list` shows them as expired until then.
+
+### Legacy download records (1D/1E)
+
+The pre-release versions 1D and 1E wrote one empty object per download,
+`<prefix>/<id>/.downloads/<at>_<random>`. They are no longer written or
+counted: the listing jumps over them, the cron deletes them (as above,
+2 calls per 1,000), and `DELETE /api/uploads/:id` removes them with their
+upload. They are not added to the count first: that would take a
+conditional sidecar update per batch, and a failed delete after it would
+count them twice. They only exist in pre-release test buckets, whose counts
+drop back to what the sidecar holds. Records without an upload (a download
+that raced a delete) are deleted the same way.
 
 ### Range requests on `/_dl/:id`
 

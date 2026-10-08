@@ -8,8 +8,9 @@ https://yeet.example.workers.dev/aB3x_Q/mixdown-v3.wav
 ```
 
 The recipient opens the link, sees the file name, size and expiry date, and
-clicks **Download**. Links expire after 30 days by default, can be protected
-with a password, and expired files are deleted automatically.
+clicks **Download**. Links expire after 30 days by default (365 days at
+most), can be protected with a password, and expired files are deleted
+automatically.
 
 yeet is self-hosted on your own Cloudflare account. It runs on the free plan:
 Workers and R2 storage are free up to 10 GB stored and 100,000 requests a day,
@@ -60,7 +61,7 @@ yeet upload song.wav
 
 ```sh
 yeet upload song.wav                         # link valid for 30 days
-yeet upload stems.zip --expires 7d           # or 24h, 90m
+yeet upload stems.zip --expires 7d           # or 24h, 90m; at most 365d
 yeet upload demo.mp3 --password hunter2      # recipient needs the password
 yeet upload *.wav                            # one link per file
 yeet list                                    # all uploads, newest first
@@ -118,9 +119,15 @@ must be managed by Cloudflare. Then run `yeet login https://dl.example.com`.
 
 Files live in the bucket as `uploads/<id>/<filename>`, next to a small
 `uploads/<id>/.meta.json` with the name, size, expiry and password hash.
-Each download adds an empty `uploads/<id>/.downloads/<time>_<random>` object
-(at most 1,000 per file per day); the daily cleanup adds them to the count in
-`.meta.json` and deletes them.
+Each download is counted in `.meta.json` (the total and the last five
+times). Downloads one after another are counted exactly; when many people
+download the same file at the same moment, a few may be missed, never
+counted twice.
+
+`yeet list` shows about 2,000 uploads at most: the Worker may make only 50
+storage calls per request on the free plan. With more, it says that only
+part of them is shown. The daily cleanup works through a bucket of any size,
+about 1,200 uploads per day.
 
 ## Security notes
 

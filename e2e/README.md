@@ -169,9 +169,16 @@ Rules of thumb:
   every expired upload. Wrap any test that triggers the cron, or needs an expired
   upload to stay in the bucket for a while, in `exclusive("cron", async () => …)`
   (see `tests/node/cron.spec.ts`), and give uploads in other tests expiries of
-  minutes or more. The cleanup also folds `.downloads/` records into the
-  sidecar, so a test that inspects those records or the sidecar's `downloads`
-  directly holds the same lock; counts from `GET /api/uploads` are unaffected.
+  minutes or more. The cleanup also deletes legacy `.downloads/` records and
+  adds the summary custom metadata to sidecars without one, so a test that
+  seeds or inspects either holds the same lock. (In the test bucket one cron
+  run gets through everything; with more uploads than its R2 call budget
+  lists, it would continue the next run.)
+- Code that has to stay within the Free plan's 50 subrequests (the listing,
+  the cron, the download count) is unit-tested on the Worker's modules with
+  the in-memory bucket of `lib/fake-r2.ts`, which counts R2 calls, returns at
+  most 100 objects per list call with metadata and throws past 50 calls
+  (`tests/node/r2-budget.spec.ts`); `wrangler dev` enforces neither.
 - Opening the page of an expired upload deletes it, so do not visit an upload
   whose removal by the cron you want to observe.
 - Tag slow tests with `{ tag: "@slow" }` so `verify:fast` can skip them.
