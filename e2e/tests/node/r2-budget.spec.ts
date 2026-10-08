@@ -1,6 +1,7 @@
 import { CLEANUP_BUDGET, CLEANUP_LIST_BUDGET, runCleanup } from "../../../packages/worker/src/cleanup.js";
 import {
   LIST_BUDGET,
+  PART_RECORDS_BUDGET,
   RECORD_ATTEMPTS,
   summarize,
   Uploads,
@@ -481,5 +482,76 @@ test.describe("R2 calls of a download count", () => {
     seedUpload(pending, idOf(1), { pendingSince: NOW });
     expect(await new Uploads(pending, PREFIX).recordDownload(idOf(1), "x")).toBe(false);
     expect(pending.calls).toEqual({ get: 1 });
+  });
+});
+
+test.describe("R2 calls of completing an upload of unknown size", () => {
+  // POST /api/uploads/:id/complete without a size at create, call by call as
+  // in packages/worker/src/index.ts: the Bearer rate-limit call (not an R2
+  // call: the bucket allows one less), the sidecar read, the part records
+  // (readPartSizes()), the multipart complete, the sidecar write and the
+  // deletion of the records. Returns what happened and the subrequests made.
+  async function complete(bucket: FakeBucket, id: string) {
+    bucket.resetCalls();
+    bucket.maxCalls = 50 - 1;
+    const uploads = new Uploads(bucket, PREFIX);
+    try {
+      const meta = (await uploads.readMeta(id))!;
+      const records = await uploads.readPartSizes(id, PART_RECORDS_BUDGET);
+      if (!records) return { outcome: "refused", subrequests: 1 + bucket.total };
+      await bucket.resumeMultipartUpload(`${PREFIX}/${id}/${meta.filename}`, "mp").complete();
+      const { pending_upload_id: _, ...finished } = meta;
+      await uploads.writeMeta(id, { ...finished, file_size: records.sizes.size * 5 });
+      await uploads.deleteKeys(records.keys);
+      return { outcome: "completed", subrequests: 1 + bucket.total };
+    } catch {
+      // What the Free plan does past 50 subrequests: the request fails.
+      const after = bucket.calls["complete"] ? " after complete" : "";
+      const written = bucket.calls["put"] ? ", sidecar written" : "";
+      return { outcome: `failed${after}${written}`, subrequests: 51 };
+    }
+  }
+
+  test(`at most ${PART_RECORDS_BUDGET + 4} subrequests; too many parts are refused before completing`, async () => {
+    const results: Record<number, { outcome: string; subrequests: number }> = {};
+    for (const parts of [1, 100, 101, 4000, 4100, 4101, 4600, 4601, 4700, 4701, 10_000]) {
+      const bucket = new FakeBucket();
+      seedUpload(bucket, idOf(0), { pendingSince: NOW, parts });
+      results[parts] = await complete(bucket, idOf(0));
+      if (results[parts]!.outcome === "refused") {
+        // Nothing changed: still pending, every record still there.
+        expect(bucket.calls["complete"] ?? 0).toBe(0);
+        expect(bucket.calls["put"] ?? 0).toBe(0);
+        expect(bucket.keys(`${PREFIX}/${idOf(0)}/.parts/`)).toHaveLength(parts);
+      } else if (results[parts]!.outcome === "completed") {
+        expect(bucket.keys(`${PREFIX}/${idOf(0)}/`)).toEqual([`${PREFIX}/${idOf(0)}/.meta.json`]);
+      }
+    }
+    // 4 + ceil(parts / 100) list calls + ceil(parts / 1000) deletes, at most 50.
+    expect(results).toEqual({
+      1: { outcome: "completed", subrequests: 6 },
+      100: { outcome: "completed", subrequests: 6 },
+      101: { outcome: "completed", subrequests: 7 },
+      4000: { outcome: "completed", subrequests: 48 },
+      4100: { outcome: "completed", subrequests: 50 },
+      4101: { outcome: "refused", subrequests: 43 },
+      4600: { outcome: "refused", subrequests: 43 },
+      4601: { outcome: "refused", subrequests: 43 },
+      4700: { outcome: "refused", subrequests: 43 },
+      4701: { outcome: "refused", subrequests: 43 },
+      10_000: { outcome: "refused", subrequests: 43 },
+    });
+  });
+
+  test("fewer records per list call: refused within the budget, before completing", async () => {
+    const bucket = new FakeBucket({ pageSize: 37 });
+    seedUpload(bucket, idOf(0), { pendingSince: NOW, parts: 1700 });
+    const refused = await complete(bucket, idOf(0));
+    expect(refused.outcome).toBe("refused");
+    expect(refused.subrequests).toBeLessThanOrEqual(2 + PART_RECORDS_BUDGET);
+    const small = new FakeBucket({ pageSize: 37 });
+    seedUpload(small, idOf(0), { pendingSince: NOW, parts: 1500 });
+    // 41 list calls and 2 deletes.
+    expect(await complete(small, idOf(0))).toEqual({ outcome: "completed", subrequests: 47 });
   });
 });

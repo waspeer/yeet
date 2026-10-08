@@ -7,6 +7,7 @@ import {
   expect,
   listObjects,
   listUploads,
+  putObject,
   readUploadMeta,
   server,
   test,
@@ -229,6 +230,32 @@ test.describe("upload API", () => {
     expect(res.status).toBe(400);
     expect(await res.json()).toEqual({ error: "Part 2 was not uploaded" });
     await api(`/api/uploads/${id}`, { method: "DELETE" });
+  });
+
+  test("size unknown: more part records than one request can list and delete is a 400 before completing", async () => {
+    // 4,101 records take 42 list calls (100 per call with metadata) and 5
+    // deletes: more than the 46 subrequests complete has for them. Seeded
+    // directly; wrangler dev itself does not enforce the Free plan's 50.
+    const id = await create({ filename: "many-parts.bin" });
+    const one = await putPartJson(id, 1, randomBytes(10));
+    const keys = Array.from({ length: 4100 }, (_, i) => `${server.uploadsPrefix}/${id}/.parts/${i + 2}`);
+    for (let i = 0; i < keys.length; i += 50) {
+      await Promise.all(
+        keys.slice(i, i + 50).map((key) => putObject(key, "", { customMetadata: { size: "10" } })),
+      );
+    }
+
+    const res = await complete(id, { parts: [one] });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({
+      error:
+        "Too many parts to complete an upload of unknown size in one request; " +
+        "start the upload again with its size",
+    });
+    // Nothing changed: still pending, every record still there.
+    expect((await readUploadMeta(id))?.pending_upload_id).toBeTruthy();
+    expect(await listObjects(`${server.uploadsPrefix}/${id}/.parts/`)).toHaveLength(4101);
+    expect((await api(`/api/uploads/${id}`, { method: "DELETE" })).status).toBe(200);
   });
 
   test("an invalid parts array is a 400 before anything is completed", async () => {

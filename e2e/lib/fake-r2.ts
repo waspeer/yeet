@@ -8,7 +8,8 @@
 //   `cursor` and `startAfter` work as in R2 (the later of the two wins);
 // - put() with `onlyIf: { etagMatches }` writes only if the object exists
 //   with that etag (atomically) and returns null otherwise;
-// - each get, head, put, list, delete and multipart abort is one subrequest.
+// - each get, head, put, list, delete and multipart abort or complete is one
+//   subrequest.
 //   Past `maxCalls` (default 50, the Free plan's limit per invocation) a call
 //   throws, as the Workers runtime does.
 
@@ -129,7 +130,7 @@ export class FakeBucket implements Bucket {
   }
 
   resumeMultipartUpload(_key: string, _uploadId: string) {
-    return { abort: () => this.call("abort") };
+    return { abort: () => this.call("abort"), complete: () => this.call("complete") };
   }
 }
 

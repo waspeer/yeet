@@ -39,7 +39,14 @@ import {
 } from "./template.js";
 import { uploadPage } from "./upload-page.js";
 import { runCleanup } from "./cleanup.js";
-import { generateId, isExpired, isValidFilename, isValidId, Uploads } from "./uploads.js";
+import {
+  generateId,
+  isExpired,
+  isValidFilename,
+  isValidId,
+  PART_RECORDS_BUDGET,
+  Uploads,
+} from "./uploads.js";
 
 export { RateLimiter };
 
@@ -385,7 +392,20 @@ api.post("/uploads/:id/complete", async (c) => {
   // part sizes, so the client gets a clear error instead of R2's.
   let partRecords: string[] = [];
   if (meta.file_size === undefined) {
-    const { sizes, keys } = await uploads.readPartSizes(id);
+    // Refused before anything is changed if the records cannot be listed
+    // and deleted within the request's subrequests (see PART_RECORDS_BUDGET).
+    const records = await uploads.readPartSizes(id, PART_RECORDS_BUDGET);
+    if (!records) {
+      return c.json(
+        {
+          error:
+            "Too many parts to complete an upload of unknown size in one request; " +
+            "start the upload again with its size",
+        },
+        400,
+      );
+    }
+    const { sizes, keys } = records;
     partRecords = keys;
     const missing = parts.find(({ partNumber }) => !sizes.has(partNumber));
     if (missing) return c.json({ error: `Part ${missing.partNumber} was not uploaded` }, 400);

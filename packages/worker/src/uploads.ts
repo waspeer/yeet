@@ -81,6 +81,15 @@ export const RECORD_ATTEMPTS = 3;
 export const LIST_BUDGET = 40;
 
 /**
+ * R2 calls `POST /api/uploads/:id/complete` of an upload of unknown size may
+ * spend on its part records (readPartSizes() and their deletion): the Free
+ * plan's 50 subrequests minus its 4 other ones (the Bearer rate-limit call,
+ * the sidecar read, the multipart complete and the sidecar write). With 100
+ * records per list call that is 4,100 parts.
+ */
+export const PART_RECORDS_BUDGET = 50 - 4;
+
+/**
  * Upload IDs are base64url. Anything else — in particular dot-segments
  * smuggled in via %2F — must never be turned into an object key, where it
  * could address objects outside the uploads prefix.
@@ -377,13 +386,27 @@ export class Uploads {
     });
   }
 
-  /** The recorded part sizes of an upload, and the keys of their records. */
-  async readPartSizes(id: string): Promise<{ sizes: Map<number, number>; keys: string[] }> {
+  /**
+   * The recorded part sizes of an upload, and the keys of their records, or
+   * null if listing them (one call per page, with metadata) and deleting
+   * them afterwards (deleteKeys(): one call per 1,000) would take more than
+   * `budget` R2 calls. It stops listing as soon as that is certain, so it
+   * makes at most `budget` calls itself.
+   */
+  async readPartSizes(
+    id: string,
+    budget = Infinity,
+  ): Promise<{ sizes: Map<number, number>; keys: string[] } | null> {
     const prefix = `${this.dir(id)}.parts/`;
     const sizes = new Map<number, number>();
     const keys: string[] = [];
     let cursor: string | undefined;
+    let calls = 0;
+    const deletes = () => Math.ceil(keys.length / 1000);
     do {
+      // This call, and at least the deletes of the records found so far.
+      if (calls + 1 + deletes() > budget) return null;
+      calls++;
       const page = await this.bucket.list({ prefix, cursor, include: ["customMetadata"] });
       for (const object of page.objects) {
         keys.push(object.key);
@@ -393,7 +416,7 @@ export class Uploads {
       }
       cursor = page.truncated ? page.cursor : undefined;
     } while (cursor);
-    return { sizes, keys };
+    return calls + deletes() > budget ? null : { sizes, keys };
   }
 
   async exists(id: string): Promise<boolean> {
