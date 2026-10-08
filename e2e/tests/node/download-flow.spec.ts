@@ -4,6 +4,7 @@ import {
   deleteUpload,
   downloadBytes,
   eventually,
+  exclusive,
   expect,
   listUploads,
   readUploadMeta,
@@ -90,28 +91,30 @@ test.describe("download count", () => {
     expect(await listed(id)).toBeUndefined();
   });
 
-  test("downloads recorded in an older sidecar still count, without the old cap of 50", async () => {
-    const old = Array.from({ length: 50 }, (_, i) => ({
-      at: new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString(),
-    }));
-    // Both kinds of older sidecars: with the summary custom metadata and without.
-    for (const withSummary of [true, false]) {
-      const { id, url } = await uploadViaApi({ filename: "veteran.bin", data: randomBytes(64) });
-      const meta = (await readUploadMeta(id))!;
-      await writeUploadMeta(id, { ...meta, downloads: old }, { withSummary });
-      expect((await listed(id))?.download_count).toBe(50);
+  // Under the "cron" lock: a cron run would fold the records into the sidecar.
+  test("downloads recorded in an older sidecar still count, without the old cap of 50", () =>
+    exclusive("cron", async () => {
+      const old = Array.from({ length: 50 }, (_, i) => ({
+        at: new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString(),
+      }));
+      // Both kinds of older sidecars: with the summary custom metadata and without.
+      for (const withSummary of [true, false]) {
+        const { id, url } = await uploadViaApi({ filename: "veteran.bin", data: randomBytes(64) });
+        const meta = (await readUploadMeta(id))!;
+        await writeUploadMeta(id, { ...meta, downloads: old }, { withSummary });
+        expect((await listed(id))?.download_count).toBe(50);
 
-      for (let i = 0; i < 3; i++) expect((await submitDownloadForm(url)).status).toBe(303);
-      await eventually(async () => (await listed(id))?.download_count === 53, {
-        message: "download_count 53",
-      });
-      const recent = (await listed(id))!.recent_downloads;
-      expect(recent.slice(0, 2)).toEqual(old.slice(-2).map((d) => d.at));
-      expect(recent.slice(2).every((at) => at > "2026-01-02")).toBe(true);
-      // The sidecar itself is no longer rewritten per download.
-      expect((await readUploadMeta(id))?.downloads).toEqual(old);
-    }
-  });
+        for (let i = 0; i < 3; i++) expect((await submitDownloadForm(url)).status).toBe(303);
+        await eventually(async () => (await listed(id))?.download_count === 53, {
+          message: "download_count 53",
+        });
+        const recent = (await listed(id))!.recent_downloads;
+        expect(recent.slice(0, 2)).toEqual(old.slice(-2).map((d) => d.at));
+        expect(recent.slice(2).every((at) => at > "2026-01-02")).toBe(true);
+        // The sidecar itself is no longer rewritten per download.
+        expect((await readUploadMeta(id))?.downloads).toEqual(old);
+      }
+    }));
 });
 
 test.describe("DELETE /api/uploads/:id", () => {

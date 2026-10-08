@@ -99,6 +99,7 @@ test.describe("download pass", () => {
       "expired, correctly signed": forgePass(b.id, now - 5),
       "signed with another token": forgePass(b.id, now + 600, `${server.token}-old`),
       malformed: `yeet_dl_${b.id}=x.y.z`,
+      "leading zero in the expiry": forgePass(b.id, now + 600).replace("=", "=0"),
     };
     for (const [name, cookie] of Object.entries(rejectedForB)) {
       expect(await pageHasPasswordField(b.url, cookie), name).toBe(true);

@@ -87,8 +87,13 @@ Projects:
 | `webkit`   | `tests/browser/*` | download + upload pages in Playwright's WebKit (Desktop Safari)   |
 | `firefox`  | `tests/browser/*` | download + upload pages in Playwright's Firefox (Desktop Firefox) |
 
-Environment knobs: `YEET_E2E_WORKERS=<n>` (parallel workers, default 4),
+Environment knobs: `YEET_E2E_WORKERS=<n>` (parallel Playwright workers,
+default 2 so a run does not max out a laptop; raise it on a bigger machine),
 `YEET_E2E_KEEP=1` (keep the temp directory with the R2 state and print its path).
+
+Agents (and humans) iterate with `npm run verify:fast` and subsets
+(`--grep`, `--project`, one file), and run the full strict `npm run verify`
+once at the end. Never run several harness instances at the same time.
 
 ## Output
 
@@ -164,7 +169,9 @@ Rules of thumb:
   every expired upload. Wrap any test that triggers the cron, or needs an expired
   upload to stay in the bucket for a while, in `exclusive("cron", async () => …)`
   (see `tests/node/cron.spec.ts`), and give uploads in other tests expiries of
-  minutes or more.
+  minutes or more. The cleanup also folds `.downloads/` records into the
+  sidecar, so a test that inspects those records or the sidecar's `downloads`
+  directly holds the same lock; counts from `GET /api/uploads` are unaffected.
 - Opening the page of an expired upload deletes it, so do not visit an upload
   whose removal by the cron you want to observe.
 - Tag slow tests with `{ tag: "@slow" }` so `verify:fast` can skip them.
@@ -172,7 +179,7 @@ Rules of thumb:
   bearer tokens) per client IP, taken from `CF-Connecting-IP`, which
   `wrangler dev` passes through. A test that makes failed attempts sends its
   own `clientIp()`; browser tests get a unique one automatically. Requests
-  without the header all count as 127.0.0.1.
+  without the header all count as 127.0.0.1. IPv6 addresses count per /64.
 - A test that needs a differently configured server (another token, a short
   token, `SENTRY_DSN`) starts its own with `startServer()` and stops it in a
   `finally`.
@@ -240,7 +247,8 @@ password?)` → `{ sha256, size }`, streaming, for large files.
 These talk to wrangler's Local Explorer API
 (`<baseURL>/cdn-cgi/local/explorer/api/r2/...`), bypassing the Worker.
 
-- `listObjects(prefix?)`, `uploadObjects(id)` → `{ key, size, etag, http_metadata, custom_metadata }[]`.
+- `listObjects(prefix?)`, `uploadObjects(id)` → `{ key, size, etag, http_metadata, custom_metadata }[]`
+  (the explorer's listing leaves both metadata fields empty; `headObject(key)` returns them).
 - `putObject(key, body, { contentType?, customMetadata? })`, `getObject(key)`.
 - `seedLegacyUpload({ filename, data, id?, meta?, contentType? })` →
   `{ id, url, meta }`: an upload as yeet < 0.2 / rclone left it — the file plus

@@ -18,7 +18,16 @@ import {
   verifyPassword,
   verifySession,
 } from "./crypto.js";
-import { rateLimit, RateLimiter, RULES, type RateLimitResult } from "./rate-limit.js";
+import {
+  rateLimit,
+  RateLimiter,
+  refundAttempt,
+  reserveAttempt,
+  RULES,
+  type RateLimitResult,
+} from "./rate-limit.js";
+import { isBearerAttempt, parseExpiry, rateLimitClient } from "./parse.js";
+import { formatRange, parseRange } from "./range.js";
 import { withOptionalSentry } from "./sentry.js";
 import {
   downloadPage,
@@ -29,7 +38,14 @@ import {
   tooManyAttempts,
 } from "./template.js";
 import { uploadPage } from "./upload-page.js";
-import { generateId, isExpired, isValidFilename, isValidId, Uploads } from "./uploads.js";
+import {
+  generateId,
+  isExpired,
+  isValidFilename,
+  isValidId,
+  Uploads,
+  type ListedUpload,
+} from "./uploads.js";
 
 export { RateLimiter };
 
@@ -50,6 +66,9 @@ export interface Env {
  * bodies up to 100 MB, so the CLI sends files in 50 MiB pieces.
  */
 const PART_SIZE = 50 * 1024 * 1024;
+
+/** The longest lifetime of an upload, in seconds: 365 days. */
+const MAX_EXPIRES_IN = 365 * 24 * 60 * 60;
 
 /** Uploads still pending after this long are considered abandoned. */
 const ABANDONED_AFTER_MS = 24 * 60 * 60 * 1000;
@@ -78,6 +97,11 @@ const app = new Hono<AppEnv>();
 app.use("*", async (c, next) => {
   c.set("uploads", new Uploads(c.env.BUCKET, c.env.UPLOADS_PREFIX || "uploads"));
   await next();
+  // No other site may frame a page of ours (clickjacking of the login,
+  // upload and download forms): CSP for current browsers, X-Frame-Options
+  // for older ones. Harmless on everything else, so set on every response.
+  c.res.headers.set("Content-Security-Policy", "frame-ancestors 'none'");
+  c.res.headers.set("X-Frame-Options", "DENY");
 });
 
 function shareUrl(origin: string, id: string, filename: string): string {
@@ -96,9 +120,12 @@ function encodeRfc8187(value: string): string {
 // Browser requests: cookies, origin checks, rate limits
 // ---------------------------------------------------------------------------
 
-/** The client's address as Cloudflare saw it; the key of the rate limits. */
+/**
+ * The client as the rate limits know it: the address Cloudflare saw, an IPv6
+ * one by its /64 (see rateLimitClient()).
+ */
 function clientIp(c: Ctx): string {
-  return c.req.header("CF-Connecting-IP") ?? "unknown";
+  return rateLimitClient(c.req.header("CF-Connecting-IP") ?? "unknown");
 }
 
 function isHttps(c: Ctx): boolean {
@@ -166,7 +193,7 @@ api.use("*", async (c, next) => {
   // origin checks. Every attempt is checked against the failure limit before
   // its result is revealed, and only wrong tokens count.
   const authorization = c.req.header("Authorization");
-  if (authorization !== undefined) {
+  if (isBearerAttempt(authorization)) {
     const valid = await isAuthorized(authorization, token);
     const limit = await rateLimit(c.env.RATE_LIMITER, RULES.bearer, clientIp(c), !valid);
     if (!limit.allowed) {
@@ -191,7 +218,7 @@ api.get("/me", (c) => c.json({ ok: true }));
 // GET /api/uploads — every finished upload, newest first
 api.get("/uploads", async (c) => {
   const origin = new URL(c.req.url).origin;
-  const result = (await c.get("uploads").listAll())
+  const result = (await c.get("uploads").listAll()).uploads
     // Finished uploads only; their summaries carry no pending_upload_id.
     .flatMap(({ id, meta }) =>
       meta && !meta.pending_upload_id
@@ -223,8 +250,16 @@ api.post("/uploads", async (c) => {
   if (size !== undefined && !isSize(size)) {
     return c.json({ error: "Invalid size" }, 400);
   }
-  if (typeof expiresIn !== "number" || !Number.isFinite(expiresIn) || expiresIn <= 0) {
-    return c.json({ error: "Invalid expires_in (seconds)" }, 400);
+  if (
+    typeof expiresIn !== "number" ||
+    !Number.isSafeInteger(expiresIn) ||
+    expiresIn < 1 ||
+    expiresIn > MAX_EXPIRES_IN
+  ) {
+    return c.json(
+      { error: `Invalid expires_in: whole seconds from 1 to ${MAX_EXPIRES_IN} (365 days)` },
+      400,
+    );
   }
   if (password !== undefined && (typeof password !== "string" || password.length === 0)) {
     return c.json({ error: "Invalid password" }, 400);
@@ -262,8 +297,10 @@ function expectedPartLength(size: number, partNumber: number): number | null {
 // PUT /api/uploads/:id/parts/:number — one part of the file as the raw body
 api.put("/uploads/:id/parts/:number", async (c) => {
   const { id } = c.req.param();
-  const partNumber = Number(c.req.param("number"));
-  if (!isValidId(id) || !Number.isInteger(partNumber) || partNumber < 1 || partNumber > 10_000) {
+  // Plain decimal digits only: no "1.0", "0x1" or "01" for part 1.
+  const rawPart = c.req.param("number");
+  const partNumber = /^[1-9]\d{0,4}$/.test(rawPart) ? Number(rawPart) : NaN;
+  if (!isValidId(id) || !(partNumber <= 10_000)) {
     return c.json({ error: "Invalid upload or part number" }, 400);
   }
 
@@ -485,38 +522,12 @@ app.get("/health", (c) => c.json({ status: "ok" }));
 
 app.get("/", (c) => c.html(landingPage()));
 
-/**
- * A single byte range: `bytes=<start>-[<end>]`, or `bytes=-<suffix>` (the last
- * `suffix` bytes).
- */
-type ByteRange = { start: number; end?: number } | { suffix: number };
-
-/**
- * The byte range of a Range header, or null to ignore the header and serve
- * the whole file (200). RFC 9110 §14.2 lets a server ignore a Range header it
- * finds invalid (bad syntax, a last position before the first) or does not
- * support (several ranges, another unit).
- */
-function parseRange(header: string | undefined): ByteRange | null {
-  const match = header?.match(/^bytes=[ \t]*(\d*)-(\d*)[ \t]*$/i);
-  if (!match) return null;
-  const [, first = "", last = ""] = match;
-  if (first === "") return last === "" ? null : { suffix: Number(last) };
-  const start = Number(first);
-  if (last === "") return { start };
-  const end = Number(last);
-  return end >= start ? { start, end } : null;
-}
-
-function formatRange(range: ByteRange): string {
-  return "suffix" in range ? `bytes=-${range.suffix}` : `bytes=${range.start}-${range.end ?? ""}`;
-}
-
 // GET /_dl/:id — the file itself, behind a short-lived signed link that the
 // password check hands out. Registered before /:id/:filename? so it wins.
 app.get("/_dl/:id", async (c) => {
   const { id } = c.req.param();
-  const expires = Number(c.req.query("expires"));
+  // Spelled exactly as signed (plain digits), or the link is invalid.
+  const expires = parseExpiry(c.req.query("expires")) ?? NaN;
   const signature = c.req.query("sig") ?? "";
   const token = c.env.UPLOAD_TOKEN ?? "";
   if (!isValidId(id) || !(await verifyDownload(token, id, expires, signature))) {
@@ -676,12 +687,15 @@ app.post("/:id/download", async (c) => {
           status,
         );
 
-      // Checked before hashing, so a client over the limit costs no PBKDF2.
+      // The attempt is counted as a failure before hashing, in the same step
+      // as the check, so a parallel burst gets no more than the limit through
+      // and a client over the limit costs no PBKDF2. A correct password
+      // refunds it below.
       const rateKey = `${clientIp(c)}:${id}`;
-      const before = await rateLimit(c.env.RATE_LIMITER, RULES.downloadPassword, rateKey, false);
-      if (!before.allowed) {
-        setRetryAfter(c, before);
-        return page(429, tooManyAttempts(before.retryAfter));
+      const reservation = await reserveAttempt(c.env.RATE_LIMITER, RULES.downloadPassword, rateKey);
+      if (!reservation.allowed) {
+        setRetryAfter(c, reservation);
+        return page(429, tooManyAttempts(reservation.retryAfter));
       }
 
       const body = await c.req.parseBody();
@@ -689,13 +703,9 @@ app.post("/:id/download", async (c) => {
       if (!(await verifyPassword(password, meta.password_hash))) {
         const S = sentryFor(c.env);
         S?.logger.warn(S.logger.fmt`Incorrect password attempt for file: ${id} (${meta.filename})`);
-        const after = await rateLimit(c.env.RATE_LIMITER, RULES.downloadPassword, rateKey, true);
-        if (!after.allowed) {
-          setRetryAfter(c, after);
-          return page(429, tooManyAttempts(after.retryAfter));
-        }
         return page(401, "Incorrect password. Please try again.");
       }
+      await refundAttempt(c.env.RATE_LIMITER, RULES.downloadPassword, rateKey, reservation);
 
       const maxAge = Math.min(DOWNLOAD_PASS_MAX_AGE, fileExpires - nowSeconds());
       if (maxAge > 0) {
@@ -734,25 +744,57 @@ app.onError((err, c) => {
 // Daily cleanup of expired and abandoned uploads
 // ---------------------------------------------------------------------------
 
+/**
+ * Subrequests the cleanup may make: the free plan allows 50 per invocation,
+ * minus a margin.
+ */
+const CLEANUP_SUBREQUESTS = 45;
+
 async function runCleanup(env: Env): Promise<void> {
   const uploads = new Uploads(env.BUCKET, env.UPLOADS_PREFIX || "uploads");
-  const stale = (await uploads.listAll()).filter(({ meta, stray }) => {
+  const listing = await uploads.listAll();
+  let subrequests = listing.subrequests;
+  const isStale = ({ meta, stray }: ListedUpload): boolean => {
     if (stray) return true; // download records without an upload
     if (!meta) return false; // unreadable sidecar: leave it for a human
     const abandoned =
       !!meta.pending_upload_id &&
       Date.now() - new Date(meta.uploaded_at).getTime() > ABANDONED_AFTER_MS;
     return isExpired(meta) || abandoned;
-  });
+  };
+  const stale = listing.uploads.filter(isStale);
 
   for (const { id, meta } of stale) {
-    if (meta?.pending_upload_id)
+    if (meta?.pending_upload_id) {
       await uploads.abortPending(id, meta.filename, meta.pending_upload_id);
+      subrequests++;
+    }
   }
-  await uploads.deleteKeys(stale.flatMap(({ keys }) => keys));
+  const staleKeys = stale.flatMap(({ keys }) => keys);
+  await uploads.deleteKeys(staleKeys);
+  subrequests += Math.ceil(staleKeys.length / 1000);
 
   if (stale.length > 0)
     console.log(`[cleanup] Deleted ${stale.length} expired or abandoned upload(s)`);
+
+  // Fold the download records of the remaining uploads into their sidecars,
+  // most records first, as far as the subrequest budget goes (a get, a put
+  // and a delete per 1000 records each); the rest wait for the next run.
+  const toFold = listing.uploads
+    .filter((upload) => !isStale(upload) && upload.meta && upload.records.keys.length > 0)
+    .sort((a, b) => b.records.keys.length - a.records.keys.length);
+  let folded = 0;
+  for (const { id, records } of toFold) {
+    const cost = 2 + Math.ceil(records.keys.length / 1000);
+    if (subrequests + cost > CLEANUP_SUBREQUESTS) break;
+    subrequests += cost;
+    try {
+      if (await uploads.foldDownloads(id, records)) folded++;
+    } catch (err) {
+      console.error(`[cleanup] Could not fold the download records of ${id}:`, err);
+    }
+  }
+  if (folded > 0) console.log(`[cleanup] Folded the download records of ${folded} upload(s)`);
 }
 
 export default withOptionalSentry<Env, Request, ScheduledController, ExecutionContext, Response>(

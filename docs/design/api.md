@@ -66,6 +66,11 @@ stays the same as today; the CLI and the tests depend on it.
     `http://localhost` so local development and tests work in WebKit.
 - **Valid when:** the signature verifies (constant time) and the expiry is in
   the future.
+- **Revoking:** the cookie is self-contained; the server keeps no list of
+  sessions. A copied cookie (from another device, a backup or malware) works
+  for up to 90 days from its login, and logging out only clears it in the
+  browser that logs out. Only changing `UPLOAD_TOKEN` revokes sessions, and
+  then all of them (with every download pass and open download link).
 
 ### Routes
 
@@ -113,7 +118,8 @@ stays the same as today; the CLI and the tests depend on it.
     p90 to about 10 ms. To be confirmed by the next measurement.
   - **Trade-off:** a stolen bucket's hashes are 2.5× cheaper to brute-force.
     Online guessing stays capped at 5 wrong passwords per minute per IP per
-    upload.
+    upload, parallel requests included: each attempt is counted before its
+    password is hashed (see "Check before reveal" below).
   - **Old links:** hashes with any other iteration count still verify.
 - **Download pass:** after a correct password, the response also sets
   `yeet_dl_<id>`:
@@ -134,6 +140,14 @@ stays the same as today; the CLI and the tests depend on it.
 - **`POST /api/uploads`** `{ filename, size?, expires_in, password? }` →
   `201 { id, part_size }`.
   - `size` is optional. If given, it must be a safe non-negative integer.
+  - `expires_in` must be whole seconds from 1 to 31,536,000 (365 days).
+    Anything else (0, negative, a fraction, a string, more than a year such
+    as `1e308`) is `400 {"error": "Invalid expires_in: whole seconds from 1 to 31536000 (365 days)"}`,
+    checked before anything is created in the bucket. Before, a huge value
+    passed the check and failed with a 500 after `createMultipartUpload`,
+    leaving a multipart upload no sidecar pointed to, which the cleanup never
+    saw. The CLI refuses `--expires` (and `YEET_DEFAULT_EXPIRES`) above
+    `365d` itself; the upload page always asks for 30 days.
   - `part_size` stays 52,428,800 (50 MiB).
 - **`PUT /api/uploads/:id/parts/:n`**
   - **Required:** a `Content-Length` header (`411` without it).
@@ -199,6 +213,16 @@ Evaluated on the Free plan:
 - **Keys:** `login:<ip>`, `dlpw:<ip>:<id>`, `bearer:<ip>`, with
   `ip = CF-Connecting-IP` (`unknown` if absent). Each key gets its own object,
   created near the client that first used it.
+  - **IPv6 by /64** (`rateLimitClient()` in `parse.ts`): an IPv6 address
+    counts by its first 64 bits (`2001:db8:1:2::/64`), since one client
+    usually has a whole /64 and could otherwise use a new address, and a new
+    budget, for every attempt. IPv4 addresses (also IPv4-mapped ones) count
+    as they are; anything unparsable is used as is.
+  - **Known limits:** keys are per client address, so a client with many
+    addresses (several /64s, a botnet) gets a budget per address, and
+    clients behind one address (a carrier-grade NAT, an office) share one: a
+    guesser there can make the others wait out a minute. The 16-character
+    token minimum is the protection that does not depend on addresses.
 - **Window:** a sliding log of the failure times in the last 60 s, at most
   `limit` entries. An attempt is refused when `limit` failures are in the
   window. `Retry-After` is the time until the oldest one leaves it (rounded up,
@@ -207,22 +231,39 @@ Evaluated on the Free plan:
   per minute. An alarm deletes the object's data once its window has passed.
 - **Check before reveal:** the Worker evaluates the cheap checks (token
   compare) first and then makes one call, `hit(failed)`. It refuses (429) if
-  over the limit, whatever the result, and only counts failures. For download
-  passwords the check comes before PBKDF2 (`hit(false)`), and a wrong password
-  is counted afterwards (`hit(true)`), so a client over the limit costs no
-  hashing.
+  over the limit, whatever the result, and only counts failures.
+- **Download passwords: reserve, then refund.** PBKDF2 takes milliseconds, so
+  the check cannot wait for the result. At first the Worker checked
+  (`hit(false)`), hashed, and only then counted a failure (`hit(true)`): a
+  burst of parallel guesses all passed the check before the first failure was
+  counted, so every one was hashed and a right one among them got its 303.
+  Now one call, `reserve()`, checks and counts the attempt as a failure in a
+  single step (the object handles one call at a time and that call never
+  awaits). A wrong password needs no second call; a correct one gives its
+  entry back with `refund()` before the redirect. So:
+  - of a burst, at most 5 attempts per minute get as far as hashing; the rest
+    get 429 without any hashing, a correct password among them included (no
+    oracle: the same 429 as a wrong one);
+  - successes cost no budget once they have finished. While a correct
+    password is being hashed it holds a slot, and after its refund one more
+    wrong password may be checked within the minute: still at most 5 wrong
+    ones;
+  - if the refund call fails, the success stays counted as a failure for the
+    rest of the minute (logged; fails safe).
 - **Cost per request:**
   - **One Durable Object call:** every `/api/*` request with an
     `Authorization` header (the CLI, correct token included, see above) and
     every `POST /login`.
   - **One or two calls:** a `POST /:id/download` for a protected file without
-    a valid download pass.
+    a valid download pass: one for a wrong password or a refusal, two for a
+    correct password (`reserve` + `refund`).
   - **No calls:** session-cookie API requests (the browser upload page), page
     views, unprotected downloads.
 
   The Worker's own CPU for a call is an RPC round trip with tiny arguments; the
   object's CPU and storage are billed to the Durable Object. Failures write one
-  row each.
+  row each; a correct download password writes two (the reservation and its
+  refund).
 
 - **Fails open:** if the object cannot be reached (e.g. the daily Durable Object
   quota is used up), the attempt is allowed and an error is logged. The limit
@@ -236,11 +277,17 @@ Evaluated on the Free plan:
 ### What counts as a failure
 
 - **Bearer:** only requests that carry an `Authorization` header with a wrong
-  value. Requests without any credentials, or with an invalid session cookie,
-  are not guesses at the token (a session signature cannot be guessed) and
-  are not counted.
-- **Both credentials:** if an `Authorization` header is present, it alone
-  decides. A wrong one gets 401 even with a valid session cookie.
+  value, an empty value included (`isBearerAttempt()`). Requests without any
+  credentials, or with an invalid session cookie, are not guesses at the
+  token (a session signature cannot be guessed) and are not counted.
+- **Both credentials:** if an `Authorization` header is present, even empty,
+  it alone decides. A wrong or empty one gets 401 (and counts) even with a
+  valid session cookie.
+  - `wrangler dev` removes an empty `Authorization` header before the Worker
+    sees it (an empty header of another name arrives), so locally such a
+    request falls back to the session cookie. Whether Cloudflare's edge
+    passes it on is not verified; if it does, the rule above applies. The
+    decision is unit-tested in `e2e/tests/node/parsing.spec.ts`.
 - **Login:** an empty or wrong token counts.
 - **Cross-origin refusals** (403) happen before any check and do not count.
 
@@ -261,6 +308,13 @@ Evaluated on the Free plan:
   `Cache-Control: no-store`. A wrong token is never echoed back in the page.
 - **Cross-origin `/login` or `/logout`:** `403` with an HTML error page
   "Cross-origin request refused".
+- **No framing:** every Worker response (so `/upload`, `/login`, the
+  download pages and their error pages) carries
+  `Content-Security-Policy: frame-ancestors 'none'` and, for browsers without
+  CSP Level 2, `X-Frame-Options: DENY`, so another site cannot frame the
+  login, upload or download forms (clickjacking). Static assets (`public/`)
+  are served before the Worker and do not get them; they are scripts and
+  images, not pages.
 
 ### Missing or short token
 
@@ -270,6 +324,20 @@ Evaluated on the Free plan:
 - **`/_dl/:id`:** refuses protected files (500) with a weak token. With a
   missing or short token anyone could sign download links.
 - **Unprotected files:** keep working, including their download links.
+
+### Strict parsing
+
+Numbers that are signed or used as keys must be spelled one way only:
+
+- **Expiry fields** of the session cookie, the download pass and the
+  `expires` of a signed `/_dl` link: a positive decimal integer of at most 12
+  digits without leading zeros (`^[1-9]\d{0,11}$`). The signatures cover the
+  number, so before, `0<expires>`, `<expires>.0` or a hex spelling (for the
+  link) of a genuine value passed as the same one. Anything else is an
+  invalid cookie (no session, no pass) or a 403 link.
+- **Part numbers** in `PUT /api/uploads/:id/parts/:n`: `^[1-9]\d*$` and at
+  most 10,000. `1.0`, `0x1`, `01`, `+1`, `1e0` are
+  `400 {"error": "Invalid upload or part number"}` instead of part 1.
 
 ### Upload API
 
@@ -336,10 +404,8 @@ How the rest follows:
   `download_count` = the sidecar's count + the records, `recent_downloads` =
   the last five of both (keys list in time order). No extra subrequests per
   upload. The cost: each download is one more object in the listing, so 1000
-  downloads cost one more list call. Within the 50-subrequest budget this
-  allows roughly 49,000 objects (uploads × 2 plus downloads) before
-  `GET /api/uploads` or the cleanup would run out; ample for a personal
-  share service, and deleting or expiring an upload removes its records.
+  downloads cost one more list call. Records therefore must not pile up; see
+  "Keeping the records bounded" below.
 - **Delete and cleanup:** both already delete every object under
   `<prefix>/<id>/`, records included. Records without an upload (a download
   that raced a delete or expiry) are listed as `stray`: `listAll()` reads no
@@ -349,6 +415,51 @@ How the rest follows:
   records add to it; the cap of 50 no longer applies to new downloads. A file
   named `.downloads` is a different key (`<id>/.downloads`, no slash) and is
   not mistaken for a record.
+
+#### Keeping the records bounded
+
+Unprotected downloads need no credentials, so a script can download one link
+tens of thousands of times. Unbounded, ~49,000 records push `GET /api/uploads`
+and the cron past the 50-subrequest budget (and their CPU), and the cleanup
+stops for every upload. Three measures, together:
+
+1. **The cron folds the records into the sidecar** (`foldDownloads()`). For
+   each upload with records it reads the sidecar, adds them to the sidecar's
+   own `download_count` and `recent_downloads` (new fields, which replace a
+   legacy `downloads` array: its count and last five times are carried over
+   and the array dropped), writes the sidecar with its summary custom metadata
+   (`summarize()` reads the new fields, so the summary stays consistent), and
+   then deletes the records it counted. The sidecar write is conditional on
+   the etag read (`onlyIf: { etagMatches }`), so a sidecar deleted or changed
+   meanwhile is never written back. A download recorded during the fold has a
+   key the fold did not list; it stays for the next one. Cost per upload: a
+   get, a put and a delete per 1000 records. The cron spends at most 45
+   subrequests in all (list calls, aborts and deletes of stale uploads
+   first), folding the uploads with the most records first; the rest wait a
+   day. So the bucket holds about one day of records.
+   - If deleting the records fails after the sidecar was written, they are
+     counted again at the next fold (logged). The alternative order, deleting
+     first, would lose them instead.
+2. **At most 1,000 records per upload between two folds** (`RECORD_CAP`).
+   `recordDownload()` first lists the upload's records (one call, at most
+   1,000 keys) and writes nothing if there are 1,000. Normal use is counted
+   exactly; past 1,000 downloads of one upload in a day, the count stops
+   growing until the next fold (an undercount, never an overcount). That is a
+   second subrequest per download (in `waitUntil`, after the response) and a
+   class A operation, like the `put`.
+3. **The listing counts at most 2,000 records per upload**
+   (`LISTED_RECORDS_LIMIT`, two days' worth). Past it, `listAll()` jumps over
+   the rest of that upload's records with `startAfter`, so it never pages
+   through more than that per upload, whatever is in the bucket (e.g. records
+   written before this version). The count shown is then too low until the
+   folds catch up: each cron run folds (or, for an expired upload, deletes)
+   the records it counted, and the rest the next day; stray records left of
+   a deleted upload go the same way. `DELETE /api/uploads/:id` still deletes
+   them all (with the records bounded, a few list and delete calls).
+
+Not chosen: rate-limiting the recording per IP and upload. It would need a
+Durable Object call per download, against the daily quota the login and
+password limits rely on; the cap bounds the objects without it.
 
 ### Range requests on `/_dl/:id`
 
@@ -366,6 +477,13 @@ a normalized header. Following RFC 9110 §14:
 - **Unsatisfiable (416, `Content-Range: bytes */<size>`):** a first position
   at or past the end (`bytes=5-` on a 5-byte file, any first position on an
   empty file), or `bytes=-0`.
+- **Huge numbers:** any number of digits is valid. Positions above
+  `Number.MAX_SAFE_INTEGER` (8 PiB, past the end of any object) are clamped
+  to it, so the range R2 gets is always plain decimal integers
+  (`bytes=0-99999999999999999999999` reaches R2 as `bytes=0-9007199254740991`,
+  never `bytes=0-1e+23`, which R2 ignored and answered with the whole file
+  under a `Content-Range` for part of it). Parsing and formatting live in
+  `packages/worker/src/range.ts`.
 
 ### Sentry
 

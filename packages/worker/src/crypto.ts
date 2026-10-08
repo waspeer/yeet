@@ -3,6 +3,8 @@
 // passes. Everything here uses WebCrypto, which is native to Workers and cheap
 // on CPU time.
 
+import { parseExpiry } from "./parse.js";
+
 const encoder = new TextEncoder();
 
 function toBase64Url(bytes: ArrayBuffer | Uint8Array): string {
@@ -132,11 +134,6 @@ async function sign(token: string, label: KeyLabel, message: string): Promise<st
 /** Seconds since the epoch, as an integer. */
 export function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
-}
-
-/** A decimal integer of at most 12 digits, as used for expiry timestamps. */
-function parseExpiry(value: string | undefined): number | null {
-  return value && /^\d{1,12}$/.test(value) ? Number(value) : null;
 }
 
 // ---------------------------------------------------------------------------
