@@ -413,10 +413,19 @@ interface ListedUpload {
 
 async function listFiles(showDownloads: boolean): Promise<void> {
   const config = loadConfig();
-  const { uploads } = await api<{ uploads: ListedUpload[] }>(config, "GET", "/uploads");
+  const { uploads, truncated } = await api<{ uploads: ListedUpload[]; truncated?: boolean }>(
+    config,
+    "GET",
+    "/uploads",
+  );
+  // The server lists at most a fixed number of R2 pages per request.
+  const truncatedNote =
+    "Note: the bucket holds more than the server can list in one request; " +
+    "only part of your uploads is shown.";
 
   if (uploads.length === 0) {
     process.stdout.write("No files found.\n");
+    if (truncated) process.stdout.write(yellow(truncatedNote) + "\n");
     return;
   }
 
@@ -457,6 +466,7 @@ async function listFiles(showDownloads: boolean): Promise<void> {
   process.stdout.write(
     dim(`${uploads.length} files (${active} active, ${expired} expired)`) + "\n",
   );
+  if (truncated) process.stdout.write(yellow(truncatedNote) + "\n");
 }
 
 async function deleteUploads(ids: string[]): Promise<void> {

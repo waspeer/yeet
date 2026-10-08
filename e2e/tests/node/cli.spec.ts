@@ -1,5 +1,7 @@
 import { existsSync } from "node:fs";
 import { readFile, rm, stat } from "node:fs/promises";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import {
   api,
   cli,
@@ -139,6 +141,45 @@ test.describe("yeet upload, list and delete", () => {
     expect((await fetch(url)).status).toBe(404);
     const after = await cli(["list"], { auth: true });
     expect(after.stdout).not.toContain(url);
+  });
+
+  // A bucket too large to list within the server's R2 call budget gives
+  // `truncated: true`. The test server's bucket never gets that large, so a
+  // stand-in server answers instead.
+  test("yeet list says so when the server could list only part of the bucket", async () => {
+    const upload = {
+      id: "abc123",
+      filename: "one.bin",
+      file_size: 10,
+      uploaded_at: new Date().toISOString(),
+      expires_at: new Date(Date.now() + 86_400_000).toISOString(),
+      has_password: false,
+      download_count: 0,
+      recent_downloads: [],
+      url: "http://127.0.0.1/abc123/one.bin",
+    };
+    const note = "only part of your uploads is shown";
+    for (const [body, shown] of [
+      [{ uploads: [upload], truncated: true }, true],
+      [{ uploads: [], truncated: true }, true],
+      [{ uploads: [upload] }, false],
+    ] as const) {
+      const fake = createServer((_req, res) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(body));
+      });
+      await new Promise<void>((resolve) => fake.listen(0, "127.0.0.1", resolve));
+      try {
+        const { port } = fake.address() as AddressInfo;
+        const list = await cli(["list"], {
+          env: { YEET_URL: `http://127.0.0.1:${port}`, YEET_TOKEN: "a-token-of-16-chars-or-more" },
+        });
+        expectExitCode(list, 0);
+        expect(list.stdout.includes(note), describeRun(list)).toBe(shown);
+      } finally {
+        await new Promise((resolve) => fake.close(resolve));
+      }
+    }
   });
 
   test(
