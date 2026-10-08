@@ -497,10 +497,23 @@ export class Uploads {
     return this.writeMeta(id, await object.json<UploadMeta>(), { etagMatches: object.etag });
   }
 
+  /** Whether `key` is the sidecar of an upload, `<prefix>/<id>/.meta.json`. */
+  isSidecarKey(key: string): boolean {
+    const [id, name, ...rest] = key.slice(this.prefix.length + 1).split("/");
+    return key.startsWith(`${this.prefix}/`) && !!id && name === ".meta.json" && rest.length === 0;
+  }
+
   /**
-   * Delete every object under `prefix` (a directory of an upload) in at most
-   * `maxCalls` R2 calls: a list (up to 1,000 keys without metadata) and a
-   * delete per round. Returns the calls made and whether nothing is left.
+   * Delete every object under `prefix` (an upload's directory, or a
+   * directory in it) in at most `maxCalls` R2 calls: a list (up to 1,000
+   * keys without metadata) and a delete per round, and the upload's sidecar
+   * in a call of its own once everything else is gone. Returns the calls
+   * made and whether nothing is left.
+   *
+   * The sidecar goes last because it is what makes the listing (and so the
+   * cron) see an upload: if the calls run out half-way, what is left is
+   * still an upload that the next run finds and deletes, not keys without a
+   * sidecar that nothing would ever clean up.
    */
   async deleteUnder(prefix: string, maxCalls: number): Promise<{ calls: number; done: boolean }> {
     if (!prefix.startsWith(`${this.prefix}/`) || !prefix.endsWith("/")) {
@@ -510,18 +523,42 @@ export class Uploads {
     while (calls + 2 <= maxCalls) {
       const page = await this.bucket.list({ prefix });
       calls++;
-      if (page.objects.length === 0) return { calls, done: true };
-      await this.bucket.delete(page.objects.map((object) => object.key));
+      const keys = page.objects.map((object) => object.key);
+      const others = keys.filter((key) => !this.isSidecarKey(key));
+      const sidecars = keys.filter((key) => this.isSidecarKey(key));
+      if (others.length > 0) {
+        await this.bucket.delete(others);
+        calls++;
+      }
+      // More to list (each round lists from the start, minus what is gone).
+      if (page.truncated) continue;
+      // Everything else is gone: only the sidecar may be left.
+      if (sidecars.length === 0) return { calls, done: true };
+      if (calls + 1 > maxCalls) break;
+      await this.bucket.delete(sidecars);
       calls++;
-      if (!page.truncated) return { calls, done: true };
+      return { calls, done: true };
     }
     return { calls, done: false };
   }
 
-  /** Delete objects by key, in batches of the 1000 R2 accepts per call. */
+  /** R2 calls deleteKeys() makes for these keys. */
+  deleteCalls(keys: string[]): number {
+    const sidecars = keys.filter((key) => this.isSidecarKey(key)).length;
+    return Math.ceil((keys.length - sidecars) / 1000) + Math.ceil(sidecars / 1000);
+  }
+
+  /**
+   * Delete objects by key, in batches of the 1000 R2 accepts per call, the
+   * sidecars after every other key (see deleteUnder()).
+   */
   async deleteKeys(keys: string[]): Promise<void> {
-    for (let i = 0; i < keys.length; i += 1000) {
-      await this.bucket.delete(keys.slice(i, i + 1000));
+    const others = keys.filter((key) => !this.isSidecarKey(key));
+    const sidecars = keys.filter((key) => this.isSidecarKey(key));
+    for (const batch of [others, sidecars]) {
+      for (let i = 0; i < batch.length; i += 1000) {
+        await this.bucket.delete(batch.slice(i, i + 1000));
+      }
     }
   }
 

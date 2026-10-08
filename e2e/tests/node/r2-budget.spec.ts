@@ -331,8 +331,9 @@ test.describe("R2 calls of the cron", () => {
     bucket.seed(`${PREFIX}/.cleanup-cursor`, "not JSON"); // unreadable: start at the beginning
     const report = await runCleanup(bucket, PREFIX, NOW);
     expect(report).toMatchObject({ deleted: 1, recordsCleared: 1, cursor: null });
-    // Cursor read, one list page, one batch delete, list + delete of the records.
-    expect(report.subrequests).toBe(5);
+    // Cursor read, one list page, a batch delete of the files and one of the
+    // sidecars, list + delete of the records.
+    expect(report.subrequests).toBe(6);
     expect(bucket.keys()).toEqual([
       `${PREFIX}/.cleanup-cursor`,
       `${PREFIX}/${idOf(1)}/.meta.json`,
@@ -340,6 +341,44 @@ test.describe("R2 calls of the cron", () => {
       `${PREFIX}/${idOf(2)}/.meta.json`,
       `${PREFIX}/${idOf(2)}/file.bin`,
     ]);
+  });
+});
+
+test.describe("deleting an upload in several calls", () => {
+  // The sidecar is what makes the listing and the cron recognize an upload:
+  // a directory left without it is never cleaned up. So whatever stops a
+  // deletion half-way, the sidecar is deleted last.
+  const dirOf = (id: string) => `${PREFIX}/${id}/`;
+  const orphaned = (bucket: FakeBucket, id: string) => {
+    const left = bucket.keys(dirOf(id));
+    return left.length > 0 && !left.includes(`${dirOf(id)}.meta.json`);
+  };
+
+  test("the cron's deleteUnder() out of budget: the sidecar stays", async () => {
+    for (const kind of ["records", "parts"] as const) {
+      for (let maxCalls = 2; maxCalls <= 6; maxCalls++) {
+        const bucket = new FakeBucket();
+        // 1,999 records sort before .meta.json, 1,500 parts after it.
+        seedUpload(
+          bucket,
+          idOf(0),
+          kind === "records" ? { records: 1999 } : { pendingSince: NOW, parts: 1500 },
+        );
+        const result = await new Uploads(bucket, PREFIX).deleteUnder(dirOf(idOf(0)), maxCalls);
+        expect(result.calls).toBeLessThanOrEqual(maxCalls);
+        expect(orphaned(bucket, idOf(0)), `${kind}, ${maxCalls} calls`).toBe(false);
+        expect(result.done).toBe(bucket.keys(dirOf(idOf(0))).length === 0);
+      }
+    }
+  });
+
+  test("DELETE /api/uploads/:id failing half-way: the sidecar stays", async () => {
+    for (let maxCalls = 3; maxCalls <= 6; maxCalls++) {
+      const bucket = new FakeBucket({ maxCalls });
+      const meta = seedUpload(bucket, idOf(0), { records: 1999 });
+      await new Uploads(bucket, PREFIX).delete(idOf(0), meta).catch(() => {});
+      expect(orphaned(bucket, idOf(0)), `${maxCalls} calls`).toBe(false);
+    }
   });
 });
 

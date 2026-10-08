@@ -63,12 +63,14 @@ export async function runCleanup(
   const budget = CLEANUP_BUDGET - calls - 1;
 
   let spent = 0;
-  let pending: string[] = []; // keys of finished work, deleted in batches of 1000
-  const batches = (n: number) => Math.ceil(n / 1000);
+  // Keys of finished work, deleted in batches of 1000 with the sidecars last.
+  let pending: string[] = [];
+  const flushCost = (keys: string[] = pending) => uploads.deleteCalls(keys);
   const flush = async () => {
-    await uploads.deleteKeys(pending);
-    spent += batches(pending.length);
+    const keys = pending;
     pending = [];
+    spent += flushCost(keys);
+    await uploads.deleteKeys(keys);
   };
 
   let deleted = 0;
@@ -80,7 +82,7 @@ export async function runCleanup(
     const stale = isStale(upload, now);
     if (!stale && upload.unsummarized) {
       // A get and a conditional put; the listings after it save a read.
-      if (spent + batches(pending.length) + 2 > budget) {
+      if (spent + flushCost() + 2 > budget) {
         stopped = true;
         break;
       }
@@ -95,9 +97,8 @@ export async function runCleanup(
     const dir = `${prefix.replace(/^\/+|\/+$/g, "")}/${upload.id}/`;
 
     if (stale && upload.complete) {
-      // Every key is known: delete them with the others in one batch.
-      const extra = batches(pending.length + upload.keys.length) - batches(pending.length);
-      if (spent + batches(pending.length) + abort + extra > budget) {
+      // Every key is known: delete them in batches with the others.
+      if (spent + flushCost([...pending, ...upload.keys]) + abort > budget) {
         stopped = true;
         break;
       }
@@ -117,7 +118,7 @@ export async function runCleanup(
 
     // Keys the listing jumped over, or legacy records of a current upload:
     // list and delete them (the whole upload if stale, else its records).
-    if (spent + batches(pending.length) + abort + 2 > budget) {
+    if (spent + flushCost() + abort + 2 > budget) {
       stopped = true;
       break;
     }
