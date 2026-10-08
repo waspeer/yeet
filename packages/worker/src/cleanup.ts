@@ -78,13 +78,18 @@ export async function runCleanup(
   const budget = CLEANUP_BUDGET - calls - 1;
 
   let spent = 0;
-  // Keys of finished work, deleted in batches of 1000 with the sidecars last.
+  // Keys of finished work, deleted in batches of 1000 with the sidecars
+  // last, in batches of their own (see deleteKeys()).
   let pending: string[] = [];
-  const flushCost = (keys: string[] = pending) => uploads.deleteCalls(keys);
+  let pendingSidecars = 0;
+  const deleteCalls = (keys: number, sidecars: number) =>
+    Math.ceil((keys - sidecars) / 1000) + Math.ceil(sidecars / 1000);
+  const flushCost = () => deleteCalls(pending.length, pendingSidecars);
   const flush = async () => {
     const keys = pending;
+    spent += flushCost();
     pending = [];
-    spent += flushCost(keys);
+    pendingSidecars = 0;
     await uploads.deleteKeys(keys);
   };
 
@@ -124,7 +129,9 @@ export async function runCleanup(
 
     if (stale && upload.complete) {
       // Every key is known: delete them in batches with the others.
-      if (spent + flushCost([...pending, ...upload.keys]) + abort > budget) {
+      const sidecars = upload.keys.filter((key) => uploads.isSidecarKey(key)).length;
+      const cost = deleteCalls(pending.length + upload.keys.length, pendingSidecars + sidecars);
+      if (spent + cost + abort > budget) {
         stopped = true;
         break;
       }
@@ -137,6 +144,7 @@ export async function runCleanup(
         spent++;
       }
       pending.push(...upload.keys);
+      pendingSidecars += sidecars;
       deleted++;
       lastDone = upload.id;
       continue;

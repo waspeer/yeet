@@ -557,12 +557,6 @@ export class Uploads {
     return { calls, done: false };
   }
 
-  /** R2 calls deleteKeys() makes for these keys. */
-  deleteCalls(keys: string[]): number {
-    const sidecars = keys.filter((key) => this.isSidecarKey(key)).length;
-    return Math.ceil((keys.length - sidecars) / 1000) + Math.ceil(sidecars / 1000);
-  }
-
   /**
    * Delete objects by key, in batches of the 1000 R2 accepts per call, the
    * sidecars after every other key (see deleteUnder()).
