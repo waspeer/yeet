@@ -219,6 +219,25 @@ test.describe("yeet upload --expires", () => {
     });
   }
 
+  for (const value of ["366d", "8761h", "525601m"]) {
+    test(`--expires ${value} (over a year) exits 1 before uploading`, async ({ tmp }) => {
+      const file = await fileWith(tmp, "never.txt", "never uploaded\n");
+      const result = await cli(["upload", file.path, "--expires", value], { auth: true });
+
+      expectExitCode(result, 1);
+      expect(result.stderr, describeRun(result)).toContain(
+        `Invalid --expires: "${value}". The longest lifetime is 365 days`,
+      );
+      expect(result.stdout).toBe("");
+    });
+  }
+
+  test("--expires 365d is the longest lifetime", async ({ tmp }) => {
+    const file = await fileWith(tmp, "year.txt", "a year\n");
+    const { id } = await cliUpload(file.path, ["--expires", "365d"]);
+    expect(await storedLifetimeSeconds(id)).toBeCloseTo(365 * 86400, -1);
+  });
+
   test("an invalid YEET_DEFAULT_EXPIRES exits 1 with a clear message", async ({ tmp }) => {
     const file = await fileWith(tmp, "never.txt", "never uploaded\n");
     const result = await cli(["upload", file.path], {

@@ -96,7 +96,7 @@ Commands:
   login [url]        Connect to your yeet server (asks for the upload token)
   upload <file...> [--expires <duration>] [--password <string>]
                      Upload files and print one share link per file
-                     --expires   link lifetime, e.g. 7d, 24h, 90m (default 30d)
+                     --expires   link lifetime, e.g. 7d, 24h, 90m (default 30d, at most 365d)
                      --password  require this password to download
   list [--downloads] Show all uploaded files (optionally with download history)
   delete <id|url...> Delete uploads before they expire
@@ -174,6 +174,9 @@ function parseArgs(argv: string[]): Args {
   return { command: "upload", filepaths, expires: expires ?? defaultExpiresDays(), password };
 }
 
+/** The longest link lifetime the server accepts. */
+const MAX_EXPIRES_DAYS = 365;
+
 function parseDuration(s: string, source = "--expires"): number {
   const match = s.match(/^(\d+)(d|h|m)$/i);
   if (!match || Number(match[1]) === 0) {
@@ -181,9 +184,12 @@ function parseDuration(s: string, source = "--expires"): number {
   }
   const [, n, unit] = match as [string, string, string];
   const num = Number(n);
-  if (unit.toLowerCase() === "d") return num;
-  if (unit.toLowerCase() === "h") return num / 24;
-  return num / (24 * 60);
+  const days =
+    unit.toLowerCase() === "d" ? num : unit.toLowerCase() === "h" ? num / 24 : num / (24 * 60);
+  if (days > MAX_EXPIRES_DAYS) {
+    die(`Invalid ${source}: "${s}". The longest lifetime is ${MAX_EXPIRES_DAYS} days (365d)`);
+  }
+  return days;
 }
 
 /** Accept either a bare upload ID or a share link. */

@@ -5,6 +5,7 @@ import {
   downloadBytes,
   eventually,
   expect,
+  listObjects,
   listUploads,
   readUploadMeta,
   server,
@@ -46,6 +47,35 @@ function complete(id: string, body: unknown): Promise<Response> {
 }
 
 test.describe("upload API", () => {
+  test("expires_in must be whole seconds from 1 to 365 days; nothing is created otherwise", async () => {
+    const YEAR = 365 * 24 * 60 * 60;
+    for (const expiresIn of [1e308, YEAR + 1, 1.5, 0, -60, 3600.25, "3600", null, true]) {
+      const filename = `expires-${randomBytes(6).toString("hex")}.bin`;
+      const res = await api("/api/uploads", {
+        method: "POST",
+        body: JSON.stringify({ filename, size: 1, expires_in: expiresIn }),
+        headers: { "Content-Type": "application/json" },
+      });
+      const detail = `expires_in ${JSON.stringify(expiresIn)}`;
+      expect(res.status, detail).toBe(400);
+      expect(await res.json(), detail).toEqual({
+        error: "Invalid expires_in: whole seconds from 1 to 31536000 (365 days)",
+      });
+      const keys = (await listObjects()).map((object) => object.key);
+      expect(
+        keys.filter((key) => key.endsWith(`/${filename}`)),
+        detail,
+      ).toEqual([]);
+    }
+    // The bounds themselves are fine.
+    for (const expiresIn of [1, YEAR]) {
+      const id = await create({ filename: "bounds.bin", size: 1, expires_in: expiresIn });
+      const meta = (await readUploadMeta(id))!;
+      expect(Date.parse(meta.expires_at) - Date.parse(meta.uploaded_at)).toBe(expiresIn * 1000);
+      expect((await api(`/api/uploads/${id}`, { method: "DELETE" })).status).toBe(200);
+    }
+  });
+
   test("size is optional at create; file_size comes from the stored object", async () => {
     const data = randomBytes(12_345);
     const id = await create({ filename: "no-size.bin" });

@@ -135,6 +135,14 @@ stays the same as today; the CLI and the tests depend on it.
 - **`POST /api/uploads`** `{ filename, size?, expires_in, password? }` →
   `201 { id, part_size }`.
   - `size` is optional. If given, it must be a safe non-negative integer.
+  - `expires_in` must be whole seconds from 1 to 31,536,000 (365 days).
+    Anything else (0, negative, a fraction, a string, more than a year such
+    as `1e308`) is `400 {"error": "Invalid expires_in: whole seconds from 1 to 31536000 (365 days)"}`,
+    checked before anything is created in the bucket. Before, a huge value
+    passed the check and failed with a 500 after `createMultipartUpload`,
+    leaving a multipart upload no sidecar pointed to, which the cleanup never
+    saw. The CLI refuses `--expires` (and `YEET_DEFAULT_EXPIRES`) above
+    `365d` itself; the upload page always asks for 30 days.
   - `part_size` stays 52,428,800 (50 MiB).
 - **`PUT /api/uploads/:id/parts/:n`**
   - **Required:** a `Content-Length` header (`411` without it).

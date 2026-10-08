@@ -66,6 +66,9 @@ export interface Env {
  */
 const PART_SIZE = 50 * 1024 * 1024;
 
+/** The longest lifetime of an upload, in seconds: 365 days. */
+const MAX_EXPIRES_IN = 365 * 24 * 60 * 60;
+
 /** Uploads still pending after this long are considered abandoned. */
 const ABANDONED_AFTER_MS = 24 * 60 * 60 * 1000;
 
@@ -238,8 +241,16 @@ api.post("/uploads", async (c) => {
   if (size !== undefined && !isSize(size)) {
     return c.json({ error: "Invalid size" }, 400);
   }
-  if (typeof expiresIn !== "number" || !Number.isFinite(expiresIn) || expiresIn <= 0) {
-    return c.json({ error: "Invalid expires_in (seconds)" }, 400);
+  if (
+    typeof expiresIn !== "number" ||
+    !Number.isSafeInteger(expiresIn) ||
+    expiresIn < 1 ||
+    expiresIn > MAX_EXPIRES_IN
+  ) {
+    return c.json(
+      { error: `Invalid expires_in: whole seconds from 1 to ${MAX_EXPIRES_IN} (365 days)` },
+      400,
+    );
   }
   if (password !== undefined && (typeof password !== "string" || password.length === 0)) {
     return c.json({ error: "Invalid password" }, 400);
