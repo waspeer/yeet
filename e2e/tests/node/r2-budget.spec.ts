@@ -270,7 +270,7 @@ test.describe("R2 calls of the cron", () => {
       expect(report.subrequests, `run ${runs + 1}`).toBeLessThanOrEqual(CLEANUP_BUDGET);
     }
     expect(left()).toEqual({ stale: 0, stray: 0, records: 0, unsummarized: 0 });
-    expect(runs).toBeLessThanOrEqual(12);
+    expect(runs).toBeLessThanOrEqual(13);
     // Nothing current was deleted, and every sidecar now has its summary.
     for (const id of keep) {
       const sidecar = bucket.objects.get(`${PREFIX}/${id}/.meta.json`);
@@ -304,6 +304,29 @@ test.describe("R2 calls of the cron", () => {
     }
     expect(bucket.objects.has(fileKey)).toBe(true);
     expect(bucket.objects.has(`${PREFIX}/${idOf(0)}/.meta.json`)).toBe(true);
+  });
+
+  test("old sidecars: each run gives as many their summary as its budget allows", async () => {
+    const bucket = new FakeBucket();
+    const ids = Array.from({ length: 300 }, (_, i) => idOf(i));
+    for (const id of ids) seedUpload(bucket, id, { legacySidecar: true });
+    // Cursor read and write, one list page, then a read and a conditional
+    // write per sidecar: (45 - 3) / 2 = 21.
+    const perRun = Math.floor((CLEANUP_BUDGET - 3) / 2);
+    let done = 0;
+    for (let run = 0; done < ids.length; run++) {
+      bucket.resetCalls();
+      const report = await runCleanup(bucket, PREFIX, NOW);
+      expect(report.subrequests).toBeLessThanOrEqual(CLEANUP_BUDGET);
+      expect(report.summarized).toBe(Math.min(perRun, ids.length - done));
+      done += report.summarized;
+    }
+    for (const id of ids) {
+      const sidecar = bucket.objects.get(`${PREFIX}/${id}/.meta.json`)!;
+      expect(JSON.parse(sidecar.customMetadata["summary"]!)).toEqual(
+        summarize(JSON.parse(sidecar.body) as UploadMeta),
+      );
+    }
   });
 
   test("junk pages, then sidecars without a summary: the cron gets to all of them", async () => {

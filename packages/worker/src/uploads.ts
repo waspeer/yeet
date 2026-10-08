@@ -344,7 +344,10 @@ export class Uploads {
    * may return fewer than asked). A finished upload is 2 objects (file and
    * sidecar) whose summary comes from the sidecar's custom metadata, so a
    * call covers about 50 uploads. A sidecar of yeet < 0.2 has no summary and
-   * costs one read, counted in the budget.
+   * costs one read, counted in the budget. With `deferReads: n` such
+   * sidecars are left unread (`meta` null, `unsummarized`) for the caller,
+   * which reserves n calls of the budget for each; `maxListCalls` caps the
+   * list calls on top of the budget.
    *
    * `.downloads/` (legacy) and `.parts/` keys can be many per upload. When a
    * page ends inside such a run, the next call starts after it
@@ -356,8 +359,13 @@ export class Uploads {
    * key to continue after (`resumeAfter`), which `after` takes: right before
    * the first upload it leaves out, so a resumed listing skips none.
    */
-  async listAll(opts: { budget?: number; after?: string } = {}): Promise<Listing> {
+  async listAll(
+    opts: { budget?: number; after?: string; deferReads?: number; maxListCalls?: number } = {},
+  ): Promise<Listing> {
     const budget = opts.budget ?? LIST_BUDGET;
+    const maxListCalls = opts.maxListCalls ?? budget;
+    // What a sidecar without a summary costs: a read, here or by the caller.
+    const readCost = opts.deferReads ?? 1;
     const base = `${this.prefix}/`;
     interface Group extends Omit<ListedUpload, "stray" | "unsummarized"> {
       sidecar: boolean;
@@ -372,11 +380,12 @@ export class Uploads {
     let next: { cursor?: string; startAfter?: string } =
       start !== undefined ? { startAfter: start } : {};
     let lastKey = start; // the last key listed
-    const readsNeeded = (list: Group[]) => list.filter((g) => g.sidecar && !g.meta).length;
+    const readsNeeded = (list: Group[]) =>
+      readCost * list.filter((g) => g.sidecar && !g.meta).length;
 
     for (;;) {
       // Room for this call, and for the reads of the uploads listed so far.
-      if (calls + 1 + readsNeeded(groups) > budget) {
+      if (calls + 1 > maxListCalls || calls + 1 + readsNeeded(groups) > budget) {
         truncated = true;
         break;
       }
@@ -437,7 +446,7 @@ export class Uploads {
     let reads = 0;
     const kept: Group[] = [];
     for (const group of candidates) {
-      const read = group.sidecar && !group.meta ? 1 : 0;
+      const read = group.sidecar && !group.meta ? readCost : 0;
       if (calls + reads + read > budget) {
         truncated = true;
         break;
@@ -468,7 +477,7 @@ export class Uploads {
       kept.map(async (group): Promise<ListedUpload> => {
         const { sidecar, others, before: _, ...listed } = group;
         let meta = listed.meta;
-        if (sidecar && !meta && group !== unread) {
+        if (sidecar && !meta && group !== unread && opts.deferReads === undefined) {
           calls++;
           const full = await this.readMeta(listed.id).catch(() => null);
           meta = full && summarize(full);
@@ -488,13 +497,19 @@ export class Uploads {
   /**
    * Give a sidecar written without one (yeet < 0.2, rclone) its summary
    * custom metadata, so listings read it from their pages instead of one
-   * read each. Conditional on the sidecar being unchanged since read. Two R2
-   * calls; returns whether it wrote.
+   * read each. Conditional on the sidecar being unchanged since read, so it
+   * never overwrites a download counted meanwhile (which writes the summary
+   * itself). Returns the sidecar read (null if gone or unreadable), whether
+   * it wrote, and the R2 calls made: 2, or 1 without a sidecar to write.
    */
-  async addSummary(id: string): Promise<boolean> {
+  async addSummary(
+    id: string,
+  ): Promise<{ meta: UploadMeta | null; written: boolean; calls: number }> {
     const object = await this.bucket.get(this.dir(id) + ".meta.json");
-    if (!object) return false;
-    return this.writeMeta(id, await object.json<UploadMeta>(), { etagMatches: object.etag });
+    const meta = await object?.json<UploadMeta>().catch(() => null);
+    if (!object || !meta) return { meta: null, written: false, calls: 1 };
+    const written = await this.writeMeta(id, meta, { etagMatches: object.etag });
+    return { meta, written, calls: 2 };
   }
 
   /** Whether `key` is the sidecar of an upload, `<prefix>/<id>/.meta.json`. */
