@@ -359,6 +359,45 @@ test.describe("upload page", () => {
     await expectGone(await id);
   });
 
+  // An error page that is not ours (an HTML 500 with a stack, Cloudflare's
+  // own 413): only the plain-language message and the status are shown.
+  const HTML_500 =
+    "<!DOCTYPE html><html><head><title>500 Internal Server Error</title></head><body>" +
+    "<h1>Internal Server Error</h1><pre>TypeError: Cannot read properties of undefined\n" +
+    "    at handlePart (worker.js:123:45)\n    at async dispatch (index.js:9:1)</pre></body></html>";
+  const HTML_413 =
+    "<html><head><title>413 Request Entity Too Large</title></head><body><center>" +
+    "<h1>413 Request Entity Too Large</h1></center><hr><center>cloudflare</center></body></html>";
+  for (const [status, body, expected] of [
+    [
+      500,
+      HTML_500,
+      "Something went wrong on the server. Please try again in a moment. (Error 500)",
+    ],
+    [413, HTML_413, "The server refused this file. (Error 413)"],
+  ] as const) {
+    test(`an HTML ${status} page is not shown, only a readable message`, async ({ page, tmp }) => {
+      test.setTimeout(60_000);
+      const file = await randomFile(tmp, 50 * KiB, `html ${status}.bin`);
+      await logIn(page);
+      await page.route("**/api/uploads/**", (route) =>
+        isPart(route.request())
+          ? route.fulfill({ status, contentType: "text/html", body })
+          : route.fallback(),
+      );
+      const id = createdId(page);
+      await choose(page, "input", file.path);
+
+      const message = page.locator("#error-message");
+      await expect(message).toHaveText(expected, { timeout: 30_000 });
+      const text = (await page.locator("body").innerText()).toLowerCase();
+      for (const leak of ["<", "html", "typeerror", "worker.js", "cloudflare", "entity"]) {
+        expect(text, `page text contains "${leak}"`).not.toContain(leak);
+      }
+      await expectGone(await id);
+    });
+  }
+
   test("an expired session mid-upload asks to log in again", async ({ page, context, tmp }) => {
     const file = await randomFile(tmp, 300 * KiB, "expired.bin");
     await logIn(page);

@@ -43,14 +43,18 @@ function post(message: FromWorker): void {
   self.postMessage(message);
 }
 
-/** Error for a non-2xx response. */
+/**
+ * Error for a non-2xx response. Its message is the server's own `error` from
+ * a JSON body; anything else (an HTML error page with a stack trace,
+ * Cloudflare's own 413 page) is never shown, so the page only says the status.
+ */
 function httpError(status: number, body: string, retryAfter: string | null): UploadError {
-  let message = body.slice(0, 200);
+  let message = "";
   try {
-    const parsed = JSON.parse(body) as { error?: unknown };
-    if (typeof parsed.error === "string") message = parsed.error;
+    const parsed = JSON.parse(body) as { error?: unknown } | null;
+    if (typeof parsed?.error === "string") message = parsed.error.slice(0, 200);
   } catch {
-    // not JSON: keep the text
+    // not JSON: show the status only
   }
   if (status === 401) return new UploadError("session", message, status);
   if (status === 408 || status === 429 || status >= 500) {
