@@ -118,8 +118,9 @@ must be managed by Cloudflare. Then run `yeet login https://dl.example.com`.
 
 Files live in the bucket as `uploads/<id>/<filename>`, next to a small
 `uploads/<id>/.meta.json` with the name, size, expiry and password hash.
-Each download adds an empty `uploads/<id>/.downloads/<time>_<random>` object;
-that is how downloads are counted.
+Each download adds an empty `uploads/<id>/.downloads/<time>_<random>` object
+(at most 1,000 per file per day); the daily cleanup adds them to the count in
+`.meta.json` and deletes them.
 
 ## Security notes
 
@@ -127,10 +128,14 @@ that is how downloads are counted.
   share link can download, unless it has a password.
 - In the browser, `/upload` asks for the token once and keeps you logged in
   with a signed, HttpOnly cookie for 90 days. The token itself never reaches
-  the page. Changing `UPLOAD_TOKEN` logs out every browser.
+  the page. A copied session cookie keeps working for up to those 90 days,
+  even after you log out elsewhere: only changing `UPLOAD_TOKEN` revokes
+  sessions, and then it logs out every browser.
 - Wrong tokens and wrong download passwords are rate limited per client
-  (5 per minute for logins and per file for passwords, 20 per minute for the
-  CLI's token), counted in a Durable Object.
+  address (5 per minute for logins and per file for passwords, 20 per minute
+  for the CLI's token), counted in a Durable Object. IPv6 addresses count
+  per /64. Someone with many addresses gets a budget per address, and people
+  sharing one address share one budget.
 - After a correct password, the browser gets a cookie for that file for up to
   24 hours, so it is not asked again.
 - Passwords are hashed with PBKDF2-SHA256 (20,000 iterations), which fits the

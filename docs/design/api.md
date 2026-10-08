@@ -66,6 +66,11 @@ stays the same as today; the CLI and the tests depend on it.
     `http://localhost` so local development and tests work in WebKit.
 - **Valid when:** the signature verifies (constant time) and the expiry is in
   the future.
+- **Revoking:** the cookie is self-contained; the server keeps no list of
+  sessions. A copied cookie (from another device, a backup or malware) works
+  for up to 90 days from its login, and logging out only clears it in the
+  browser that logs out. Only changing `UPLOAD_TOKEN` revokes sessions, and
+  then all of them (with every download pass and open download link).
 
 ### Routes
 
@@ -208,6 +213,16 @@ Evaluated on the Free plan:
 - **Keys:** `login:<ip>`, `dlpw:<ip>:<id>`, `bearer:<ip>`, with
   `ip = CF-Connecting-IP` (`unknown` if absent). Each key gets its own object,
   created near the client that first used it.
+  - **IPv6 by /64** (`rateLimitClient()` in `parse.ts`): an IPv6 address
+    counts by its first 64 bits (`2001:db8:1:2::/64`), since one client
+    usually has a whole /64 and could otherwise use a new address, and a new
+    budget, for every attempt. IPv4 addresses (also IPv4-mapped ones) count
+    as they are; anything unparsable is used as is.
+  - **Known limits:** keys are per client address, so a client with many
+    addresses (several /64s, a botnet) gets a budget per address, and
+    clients behind one address (a carrier-grade NAT, an office) share one: a
+    guesser there can make the others wait out a minute. The 16-character
+    token minimum is the protection that does not depend on addresses.
 - **Window:** a sliding log of the failure times in the last 60 s, at most
   `limit` entries. An attempt is refused when `limit` failures are in the
   window. `Retry-After` is the time until the oldest one leaves it (rounded up,

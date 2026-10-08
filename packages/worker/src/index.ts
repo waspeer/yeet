@@ -26,7 +26,7 @@ import {
   RULES,
   type RateLimitResult,
 } from "./rate-limit.js";
-import { isBearerAttempt, parseExpiry } from "./parse.js";
+import { isBearerAttempt, parseExpiry, rateLimitClient } from "./parse.js";
 import { formatRange, parseRange } from "./range.js";
 import { withOptionalSentry } from "./sentry.js";
 import {
@@ -120,9 +120,12 @@ function encodeRfc8187(value: string): string {
 // Browser requests: cookies, origin checks, rate limits
 // ---------------------------------------------------------------------------
 
-/** The client's address as Cloudflare saw it; the key of the rate limits. */
+/**
+ * The client as the rate limits know it: the address Cloudflare saw, an IPv6
+ * one by its /64 (see rateLimitClient()).
+ */
 function clientIp(c: Ctx): string {
-  return c.req.header("CF-Connecting-IP") ?? "unknown";
+  return rateLimitClient(c.req.header("CF-Connecting-IP") ?? "unknown");
 }
 
 function isHttps(c: Ctx): boolean {

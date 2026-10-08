@@ -56,6 +56,22 @@ test.describe("rate limits", () => {
     expect((await postLogin(server.token, { ip: clientIp() })).status).toBe(303);
   });
 
+  test("login: IPv6 clients are counted per /64, not per address", async () => {
+    const hex = () => randomBytes(2).toString("hex");
+    const net = `2001:db8:${hex()}:${hex()}`; // a random /64 of the documentation range
+    for (let i = 1; i <= 5; i++) {
+      // Five addresses of the same /64, in several spellings.
+      const ip = [`${net}::${i}`, `${net}:0:0:0:${i}`, `${net.toUpperCase()}::${i}:${i}`][i % 3]!;
+      expect((await postLogin(`wrong-${i}-abcdefghij`, { ip })).status, ip).toBe(401);
+    }
+    const limited = await postLogin(server.token, { ip: `${net}:ffff:ffff:ffff:fffe` });
+    expect(limited.status, "another address of the same /64").toBe(429);
+    // The neighbouring /64 has its own budget.
+    const [a, b, c, d] = net.split(":");
+    const next = `${a}:${b}:${c}:${(Number.parseInt(d!, 16) ^ 1).toString(16)}::1`;
+    expect((await postLogin(server.token, { ip: next })).status, next).toBe(303);
+  });
+
   test("login: successes do not count", async () => {
     const ip = clientIp();
     for (let i = 0; i < 8; i++) expect((await postLogin(server.token, { ip })).status).toBe(303);
