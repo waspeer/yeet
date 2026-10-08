@@ -4,7 +4,6 @@ import {
   deleteUpload,
   downloadBytes,
   eventually,
-  exclusive,
   expect,
   listUploads,
   readUploadMeta,
@@ -62,59 +61,87 @@ test.describe("download form", () => {
 test.describe("download count", () => {
   const listed = async (id: string) => (await listUploads()).find((u) => u.id === id);
 
-  test("10 downloads at once are all counted, and delete removes their records", async () => {
+  test("downloads one after another are all counted, in the sidecar", async () => {
     const started = new Date().toISOString();
-    const { id, url } = await uploadViaApi({ filename: "popular.bin", data: randomBytes(512) });
-
-    const responses = await Promise.all(
-      Array.from({ length: 10 }, () => submitDownloadForm(url, undefined, { ip: clientIp() })),
-    );
-    expect(responses.map((res) => res.status)).toEqual(Array(10).fill(303));
-
-    // Recorded in waitUntil(), after the redirects have been sent.
-    await eventually(async () => (await listed(id))?.download_count === 10, {
-      message: "download_count 10",
+    const { id, url } = await uploadViaApi({ filename: "steady.bin", data: randomBytes(512) });
+    const n = 8;
+    for (let i = 0; i < n; i++) {
+      expect((await submitDownloadForm(url, undefined, { ip: clientIp() })).status).toBe(303);
+    }
+    // Counted in waitUntil(), after the redirects have been sent.
+    await eventually(async () => (await listed(id))?.download_count === n, {
+      message: `download_count ${n}`,
     });
-    await sleep(500); // and no more than that
+    await sleep(1000); // and no more than that
     const upload = (await listed(id))!;
-    expect(upload.download_count).toBe(10);
+    expect(upload.download_count).toBe(n);
     expect(upload.recent_downloads).toHaveLength(5);
     for (const at of upload.recent_downloads) {
       expect(at >= started && at <= new Date().toISOString(), at).toBe(true);
     }
     expect([...upload.recent_downloads].sort()).toEqual(upload.recent_downloads);
+    // The sidecar holds the count; nothing else is written per download.
+    const meta = (await readUploadMeta(id))!;
+    expect(meta.download_count).toBe(n);
+    expect(meta.recent_downloads).toEqual(upload.recent_downloads);
+    expect((await uploadObjects(id)).map((o) => o.key).sort()).toEqual([
+      `uploads/${id}/.meta.json`,
+      `uploads/${id}/steady.bin`,
+    ]);
+    expect((await deleteUpload(id)).status).toBe(200);
+  });
+
+  // Each download is a conditional read-modify-write of the sidecar, retried
+  // a few times on a conflict: with many at once some may be dropped (an
+  // undercount), but never counted twice.
+  test("20 downloads at once: at least 15 counted, never more than 20", async () => {
+    const { id, url } = await uploadViaApi({ filename: "popular.bin", data: randomBytes(512) });
+    const n = 20;
+    const responses = await Promise.all(
+      Array.from({ length: n }, () => submitDownloadForm(url, undefined, { ip: clientIp() })),
+    );
+    expect(responses.map((res) => res.status)).toEqual(Array(n).fill(303));
+
+    // The retries take a few hundred milliseconds at most; wait well past them.
+    await sleep(3000);
+    const count = (await listed(id))!.download_count;
+    expect(count).toBeGreaterThanOrEqual(15);
+    expect(count).toBeLessThanOrEqual(n);
+    expect((await readUploadMeta(id))!.download_count).toBe(count);
 
     expect((await deleteUpload(id)).status).toBe(200);
     await eventually(async () => (await uploadObjects(id)).length === 0, {
-      message: `uploads/${id}/ to be empty, download records included`,
+      message: `uploads/${id}/ to be empty`,
     });
     expect(await listed(id)).toBeUndefined();
   });
 
-  // Under the "cron" lock: a cron run would fold the records into the sidecar.
-  test("downloads recorded in an older sidecar still count, without the old cap of 50", () =>
-    exclusive("cron", async () => {
-      const old = Array.from({ length: 50 }, (_, i) => ({
-        at: new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString(),
-      }));
-      // Both kinds of older sidecars: with the summary custom metadata and without.
-      for (const withSummary of [true, false]) {
-        const { id, url } = await uploadViaApi({ filename: "veteran.bin", data: randomBytes(64) });
-        const meta = (await readUploadMeta(id))!;
-        await writeUploadMeta(id, { ...meta, downloads: old }, { withSummary });
-        expect((await listed(id))?.download_count).toBe(50);
-
-        for (let i = 0; i < 3; i++) expect((await submitDownloadForm(url)).status).toBe(303);
-        await eventually(async () => (await listed(id))?.download_count === 53, {
-          message: "download_count 53",
-        });
-        const recent = (await listed(id))!.recent_downloads;
-        expect(recent.slice(0, 2)).toEqual(old.slice(-2).map((d) => d.at));
-        expect(recent.slice(2).every((at) => at > "2026-01-02")).toBe(true);
-        // The sidecar itself is no longer rewritten per download.
-        expect((await readUploadMeta(id))?.downloads).toEqual(old);
-      }
+  test("downloads recorded in an older sidecar still count, without the old cap of 50", async () => {
+    const old = Array.from({ length: 50 }, (_, i) => ({
+      at: new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString(),
     }));
+    // Both kinds of older sidecars: with the summary custom metadata and without.
+    for (const withSummary of [true, false]) {
+      const { id, url } = await uploadViaApi({ filename: "veteran.bin", data: randomBytes(64) });
+      const meta = (await readUploadMeta(id))!;
+      await writeUploadMeta(id, { ...meta, downloads: old }, { withSummary });
+      expect((await listed(id))?.download_count).toBe(50);
+
+      for (let i = 0; i < 3; i++) expect((await submitDownloadForm(url)).status).toBe(303);
+      await eventually(async () => (await listed(id))?.download_count === 53, {
+        message: "download_count 53",
+      });
+      const recent = (await listed(id))!.recent_downloads;
+      expect(recent.slice(0, 2)).toEqual(old.slice(-2).map((d) => d.at));
+      expect(recent.slice(2).every((at) => at > "2026-01-02")).toBe(true);
+      // The array gave way to the count on the first new download.
+      const stored = (await readUploadMeta(id))!;
+      expect(stored.downloads).toBeUndefined();
+      expect(stored.download_count).toBe(53);
+      expect(stored.recent_downloads).toEqual(recent);
+      expect((await deleteUpload(id)).status).toBe(200);
+    }
+  });
 });
 
 test.describe("DELETE /api/uploads/:id", () => {

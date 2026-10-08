@@ -171,9 +171,9 @@ export async function triggerCron(cron = "0 3 * * *"): Promise<void> {
 export interface UploadMeta extends LegacyMeta {
   /** Set while the file is still being uploaded: the R2 multipart upload ID. */
   pending_upload_id?: string;
-  /** Downloads folded in by the cron (replaces `downloads` once set). */
+  /** Downloads counted so far (replaces `downloads` once set). */
   download_count?: number;
-  /** The last five download times, folded in with download_count. */
+  /** The last five download times, oldest first. */
   recent_downloads?: string[];
 }
 
