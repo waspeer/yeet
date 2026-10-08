@@ -126,8 +126,15 @@ counted twice.
 
 `yeet list` shows about 2,000 uploads at most: the Worker may make only 50
 storage calls per request on the free plan. With more, it says that only
-part of them is shown. The daily cleanup works through a bucket of any size,
-about 1,200 uploads per day.
+part of them is shown: the uploads whose IDs come first in the bucket
+(sorted newest first, as always). IDs are random, so these are not your
+newest uploads. The daily cleanup works through a bucket of any size, about
+1,200 uploads per day.
+
+Uploads made with a yeet older than 0.2 cost `yeet list` a storage call
+each until the daily cleanup has updated them, 21 per day; a bucket of
+nothing but those shows 39 at first. To update them all at once, see
+"Migrating a bucket of yeet < 0.2" in [docs/design/api.md](docs/design/api.md).
 
 ## Security notes
 
