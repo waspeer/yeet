@@ -38,14 +38,8 @@ import {
   tooManyAttempts,
 } from "./template.js";
 import { uploadPage } from "./upload-page.js";
-import {
-  generateId,
-  isExpired,
-  isValidFilename,
-  isValidId,
-  Uploads,
-  type ListedUpload,
-} from "./uploads.js";
+import { runCleanup } from "./cleanup.js";
+import { generateId, isExpired, isValidFilename, isValidId, Uploads } from "./uploads.js";
 
 export { RateLimiter };
 
@@ -69,9 +63,6 @@ const PART_SIZE = 50 * 1024 * 1024;
 
 /** The longest lifetime of an upload, in seconds: 365 days. */
 const MAX_EXPIRES_IN = 365 * 24 * 60 * 60;
-
-/** Uploads still pending after this long are considered abandoned. */
-const ABANDONED_AFTER_MS = 24 * 60 * 60 * 1000;
 
 /** How long a download pass (after a correct password) lasts at most. */
 const DOWNLOAD_PASS_MAX_AGE = 24 * 60 * 60;
@@ -215,10 +206,13 @@ api.use("*", async (c, next) => {
 // GET /api/me — lets `yeet login` check the URL and token
 api.get("/me", (c) => c.json({ ok: true }));
 
-// GET /api/uploads — every finished upload, newest first
+// GET /api/uploads — every finished upload, newest first. `truncated: true`
+// if the listing reached its limit of R2 calls first (see listAll()): then
+// only the uploads of the first part of the bucket (in ID order) are there.
 api.get("/uploads", async (c) => {
   const origin = new URL(c.req.url).origin;
-  const result = (await c.get("uploads").listAll()).uploads
+  const listing = await c.get("uploads").listAll();
+  const result = listing.uploads
     // Finished uploads only; their summaries carry no pending_upload_id.
     .flatMap(({ id, meta }) =>
       meta && !meta.pending_upload_id
@@ -227,7 +221,7 @@ api.get("/uploads", async (c) => {
     )
     .sort((a, b) => b.uploaded_at.localeCompare(a.uploaded_at));
 
-  return c.json({ uploads: result });
+  return c.json({ uploads: result, ...(listing.truncated ? { truncated: true } : {}) });
 });
 
 function isSize(value: unknown): value is number {
@@ -718,11 +712,18 @@ app.post("/:id/download", async (c) => {
     }
   }
 
-  // Record the download without holding up the redirect.
+  // Count the download without holding up the redirect.
+  const at = new Date().toISOString();
   c.executionCtx.waitUntil(
-    uploads.recordDownload(id).catch((err) => {
-      console.error(`[download] Failed to record download for ${id}:`, err);
-    }),
+    uploads
+      .recordDownload(id, at)
+      .then((counted) => {
+        if (!counted)
+          console.log(`[download] Download of ${id} not counted (sidecar kept changing)`);
+      })
+      .catch((err) => {
+        console.error(`[download] Failed to record download for ${id}:`, err);
+      }),
   );
 
   // The signed link is a bearer token: until it expires it works without the
@@ -744,64 +745,28 @@ app.onError((err, c) => {
 // Daily cleanup of expired and abandoned uploads
 // ---------------------------------------------------------------------------
 
-/**
- * Subrequests the cleanup may make: the free plan allows 50 per invocation,
- * minus a margin.
- */
-const CLEANUP_SUBREQUESTS = 45;
-
-async function runCleanup(env: Env): Promise<void> {
-  const uploads = new Uploads(env.BUCKET, env.UPLOADS_PREFIX || "uploads");
-  const listing = await uploads.listAll();
-  let subrequests = listing.subrequests;
-  const isStale = ({ meta, stray }: ListedUpload): boolean => {
-    if (stray) return true; // download records without an upload
-    if (!meta) return false; // unreadable sidecar: leave it for a human
-    const abandoned =
-      !!meta.pending_upload_id &&
-      Date.now() - new Date(meta.uploaded_at).getTime() > ABANDONED_AFTER_MS;
-    return isExpired(meta) || abandoned;
-  };
-  const stale = listing.uploads.filter(isStale);
-
-  for (const { id, meta } of stale) {
-    if (meta?.pending_upload_id) {
-      await uploads.abortPending(id, meta.filename, meta.pending_upload_id);
-      subrequests++;
-    }
+async function cleanup(env: Env): Promise<void> {
+  const report = await runCleanup(env.BUCKET, env.UPLOADS_PREFIX || "uploads");
+  if (report.deleted > 0) {
+    console.log(`[cleanup] Deleted ${report.deleted} expired or abandoned upload(s)`);
   }
-  const staleKeys = stale.flatMap(({ keys }) => keys);
-  await uploads.deleteKeys(staleKeys);
-  subrequests += Math.ceil(staleKeys.length / 1000);
-
-  if (stale.length > 0)
-    console.log(`[cleanup] Deleted ${stale.length} expired or abandoned upload(s)`);
-
-  // Fold the download records of the remaining uploads into their sidecars,
-  // most records first, as far as the subrequest budget goes (a get, a put
-  // and a delete per 1000 records each); the rest wait for the next run.
-  const toFold = listing.uploads
-    .filter((upload) => !isStale(upload) && upload.meta && upload.records.keys.length > 0)
-    .sort((a, b) => b.records.keys.length - a.records.keys.length);
-  let folded = 0;
-  for (const { id, records } of toFold) {
-    const cost = 2 + Math.ceil(records.keys.length / 1000);
-    if (subrequests + cost > CLEANUP_SUBREQUESTS) break;
-    subrequests += cost;
-    try {
-      if (await uploads.foldDownloads(id, records)) folded++;
-    } catch (err) {
-      console.error(`[cleanup] Could not fold the download records of ${id}:`, err);
-    }
+  if (report.recordsCleared > 0) {
+    console.log(
+      `[cleanup] Deleted the legacy download records of ${report.recordsCleared} upload(s)`,
+    );
   }
-  if (folded > 0) console.log(`[cleanup] Folded the download records of ${folded} upload(s)`);
+  if (report.summarized > 0) {
+    console.log(`[cleanup] Added the summary to ${report.summarized} older sidecar(s)`);
+  }
+  if (report.cursor)
+    console.log(`[cleanup] Not done; the next run continues after ${report.cursor}`);
 }
 
 export default withOptionalSentry<Env, Request, ScheduledController, ExecutionContext, Response>(
   () => ({
     fetch: (request, env, ctx) => app.fetch(request, env, ctx),
     scheduled(_controller, env, ctx) {
-      ctx.waitUntil(runCleanup(env));
+      ctx.waitUntil(cleanup(env));
     },
   }),
   async (handler) => {

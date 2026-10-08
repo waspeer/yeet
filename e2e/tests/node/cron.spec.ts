@@ -6,6 +6,7 @@ import {
   exclusive,
   expect,
   forgeDownloadUrl,
+  headObject,
   listUploads,
   putObject,
   randomId,
@@ -16,6 +17,7 @@ import {
   sleep,
   startUpload,
   submitDownloadForm,
+  summarize,
   test,
   triggerCron,
   uploadObjects,
@@ -66,10 +68,8 @@ test.describe("expiry at request time (no cron)", () => {
 
       await waitUntilExpired(forForm.id);
       // Still in the bucket: what follows is the request-time check, not cleanup.
-      // (forDl also has a download record, `.downloads/…`.)
       for (const { id } of [forDl, forPage, forForm]) {
-        const keys = (await uploadObjects(id)).map((o) => o.key);
-        expect(keys.filter((key) => !key.includes("/.downloads/"))).toHaveLength(2);
+        expect(await uploadObjects(id)).toHaveLength(2);
       }
 
       // /_dl does not delete anything, so check it first.
@@ -111,7 +111,7 @@ test.describe("daily cleanup (cron)", () => {
       expect((await fetch(url)).status).toBe(404);
     }));
 
-  test("removes the download records of an expired upload, and stray ones", () =>
+  test("removes an expired upload that was downloaded, and stray legacy download records", () =>
     exclusive("cron", async () => {
       const { id, url } = await uploadViaApi({
         filename: "downloaded.bin",
@@ -124,7 +124,8 @@ test.describe("daily cleanup (cron)", () => {
         { message: "download_count 2" },
       );
 
-      // Download records without an upload, as a download racing a delete can leave.
+      // Download records without an upload (yeet 1D/1E wrote one object per
+      // download), as a download racing a delete could leave.
       const stray = randomId();
       const strayKey = `uploads/${stray}/.downloads/${new Date().toISOString()}_0a1b2c3d`;
       await putObject(strayKey, "");
@@ -195,6 +196,14 @@ test.describe("daily cleanup (cron)", () => {
       // Once the expired control is gone, this cleanup run has done its deleting.
       await eventually(gone(control.id), { message: "the cron run to remove the control" });
       expect(await uploadObjects(id)).toHaveLength(2);
+      // The cleanup gave its sidecar the summary later listings read instead.
+      const sidecar = `${server.uploadsPrefix}/${id}/.meta.json`;
+      await eventually(async () => !!(await headObject(sidecar))?.custom_metadata["summary"], {
+        message: "the cron to add the summary to the legacy sidecar",
+      });
+      expect(JSON.parse((await headObject(sidecar))!.custom_metadata["summary"]!)).toEqual(
+        summarize((await readUploadMeta(id))!),
+      );
 
       const listed = (await listUploads()).find((u) => u.id === id);
       expect(listed).toMatchObject({ filename: "legacy upload.bin", file_size: data.length, url });

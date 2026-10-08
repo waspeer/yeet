@@ -2,13 +2,15 @@
 // earlier version of yeet:
 //
 //   <prefix>/<id>/<filename>     the file itself
-//   <prefix>/<id>/.meta.json     metadata sidecar (UploadMeta)
+//   <prefix>/<id>/.meta.json     metadata sidecar (UploadMeta), which also
+//                                holds the download count
 //   <prefix>/<id>/.parts/<n>     size of part n, only while an upload of
 //                                unknown size is pending
-//   <prefix>/<id>/.downloads/<at>_<random>
-//                                one empty object per download (after 0.2),
-//                                <at> the ISO 8601 time; see recordDownload().
-//                                The daily cron folds them into the sidecar.
+//   <prefix>/<id>/.downloads/…   legacy: one empty object per download,
+//                                written by the pre-release versions 1D/1E
+//                                only. Never written or counted any more; the
+//                                listing skips them and the cron deletes them.
+//   <prefix>/.cleanup-cursor     where the next cron run resumes (cleanup.ts)
 
 export interface DownloadRecord {
   at: string; // ISO 8601
@@ -22,34 +24,61 @@ export interface UploadMeta {
   expires_at: string;
   password_hash?: string;
   /**
-   * Downloads recorded by yeet 0.2 and earlier, which rewrote the sidecar per
-   * download (and kept the last 50). Newer downloads are `.downloads/` objects.
+   * Downloads recorded by yeet 0.2 and earlier (the last 50). Read for the
+   * count; replaced by download_count and recent_downloads the first time a
+   * download is recorded.
    */
   downloads?: DownloadRecord[];
-  /**
-   * Downloads folded in from `.downloads/` records by the daily cron (see
-   * foldDownloads()); `downloads` is folded in too and dropped then.
-   */
+  /** Downloads recorded so far (see recordDownload()). */
   download_count?: number;
-  /** The last five download times, folded in with download_count. */
+  /** The last five download times, oldest first. */
   recent_downloads?: string[];
   /** Set while the file is still being uploaded; holds the R2 multipart upload ID. */
   pending_upload_id?: string;
 }
 
 /**
- * Download records written per upload between two folds. Past it a download
- * is not recorded (the count stops growing until the next fold), so scripted
- * downloads of one link cannot fill the bucket and the listing.
+ * The part of the R2 binding this module uses. R2Bucket satisfies it; the
+ * unit tests pass a fake that counts calls.
  */
-export const RECORD_CAP = 1000;
+export interface Bucket {
+  get(key: string): Promise<{ etag: string; json<T>(): Promise<T> } | null>;
+  head(key: string): Promise<object | null>;
+  put(
+    key: string,
+    value: string,
+    options?: {
+      httpMetadata?: { contentType?: string };
+      customMetadata?: Record<string, string>;
+      onlyIf?: { etagMatches?: string };
+    },
+  ): Promise<object | null>;
+  list(options: {
+    prefix?: string;
+    cursor?: string;
+    startAfter?: string;
+    include?: ("httpMetadata" | "customMetadata")[];
+  }): Promise<{
+    objects: { key: string; customMetadata?: Record<string, string> }[];
+    truncated: boolean;
+    cursor?: string;
+  }>;
+  delete(keys: string | string[]): Promise<void>;
+  resumeMultipartUpload(key: string, uploadId: string): { abort(): Promise<void> };
+}
 
 /**
- * Records of one upload counted by a listing. Past it the listing skips the
- * rest of that upload's records, so it never pages through more than this per
- * upload; normally there are at most RECORD_CAP (one day's worth).
+ * Attempts at writing one download into the sidecar (see recordDownload()):
+ * a get and a conditional put each, so at most 6 R2 calls per download.
  */
-export const LISTED_RECORDS_LIMIT = 2 * RECORD_CAP;
+export const RECORD_ATTEMPTS = 3;
+
+/**
+ * R2 calls one listing may make, sidecar reads of old uploads included. The
+ * free plan allows 50 subrequests per request; GET /api/uploads also makes a
+ * rate-limit call. See listAll().
+ */
+export const LIST_BUDGET = 40;
 
 /**
  * Upload IDs are base64url. Anything else — in particular dot-segments
@@ -72,8 +101,8 @@ export function isValidFilename(name: string): boolean {
   );
 }
 
-export function isExpired(meta: { expires_at: string }): boolean {
-  return new Date(meta.expires_at) <= new Date();
+export function isExpired(meta: { expires_at: string }, now = Date.now()): boolean {
+  return new Date(meta.expires_at).getTime() <= now;
 }
 
 export function generateId(): string {
@@ -110,36 +139,49 @@ export function summarize(meta: UploadMeta): UploadSummary {
   };
 }
 
-/** Prefix (below an upload's directory) of its download records. */
-const DOWNLOADS = ".downloads/";
-
 /**
- * A summary with the download records counted in: the sidecar's own downloads
- * (yeet 0.2 and earlier) came before them.
+ * The sidecar with one more download at `at`: download_count and
+ * recent_downloads, which take over from a legacy `downloads` array.
  */
-function withDownloads<T extends { download_count: number; recent_downloads: string[] }>(
-  summary: T,
-  downloads: string[],
-): T {
-  if (downloads.length === 0) return summary;
+export function withDownload(meta: UploadMeta, at: string): UploadMeta {
+  const { downloads: _, ...rest } = meta;
+  const { download_count, recent_downloads } = summarize(meta);
   return {
-    ...summary,
-    download_count: summary.download_count + downloads.length,
-    recent_downloads: [...summary.recent_downloads, ...downloads.slice(-5)].sort().slice(-5),
+    ...rest,
+    download_count: download_count + 1,
+    recent_downloads: [...recent_downloads, at].sort().slice(-5),
   };
 }
+
+/** Subdirectories of an upload that can hold many objects; listings jump over them. */
+const BULK_DIRS = [".downloads/", ".parts/"];
 
 /** One upload as listAll() finds it. */
 export interface ListedUpload {
   id: string;
-  /** Every key found, except records skipped past LISTED_RECORDS_LIMIT. */
+  /** The keys listed; every key of the upload when `complete`. */
   keys: string[];
-  /** The summary with the counted records added, or null if unreadable. */
+  /** False if the listing jumped over some of its keys (see listAll()). */
+  complete: boolean;
+  /** The summary, or null without a (readable) sidecar. */
   meta: UploadSummary | null;
-  /** Download records without an upload (no sidecar, nothing else). */
+  /** It has legacy `.downloads/` records (yeet 1D/1E), which the cron deletes. */
+  legacyRecords: boolean;
+  /** Legacy download records without an upload (no sidecar, nothing else). */
   stray: boolean;
-  /** The keys and times of the records counted, for foldDownloads(). */
-  records: { keys: string[]; times: string[] };
+  /** Its sidecar has no summary custom metadata (yeet < 0.2): read separately. */
+  unsummarized: boolean;
+}
+
+export interface Listing {
+  /** In key order (by ID), so a later listing can resume after the last one. */
+  uploads: ListedUpload[];
+  /** True if the budget ran out before the end of the bucket: uploads after the last are missing. */
+  truncated: boolean;
+  /** The R2 calls made. */
+  subrequests: number;
+  /** When truncated: the key to pass as `after` to continue where this listing stopped. */
+  resumeAfter?: string;
 }
 
 function toCustomMetadata(meta: UploadMeta): Record<string, string> {
@@ -155,11 +197,15 @@ function fromCustomMetadata(custom: Record<string, string> | undefined): UploadS
   }
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export class Uploads {
   private readonly prefix: string;
 
   constructor(
-    private readonly bucket: R2Bucket,
+    private readonly bucket: Bucket,
     prefix: string,
   ) {
     this.prefix = prefix.replace(/^\/+|\/+$/g, "");
@@ -174,6 +220,20 @@ export class Uploads {
     return this.dir(id) + filename;
   }
 
+  /** Where the cron keeps its position (an ID is never `.cleanup-cursor`). */
+  get cursorKey(): string {
+    return `${this.prefix}/.cleanup-cursor`;
+  }
+
+  /**
+   * A key that sorts right after every key of upload `id` and before the
+   * next upload's: `<id>0`, since '/' < '0' and no ID character lies
+   * between the two.
+   */
+  keyAfter(id: string): string {
+    return `${this.dir(id).slice(0, -1)}0`;
+  }
+
   /** Read the metadata sidecar, or null if the upload does not exist. */
   async readMeta(id: string): Promise<UploadMeta | null> {
     const object = await this.bucket.get(this.dir(id) + ".meta.json");
@@ -183,14 +243,25 @@ export class Uploads {
 
   /**
    * Write the metadata sidecar. A summary also goes into the object's custom
-   * metadata, so listing every upload takes one R2 call per 1000 objects
-   * instead of one read per upload — the free plan allows only 50 per request.
+   * metadata, so a listing reads every upload's summary from its list pages
+   * instead of one read per upload — the free plan allows only 50 calls per
+   * request.
    */
-  async writeMeta(id: string, meta: UploadMeta): Promise<void> {
-    await this.bucket.put(this.dir(id) + ".meta.json", JSON.stringify(meta, null, 2), {
-      httpMetadata: { contentType: "application/json" },
-      customMetadata: toCustomMetadata(meta),
-    });
+  async writeMeta(
+    id: string,
+    meta: UploadMeta,
+    onlyIf?: { etagMatches: string },
+  ): Promise<boolean> {
+    const written = await this.bucket.put(
+      this.dir(id) + ".meta.json",
+      JSON.stringify(meta, null, 2),
+      {
+        httpMetadata: { contentType: "application/json" },
+        customMetadata: toCustomMetadata(meta),
+        ...(onlyIf ? { onlyIf } : {}),
+      },
+    );
+    return written !== null;
   }
 
   /**
@@ -229,153 +300,206 @@ export class Uploads {
   }
 
   /**
-   * Record a download as a new empty object, `.downloads/<ISO time>_<random>`.
-   * Never a read-modify-write of the sidecar: concurrent downloads each write
-   * their own key, so none is lost. listAll() counts them in the same listing
-   * that reads the summaries; the daily cron folds them into the sidecar;
-   * delete() and the cleanup remove them with the upload.
+   * Count a download made at `at` in the sidecar: a read-modify-write that
+   * only writes if the sidecar is unchanged since it was read (R2's
+   * `onlyIf: { etagMatches }`, checked atomically with the write). On a
+   * conflict (another download, or a delete, got there first) it reads again
+   * after a short random wait, up to RECORD_ATTEMPTS times.
    *
-   * At most RECORD_CAP records are written between two folds: one list call
-   * (of at most that many keys) checks first. Returns whether it recorded.
+   * So downloads one after another are counted exactly, and a count is never
+   * written twice or over a newer one (no overcount, a deleted upload is
+   * never written back). Under heavy concurrency on one file a download may
+   * still find the sidecar changed on every attempt and is then not counted:
+   * an undercount. At most 2 × RECORD_ATTEMPTS R2 calls; called in
+   * waitUntil(), after the response. Returns whether it counted.
    */
-  async recordDownload(id: string): Promise<boolean> {
-    const prefix = this.dir(id) + DOWNLOADS;
-    const existing = await this.bucket.list({ prefix, limit: RECORD_CAP });
-    if (existing.truncated || existing.objects.length >= RECORD_CAP) return false;
-    const random = [...crypto.getRandomValues(new Uint8Array(4))]
-      .map((byte) => byte.toString(16).padStart(2, "0"))
-      .join("");
-    await this.bucket.put(`${prefix}${new Date().toISOString()}_${random}`, "");
-    return true;
+  async recordDownload(id: string, at: string): Promise<boolean> {
+    const key = this.dir(id) + ".meta.json";
+    for (let attempt = 1; ; attempt++) {
+      const started = Date.now();
+      const object = await this.bucket.get(key);
+      if (!object) return false;
+      const meta = await object.json<UploadMeta>();
+      if (meta.pending_upload_id) return false;
+      if (await this.writeMeta(id, withDownload(meta, at), { etagMatches: object.etag })) {
+        return true;
+      }
+      if (attempt >= RECORD_ATTEMPTS) return false;
+      // Spread the retries of colliding downloads over a few round trips of
+      // the read and write just made, more widely on each attempt.
+      const roundTrip = Math.max(10, Date.now() - started);
+      await sleep(Math.random() * roundTrip * 8 * attempt);
+    }
   }
 
   /**
-   * Every upload with its object keys and metadata summary, download records
-   * included. Sidecars written by yeet < 0.2 carry no summary; those are read
-   * individually. `stray` marks download records left without an upload (a
-   * download that raced a delete): no sidecar is read for them, and the
-   * cleanup removes them.
+   * Finished and pending uploads with their summaries, in key order, in at
+   * most `budget` R2 calls (default LIST_BUDGET) whatever the bucket holds.
    *
-   * Counts at most LISTED_RECORDS_LIMIT records per upload: past that the
-   * listing jumps over the rest of that upload's records (`startAfter`), so
-   * the number of list calls stays bounded however many there are. Returns
-   * the subrequests it made, for the cron's budget.
+   * One list call returns up to 100 objects with their custom metadata
+   * (miniflare's cap; Cloudflare documents that a list including metadata
+   * may return fewer than asked). A finished upload is 2 objects (file and
+   * sidecar) whose summary comes from the sidecar's custom metadata, so a
+   * call covers about 50 uploads. A sidecar of yeet < 0.2 has no summary and
+   * costs one read, counted in the budget.
+   *
+   * `.downloads/` (legacy) and `.parts/` keys can be many per upload. When a
+   * page ends inside such a run, the next call starts after it
+   * (`startAfter`), so it costs at most one call per upload; the upload is
+   * then marked incomplete (its keys are not all listed).
+   *
+   * Stops when the budget is spent, and then returns the uploads listed so
+   * far (never a partly listed last one) with `truncated: true` and the
+   * key to continue after (`resumeAfter`), which `after` takes.
    */
-  async listAll(): Promise<{ uploads: ListedUpload[]; subrequests: number }> {
-    const groups = new Map<
-      string,
-      { keys: string[]; meta: UploadSummary | null; sidecar: boolean; others: number } & {
-        records: { keys: string[]; times: string[] };
+  async listAll(opts: { budget?: number; after?: string } = {}): Promise<Listing> {
+    const budget = opts.budget ?? LIST_BUDGET;
+    const base = `${this.prefix}/`;
+    interface Group extends Omit<ListedUpload, "stray" | "unsummarized"> {
+      sidecar: boolean;
+      others: number;
+    }
+    const groups: Group[] = [];
+    let calls = 0;
+    let truncated = false;
+    let next: { cursor?: string; startAfter?: string } =
+      opts.after !== undefined && opts.after.startsWith(base) ? { startAfter: opts.after } : {};
+    let lastKey = next.startAfter;
+    const readsNeeded = (list: Group[]) => list.filter((g) => g.sidecar && !g.meta).length;
+
+    for (;;) {
+      // Room for this call, and for the reads of the uploads listed so far.
+      if (calls + 1 + readsNeeded(groups) > budget) {
+        truncated = true;
+        break;
       }
-    >();
-    let subrequests = 0;
-    let cursor: string | undefined;
-    let startAfter: string | undefined;
-    do {
-      const page = await this.bucket.list({
-        prefix: `${this.prefix}/`,
-        ...(cursor ? { cursor } : startAfter ? { startAfter } : {}),
-        include: ["customMetadata"],
-      });
-      subrequests++;
-      let skipping: string | undefined;
+      const page = await this.bucket.list({ prefix: base, ...next, include: ["customMetadata"] });
+      calls++;
       for (const object of page.objects) {
-        const [id, ...rest] = object.key.slice(this.prefix.length + 1).split("/");
+        const [id, ...rest] = object.key.slice(base.length).split("/");
         if (!id || !isValidId(id) || rest.length === 0) continue;
-        let group = groups.get(id);
-        if (!group) {
+        let group = groups.at(-1);
+        if (group?.id !== id) {
           group = {
+            id,
             keys: [],
+            complete: true,
             meta: null,
+            legacyRecords: false,
             sidecar: false,
             others: 0,
-            records: { keys: [], times: [] },
           };
-          groups.set(id, group);
+          groups.push(group);
         }
         const name = rest.join("/");
-        if (name.startsWith(DOWNLOADS)) {
-          if (group.records.keys.length >= LISTED_RECORDS_LIMIT) {
-            skipping = id;
-            continue;
-          }
-          group.keys.push(object.key);
-          group.records.keys.push(object.key);
-          // Listed in key order, which for ISO 8601 times is time order.
-          group.records.times.push(name.slice(DOWNLOADS.length).split("_")[0]!);
+        group.keys.push(object.key);
+        if (name.startsWith(".downloads/")) {
+          group.legacyRecords = true;
           continue;
         }
-        group.keys.push(object.key);
         group.others++;
         if (name === ".meta.json") {
           group.sidecar = true;
           group.meta = fromCustomMetadata(object.customMetadata);
         }
       }
-      const last = page.objects.at(-1)?.key;
-      const skipPrefix = skipping && `${this.prefix}/${skipping}/${DOWNLOADS}`;
-      if (page.truncated && skipPrefix && last?.startsWith(skipPrefix)) {
-        // Still inside the records being skipped: continue after all of them.
-        // Record keys are ISO times and hex digits, which all sort before "~".
-        cursor = undefined;
-        startAfter = `${skipPrefix}~`;
+      if (!page.truncated) break;
+      // A page that ends inside an upload's `.downloads/` or `.parts/` run:
+      // continue after the run. Its keys (times, hex, digits) sort before '~'.
+      const last = page.objects.at(-1)?.key ?? "";
+      if (last) lastKey = last;
+      const [lastId, ...lastRest] = last.slice(base.length).split("/");
+      const bulk = BULK_DIRS.find((dir) => lastRest.join("/").startsWith(dir));
+      if (bulk && lastId && isValidId(lastId)) {
+        groups.at(-1)!.complete = false;
+        next = { startAfter: `${base}${lastId}/${bulk}~` };
       } else {
-        cursor = page.truncated ? page.cursor : undefined;
-        startAfter = undefined;
+        next = { cursor: page.cursor };
       }
-    } while (cursor || startAfter);
+    }
+
+    // Keys of one upload are contiguous, so every upload but the last is
+    // listed completely; the last only if the listing reached the end.
+    let listed = truncated && groups.length > 1 ? groups.slice(0, -1) : groups;
+    if (truncated && groups.length === 1) {
+      // One upload with more keys than the budget lists: not a yeet upload
+      // (those have a handful plus the runs skipped above). Report it as
+      // incomplete so the cron moves past it rather than stalling.
+      groups[0]!.complete = false;
+    }
+    // The reads of old sidecars, as far as the budget goes.
+    let reads = 0;
+    const kept: Group[] = [];
+    for (const group of listed) {
+      const read = group.sidecar && !group.meta ? 1 : 0;
+      if (calls + reads + read > budget) {
+        truncated = true;
+        break;
+      }
+      reads += read;
+      kept.push(group);
+    }
+    listed = kept;
 
     const uploads = await Promise.all(
-      [...groups].map(async ([id, { keys, meta, sidecar, others, records }]) => {
-        const stray = !sidecar && others === 0;
-        if (!meta && !stray) {
-          subrequests++;
-          const full = await this.readMeta(id).catch(() => null);
+      listed.map(async ({ sidecar, others, ...group }): Promise<ListedUpload> => {
+        let meta = group.meta;
+        if (sidecar && !meta) {
+          calls++;
+          const full = await this.readMeta(group.id).catch(() => null);
           meta = full && summarize(full);
         }
-        return { id, keys, meta: meta && withDownloads(meta, records.times), stray, records };
+        return {
+          ...group,
+          meta,
+          stray: !sidecar && others === 0,
+          unsummarized: sidecar && !group.meta,
+        };
       }),
     );
-    return { uploads, subrequests };
+    const lastListed = uploads.at(-1)?.id;
+    return {
+      uploads,
+      truncated,
+      subrequests: calls,
+      // After the last upload listed or, if there is none (the budget went
+      // on keys that are no upload), after the last key seen, so the next
+      // listing always gets further.
+      ...(truncated ? { resumeAfter: lastListed ? this.keyAfter(lastListed) : lastKey } : {}),
+    };
   }
 
   /**
-   * Fold download records into the sidecar: add them to `download_count` and
-   * `recent_downloads` (which replace a legacy `downloads` array), write the
-   * sidecar and its summary, then delete the records. The sidecar is only
-   * written if it has not changed since it was read (an etag condition), so a
-   * concurrent delete or completion is never undone. Returns false if nothing
-   * was folded.
-   *
-   * A download recorded meanwhile is a key not in `records` and stays for the
-   * next fold. If deleting the records fails after the sidecar was written,
-   * they are counted again next time (logged by the caller).
+   * Give a sidecar written without one (yeet < 0.2, rclone) its summary
+   * custom metadata, so listings read it from their pages instead of one
+   * read each. Conditional on the sidecar being unchanged since read. Two R2
+   * calls; returns whether it wrote.
    */
-  async foldDownloads(id: string, records: { keys: string[]; times: string[] }): Promise<boolean> {
-    if (records.keys.length === 0) return false;
+  async addSummary(id: string): Promise<boolean> {
     const object = await this.bucket.get(this.dir(id) + ".meta.json");
     if (!object) return false;
-    const meta = await object.json<UploadMeta>();
-    if (meta.pending_upload_id) return false;
-    const { downloads: _, ...rest } = meta;
-    const counted = withDownloads(summarize(meta), records.times);
-    const folded: UploadMeta = {
-      ...rest,
-      download_count: counted.download_count,
-      recent_downloads: counted.recent_downloads,
-    };
-    const written = await this.bucket.put(
-      this.dir(id) + ".meta.json",
-      JSON.stringify(folded, null, 2),
-      {
-        httpMetadata: { contentType: "application/json" },
-        customMetadata: toCustomMetadata(folded),
-        onlyIf: { etagMatches: object.etag },
-      },
-    );
-    if (!written) return false;
-    await this.deleteKeys(records.keys);
-    return true;
+    return this.writeMeta(id, await object.json<UploadMeta>(), { etagMatches: object.etag });
+  }
+
+  /**
+   * Delete every object under `prefix` (a directory of an upload) in at most
+   * `maxCalls` R2 calls: a list (up to 1,000 keys without metadata) and a
+   * delete per round. Returns the calls made and whether nothing is left.
+   */
+  async deleteUnder(prefix: string, maxCalls: number): Promise<{ calls: number; done: boolean }> {
+    if (!prefix.startsWith(`${this.prefix}/`) || !prefix.endsWith("/")) {
+      throw new Error(`Unsafe prefix: ${JSON.stringify(prefix)}`);
+    }
+    let calls = 0;
+    while (calls + 2 <= maxCalls) {
+      const page = await this.bucket.list({ prefix });
+      calls++;
+      if (page.objects.length === 0) return { calls, done: true };
+      await this.bucket.delete(page.objects.map((object) => object.key));
+      calls++;
+      if (!page.truncated) return { calls, done: true };
+    }
+    return { calls, done: false };
   }
 
   /** Delete objects by key, in batches of the 1000 R2 accepts per call. */
