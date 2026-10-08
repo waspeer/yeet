@@ -167,7 +167,10 @@ export interface ListedUpload {
   meta: UploadSummary | null;
   /** It has legacy `.downloads/` records (yeet 1D/1E), which the cron deletes. */
   legacyRecords: boolean;
-  /** Legacy download records without an upload (no sidecar, nothing else). */
+  /**
+   * Legacy download records without an upload: every key was listed, and
+   * there is no sidecar or anything else.
+   */
   stray: boolean;
   /** Its sidecar has no summary custom metadata (yeet < 0.2): read separately. */
   unsummarized: boolean;
@@ -473,7 +476,8 @@ export class Uploads {
         return {
           ...listed,
           meta,
-          stray: !sidecar && others === 0,
+          // Only if every key was listed: a sidecar may follow the records.
+          stray: listed.complete && !sidecar && others === 0,
           unsummarized: sidecar && !listed.meta,
         };
       }),

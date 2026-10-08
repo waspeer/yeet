@@ -66,6 +66,27 @@ function listing(bucket: FakeBucket, after?: string) {
   return new Uploads(bucket, PREFIX).listAll(after === undefined ? {} : { after });
 }
 
+/**
+ * A bucket whose list calls with metadata after the first (since
+ * resetCalls()) return nothing but say there is more, as R2 may: "fewer
+ * than asked" includes none.
+ */
+class StarvedBucket extends FakeBucket {
+  private metadataLists = 0;
+  override resetCalls(): void {
+    super.resetCalls();
+    this.metadataLists = 0;
+  }
+  override async list(options: Parameters<FakeBucket["list"]>[0]) {
+    if (!options.include?.length || this.metadataLists++ === 0) return super.list(options);
+    await super.list({ ...options, prefix: "\u{10FFFF}" }); // counts the call
+    const after = options.cursor
+      ? Buffer.from(options.cursor, "base64url").toString("utf-8")
+      : (options.startAfter ?? "");
+    return { objects: [], truncated: true, cursor: Buffer.from(after).toString("base64url") };
+  }
+}
+
 test.describe("R2 calls of a listing", () => {
   test("12 uploads with 1,000 legacy download records each: listed in a few calls", async () => {
     const bucket = new FakeBucket();
@@ -151,6 +172,17 @@ test.describe("R2 calls of a listing", () => {
     const resumed = await listing(junk, stopped.resumeAfter);
     expect(resumed.truncated).toBe(false);
     expect(resumed.uploads.map((u) => u.id)).toEqual(["zzzzzz"]);
+  });
+
+  test("an upload of which only legacy records were listed is not stray", async () => {
+    const bucket = new FakeBucket();
+    seedUpload(bucket, idOf(0), { records: 500 });
+    bucket.resetCalls();
+    // One call: a page of `.downloads/` records, then the budget is spent.
+    const result = await new Uploads(bucket, PREFIX).listAll({ budget: 1 });
+    expect(result.uploads.map((u) => [u.id, u.complete, u.stray])).toEqual([
+      [idOf(0), false, false],
+    ]);
   });
 
   test("junk pages, then sidecars without a summary: resuming skips no upload", async () => {
@@ -258,6 +290,20 @@ test.describe("R2 calls of the cron", () => {
     }
     expect(cursors.at(-1)).toBeNull();
     expect(new Set(cursors).size).toBe(cursors.length); // always further, never stuck
+  });
+
+  test("short list pages: a current upload with legacy records is not deleted as stray", async () => {
+    const bucket = new StarvedBucket();
+    const meta = seedUpload(bucket, idOf(0), { records: 500 });
+    const fileKey = `${PREFIX}/${idOf(0)}/${meta.filename}`;
+    for (let run = 0; run < 3; run++) {
+      bucket.resetCalls();
+      const report = await runCleanup(bucket, PREFIX, NOW);
+      expect(report.subrequests).toBeLessThanOrEqual(CLEANUP_BUDGET);
+      expect(report.deleted).toBe(0);
+    }
+    expect(bucket.objects.has(fileKey)).toBe(true);
+    expect(bucket.objects.has(`${PREFIX}/${idOf(0)}/.meta.json`)).toBe(true);
   });
 
   test("junk pages, then sidecars without a summary: the cron gets to all of them", async () => {
