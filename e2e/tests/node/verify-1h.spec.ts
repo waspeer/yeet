@@ -41,13 +41,24 @@ class CheckedBucket extends StrictBucket {
  * One realistic sidecar per historic writer, as `JSON.stringify(meta, null, 2)`
  * (every writer pretty-printed), with the file it sits next to.
  */
-function historic(expires: number): Record<string, { meta: Record<string, unknown>; summary: boolean; file: boolean }> {
+function historic(
+  expires: number,
+): Record<string, { meta: Record<string, unknown>; summary: boolean; file: boolean }> {
   const up = iso(NOW - 3 * DAY);
   const exp = iso(expires);
   const downloads50 = Array.from({ length: 50 }, (_, i) => ({ at: iso(NOW - 2 * DAY + i * 1000) }));
   return {
     // yeet 0.1 CLI (cf7f56e .. 1d6a39c, rclone): no password.
-    cli01: { meta: { filename: "report final (v2).pdf", file_size: 123456, uploaded_at: up, expires_at: exp }, summary: false, file: true },
+    cli01: {
+      meta: {
+        filename: "report final (v2).pdf",
+        file_size: 123456,
+        uploaded_at: up,
+        expires_at: exp,
+      },
+      summary: false,
+      file: true,
+    },
     // yeet 0.1 CLI with an argon2id password hash.
     cli01pw: {
       meta: {
@@ -55,44 +66,129 @@ function historic(expires: number): Record<string, { meta: Record<string, unknow
         file_size: 9,
         uploaded_at: up,
         expires_at: exp,
-        password_hash: "$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHRzb21lc2FsdA$Zm9vYmFyYmF6cXV4Zm9vYmFyYmF6cXV4",
+        password_hash:
+          "$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHRzb21lc2FsdA$Zm9vYmFyYmF6cXV4Zm9vYmFyYmF6cXV4",
       },
       summary: false,
       file: true,
     },
     // yeet 0.1 CLI, an empty file.
-    cli01empty: { meta: { filename: "empty.txt", file_size: 0, uploaded_at: up, expires_at: exp }, summary: false, file: true },
+    cli01empty: {
+      meta: { filename: "empty.txt", file_size: 0, uploaded_at: up, expires_at: exp },
+      summary: false,
+      file: true,
+    },
     // yeet 0.2 server (a913cf5 .. 1d6a39c): downloads appended, last 50 kept.
-    srv02: { meta: { filename: "movie.mkv", file_size: 7_000_000_000, uploaded_at: up, expires_at: exp, downloads: downloads50 }, summary: false, file: true },
+    srv02: {
+      meta: {
+        filename: "movie.mkv",
+        file_size: 7_000_000_000,
+        uploaded_at: up,
+        expires_at: exp,
+        downloads: downloads50,
+      },
+      summary: false,
+      file: true,
+    },
     srv02pw: {
-      meta: { filename: "ünïcødé 文件.txt", file_size: 4, uploaded_at: up, expires_at: exp, password_hash: "$argon2id$v=19$m=65536,t=3,p=4$YQ$Yg", downloads: [{ at: iso(NOW - DAY) }] },
+      meta: {
+        filename: "ünïcødé 文件.txt",
+        file_size: 4,
+        uploaded_at: up,
+        expires_at: exp,
+        password_hash: "$argon2id$v=19$m=65536,t=3,p=4$YQ$Yg",
+        downloads: [{ at: iso(NOW - DAY) }],
+      },
       summary: false,
       file: true,
     },
     // yeet 0.1 CLI with a fractional/odd --expires (still an ISO string).
-    cliFarFuture: { meta: { filename: "far.bin", file_size: 1, uploaded_at: up, expires_at: expires > NOW ? "+010000-01-01T00:00:00.000Z" : exp }, summary: false, file: true },
+    cliFarFuture: {
+      meta: {
+        filename: "far.bin",
+        file_size: 1,
+        uploaded_at: up,
+        expires_at: expires > NOW ? "+010000-01-01T00:00:00.000Z" : exp,
+      },
+      summary: false,
+      file: true,
+    },
     // Worker feb7b2f: finished upload with summary.
-    wFeb: { meta: { filename: "a.bin", file_size: 3, uploaded_at: up, expires_at: exp, password_hash: "pbkdf2-sha256$100000$c2FsdA$aGFzaA" }, summary: true, file: true },
+    wFeb: {
+      meta: {
+        filename: "a.bin",
+        file_size: 3,
+        uploaded_at: up,
+        expires_at: exp,
+        password_hash: "pbkdf2-sha256$100000$c2FsdA$aGFzaA",
+      },
+      summary: true,
+      file: true,
+    },
     // Worker 1B..1E: download_count folded, legacy downloads dropped (b858bb3).
-    w1E: { meta: { filename: "b.bin", file_size: 3, uploaded_at: up, expires_at: exp, download_count: 1234, recent_downloads: [iso(NOW - 5000), iso(NOW - 4000)] }, summary: true, file: true },
+    w1E: {
+      meta: {
+        filename: "b.bin",
+        file_size: 3,
+        uploaded_at: up,
+        expires_at: exp,
+        download_count: 1234,
+        recent_downloads: [iso(NOW - 5000), iso(NOW - 4000)],
+      },
+      summary: true,
+      file: true,
+    },
     // Worker 1F+ (current writeMeta): download_count, recent_downloads (5).
     wNow: {
-      meta: { filename: "c.bin", file_size: 3, uploaded_at: up, expires_at: exp, download_count: 7, recent_downloads: [1, 2, 3, 4, 5].map((i) => iso(NOW - i * 1000)) },
+      meta: {
+        filename: "c.bin",
+        file_size: 3,
+        uploaded_at: up,
+        expires_at: exp,
+        download_count: 7,
+        recent_downloads: [1, 2, 3, 4, 5].map((i) => iso(NOW - i * 1000)),
+      },
       summary: true,
       file: true,
     },
     // Worker: still pending, size declared (feb7b2f+) and unknown (c1056ac+).
-    wPendSize: { meta: { filename: "p.bin", file_size: 10, uploaded_at: up, expires_at: exp, pending_upload_id: "mp-1" }, summary: true, file: false },
-    wPendNoSize: { meta: { filename: "q.bin", uploaded_at: up, expires_at: exp, pending_upload_id: "mp-2" }, summary: true, file: false },
+    wPendSize: {
+      meta: {
+        filename: "p.bin",
+        file_size: 10,
+        uploaded_at: up,
+        expires_at: exp,
+        pending_upload_id: "mp-1",
+      },
+      summary: true,
+      file: false,
+    },
+    wPendNoSize: {
+      meta: { filename: "q.bin", uploaded_at: up, expires_at: exp, pending_upload_id: "mp-2" },
+      summary: true,
+      file: false,
+    },
     // A finished sidecar without file_size (readers default it to 0).
-    wNoSize: { meta: { filename: "r.bin", uploaded_at: up, expires_at: exp }, summary: false, file: true },
+    wNoSize: {
+      meta: { filename: "r.bin", uploaded_at: up, expires_at: exp },
+      summary: false,
+      file: true,
+    },
   };
 }
 
-function seed(b: StrictBucket, id: string, s: { meta: Record<string, unknown>; summary: boolean; file: boolean }) {
+function seed(
+  b: StrictBucket,
+  id: string,
+  s: { meta: Record<string, unknown>; summary: boolean; file: boolean },
+) {
   const meta = s.meta as unknown as UploadMeta;
   if (s.file) b.seed(`${P}/${id}/${meta.filename}`, "xyz");
-  b.seed(`${P}/${id}/.meta.json`, JSON.stringify(meta, null, 2), s.summary ? { summary: JSON.stringify(summarize(meta)) } : {});
+  b.seed(
+    `${P}/${id}/.meta.json`,
+    JSON.stringify(meta, null, 2),
+    s.summary ? { summary: JSON.stringify(summarize(meta)) } : {},
+  );
 }
 
 test.describe("1H verifier: historic sidecar formats", () => {
@@ -151,8 +247,14 @@ test.describe("1H verifier: historic sidecar formats", () => {
 });
 
 test.describe("1H verifier: MAX_SUMMARY_BYTES", () => {
-  const base: UploadMeta = { filename: "", file_size: 3, uploaded_at: iso(NOW - DAY), expires_at: iso(NOW + DAY) };
-  const total = (m: UploadMeta) => Buffer.byteLength("summary") + Buffer.byteLength(JSON.stringify(summarize(m)));
+  const base: UploadMeta = {
+    filename: "",
+    file_size: 3,
+    uploaded_at: iso(NOW - DAY),
+    expires_at: iso(NOW + DAY),
+  };
+  const total = (m: UploadMeta) =>
+    Buffer.byteLength("summary") + Buffer.byteLength(JSON.stringify(summarize(m)));
   const empty = total(base);
 
   test("exactly the cap is stored, one byte more is not (ASCII)", async () => {
@@ -176,7 +278,9 @@ test.describe("1H verifier: MAX_SUMMARY_BYTES", () => {
     const e1 = { ...base, filename: "é".repeat(Math.floor(room / 2) + 1) };
     expect(canStoreSummary(e)).toBe(true);
     expect(canStoreSummary(e1)).toBe(false);
-    expect(JSON.stringify(summarize(e1)).length + "summary".length).toBeLessThanOrEqual(MAX_SUMMARY_BYTES);
+    expect(JSON.stringify(summarize(e1)).length + "summary".length).toBeLessThanOrEqual(
+      MAX_SUMMARY_BYTES,
+    );
     const emoji = { ...base, filename: "😀".repeat(Math.floor(room / 4) + 1) };
     expect(JSON.stringify(summarize(emoji)).length + 7).toBeLessThan(MAX_SUMMARY_BYTES);
     expect(canStoreSummary(emoji)).toBe(false);
@@ -199,7 +303,10 @@ test.describe("1H verifier: MAX_SUMMARY_BYTES", () => {
     expect(JSON.parse(sc.body).download_count).toBe(1);
     expect(sc.meta).toEqual({});
     // Expire it: the cron deletes it without ever writing a summary.
-    b.seed(`${P}/big/.meta.json`, JSON.stringify({ ...base, filename: long, expires_at: iso(NOW - 1) }));
+    b.seed(
+      `${P}/big/.meta.json`,
+      JSON.stringify({ ...base, filename: long, expires_at: iso(NOW - 1) }),
+    );
     b.reset();
     b.maxCalls = CLEANUP_BUDGET;
     const r = await runCleanup(b, P, NOW);
@@ -214,10 +321,16 @@ test.describe("1H verifier: MAX_SUMMARY_BYTES", () => {
     const long = "z".repeat(3000);
     for (let i = 0; i < 60; i++) {
       b.seed(`${P}/a${String(i).padStart(3, "0")}/f`, "x");
-      b.seed(`${P}/a${String(i).padStart(3, "0")}/.meta.json`, JSON.stringify({ ...base, filename: long }));
+      b.seed(
+        `${P}/a${String(i).padStart(3, "0")}/.meta.json`,
+        JSON.stringify({ ...base, filename: long }),
+      );
     }
     b.seed(`${P}/zz/f.bin`, "x");
-    b.seed(`${P}/zz/.meta.json`, JSON.stringify({ ...base, filename: "f.bin", expires_at: iso(NOW - 1) }));
+    b.seed(
+      `${P}/zz/.meta.json`,
+      JSON.stringify({ ...base, filename: "f.bin", expires_at: iso(NOW - 1) }),
+    );
     let runs = 0;
     while (b.sorted(`${P}/zz/`).length > 0 && runs < 20) {
       b.reset();
@@ -272,7 +385,11 @@ test.describe("1H verifier: readPartSizes budget and deleteUnder on short pages"
   test("readPartSizes never makes more than its budget, and a result fits the budget with its deletes", async () => {
     for (const seedNo of [1, 2, 3, 4, 5, 6]) {
       for (const parts of [0, 1, 99, 100, 101, 999, 1000, 1001, 2500, 4100, 4101]) {
-        const b = new StrictBucket({ randomPages: true, seed: seedNo * 1000 + parts, maxCalls: 100_000 });
+        const b = new StrictBucket({
+          randomPages: true,
+          seed: seedNo * 1000 + parts,
+          maxCalls: 100_000,
+        });
         for (let n = 1; n <= parts; n++) b.seed(`${P}/x/.parts/${n}`, "", { size: "5" });
         const u = new Uploads(b, P);
         const r = await u.readPartSizes("x", PART_RECORDS_BUDGET);
@@ -280,7 +397,9 @@ test.describe("1H verifier: readPartSizes budget and deleteUnder on short pages"
         expect(lists, `${seedNo}/${parts}`).toBeLessThanOrEqual(PART_RECORDS_BUDGET);
         if (r) {
           expect(r.keys).toHaveLength(parts);
-          expect(lists + Math.ceil(parts / 1000), `${seedNo}/${parts}`).toBeLessThanOrEqual(PART_RECORDS_BUDGET);
+          expect(lists + Math.ceil(parts / 1000), `${seedNo}/${parts}`).toBeLessThanOrEqual(
+            PART_RECORDS_BUDGET,
+          );
         }
       }
     }
@@ -361,7 +480,12 @@ test.describe("1H verifier: edges the first mutation run missed", () => {
   test("writeMeta of a malformed sidecar (e.g. a pending one completed) writes it without a summary instead of throwing", async () => {
     const b = new StrictBucket();
     const u = new Uploads(b, P);
-    const meta = { filename: "f", uploaded_at: iso(NOW), expires_at: iso(NOW + DAY), downloads: 5 } as unknown as UploadMeta;
+    const meta = {
+      filename: "f",
+      uploaded_at: iso(NOW),
+      expires_at: iso(NOW + DAY),
+      downloads: 5,
+    } as unknown as UploadMeta;
     expect(await u.writeMeta("x", meta)).toBe(true);
     expect(b.objects.get(`${P}/x/.meta.json`)!.meta).toEqual({});
   });
