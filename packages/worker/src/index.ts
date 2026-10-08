@@ -26,6 +26,7 @@ import {
   RULES,
   type RateLimitResult,
 } from "./rate-limit.js";
+import { isBearerAttempt, parseExpiry } from "./parse.js";
 import { formatRange, parseRange } from "./range.js";
 import { withOptionalSentry } from "./sentry.js";
 import {
@@ -189,7 +190,7 @@ api.use("*", async (c, next) => {
   // origin checks. Every attempt is checked against the failure limit before
   // its result is revealed, and only wrong tokens count.
   const authorization = c.req.header("Authorization");
-  if (authorization !== undefined) {
+  if (isBearerAttempt(authorization)) {
     const valid = await isAuthorized(authorization, token);
     const limit = await rateLimit(c.env.RATE_LIMITER, RULES.bearer, clientIp(c), !valid);
     if (!limit.allowed) {
@@ -293,8 +294,10 @@ function expectedPartLength(size: number, partNumber: number): number | null {
 // PUT /api/uploads/:id/parts/:number — one part of the file as the raw body
 api.put("/uploads/:id/parts/:number", async (c) => {
   const { id } = c.req.param();
-  const partNumber = Number(c.req.param("number"));
-  if (!isValidId(id) || !Number.isInteger(partNumber) || partNumber < 1 || partNumber > 10_000) {
+  // Plain decimal digits only: no "1.0", "0x1" or "01" for part 1.
+  const rawPart = c.req.param("number");
+  const partNumber = /^[1-9]\d{0,4}$/.test(rawPart) ? Number(rawPart) : NaN;
+  if (!isValidId(id) || !(partNumber <= 10_000)) {
     return c.json({ error: "Invalid upload or part number" }, 400);
   }
 
@@ -520,7 +523,8 @@ app.get("/", (c) => c.html(landingPage()));
 // password check hands out. Registered before /:id/:filename? so it wins.
 app.get("/_dl/:id", async (c) => {
   const { id } = c.req.param();
-  const expires = Number(c.req.query("expires"));
+  // Spelled exactly as signed (plain digits), or the link is invalid.
+  const expires = parseExpiry(c.req.query("expires")) ?? NaN;
   const signature = c.req.query("sig") ?? "";
   const token = c.env.UPLOAD_TOKEN ?? "";
   if (!isValidId(id) || !(await verifyDownload(token, id, expires, signature))) {

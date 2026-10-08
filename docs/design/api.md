@@ -262,11 +262,17 @@ Evaluated on the Free plan:
 ### What counts as a failure
 
 - **Bearer:** only requests that carry an `Authorization` header with a wrong
-  value. Requests without any credentials, or with an invalid session cookie,
-  are not guesses at the token (a session signature cannot be guessed) and
-  are not counted.
-- **Both credentials:** if an `Authorization` header is present, it alone
-  decides. A wrong one gets 401 even with a valid session cookie.
+  value, an empty value included (`isBearerAttempt()`). Requests without any
+  credentials, or with an invalid session cookie, are not guesses at the
+  token (a session signature cannot be guessed) and are not counted.
+- **Both credentials:** if an `Authorization` header is present, even empty,
+  it alone decides. A wrong or empty one gets 401 (and counts) even with a
+  valid session cookie.
+  - `wrangler dev` removes an empty `Authorization` header before the Worker
+    sees it (an empty header of another name arrives), so locally such a
+    request falls back to the session cookie. Whether Cloudflare's edge
+    passes it on is not verified; if it does, the rule above applies. The
+    decision is unit-tested in `e2e/tests/node/parsing.spec.ts`.
 - **Login:** an empty or wrong token counts.
 - **Cross-origin refusals** (403) happen before any check and do not count.
 
@@ -303,6 +309,20 @@ Evaluated on the Free plan:
 - **`/_dl/:id`:** refuses protected files (500) with a weak token. With a
   missing or short token anyone could sign download links.
 - **Unprotected files:** keep working, including their download links.
+
+### Strict parsing
+
+Numbers that are signed or used as keys must be spelled one way only:
+
+- **Expiry fields** of the session cookie, the download pass and the
+  `expires` of a signed `/_dl` link: a positive decimal integer of at most 12
+  digits without leading zeros (`^[1-9]\d{0,11}$`). The signatures cover the
+  number, so before, `0<expires>`, `<expires>.0` or a hex spelling (for the
+  link) of a genuine value passed as the same one. Anything else is an
+  invalid cookie (no session, no pass) or a 403 link.
+- **Part numbers** in `PUT /api/uploads/:id/parts/:n`: `^[1-9]\d*$` and at
+  most 10,000. `1.0`, `0x1`, `01`, `+1`, `1e0` are
+  `400 {"error": "Invalid upload or part number"}` instead of part 1.
 
 ### Upload API
 

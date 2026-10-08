@@ -240,6 +240,8 @@ test.describe("session cookie on /api", () => {
     const rejected = {
       "flipped signature": `yeet_session=v1.${expires}.${flip(sig!)}`,
       "later expiry, same signature": `yeet_session=v1.${Number(expires) + 1}.${sig}`,
+      // Same number, another spelling: the signature covers the number only.
+      "leading zero in the expiry": `yeet_session=v1.0${expires}.${sig}`,
       "expired, correctly signed": forgeSession(now - 10),
       "signed with another token": forgeSession(now + DAY, `${server.token}-other`),
       "wrong version": `yeet_session=v2.${expires}.${sig}`,

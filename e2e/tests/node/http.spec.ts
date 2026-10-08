@@ -153,6 +153,23 @@ test.describe("signed download link", () => {
     expect(open.headers.get("content-range")).toBe("bytes */0");
   });
 
+  test("a signed link's expiry must be plain digits, as signed", async () => {
+    const link = new URL(await signedDownloadUrl(shareUrl));
+    const expires = link.searchParams.get("expires")!;
+    for (const spelling of [
+      `0${expires}`,
+      `${expires}.0`,
+      `0x${Number(expires).toString(16)}`,
+      `${Number(expires) / 1e9}e9`,
+      ` ${expires}`,
+    ]) {
+      const variant = new URL(link);
+      variant.searchParams.set("expires", spelling);
+      expect((await fetch(variant)).status, `expires=${spelling}`).toBe(403);
+    }
+    expect((await fetch(link)).status).toBe(200);
+  });
+
   test("a tampered signature or expiry returns 403", async () => {
     const link = new URL(await signedDownloadUrl(shareUrl));
     const sig = link.searchParams.get("sig")!;

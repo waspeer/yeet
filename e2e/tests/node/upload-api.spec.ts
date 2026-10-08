@@ -138,6 +138,20 @@ test.describe("upload API", () => {
     expect((await fetch(`${server.baseURL}/${id}/liar.bin`)).status).toBe(404);
   });
 
+  test("a part number must be plain decimal digits without leading zeros", async () => {
+    const id = await create({ filename: "part-numbers.bin" });
+    for (const n of ["1.0", "0x1", "01", "+1", "1e0", " 1", "0", "10001"]) {
+      const res = await api(`/api/uploads/${id}/parts/${encodeURIComponent(n)}`, {
+        method: "PUT",
+        body: "x",
+      });
+      expect(res.status, `part "${n}"`).toBe(400);
+      expect(await res.json(), `part "${n}"`).toEqual({ error: "Invalid upload or part number" });
+    }
+    expect((await putPart(id, 1, Buffer.from("x"))).status).toBe(200);
+    expect((await api(`/api/uploads/${id}`, { method: "DELETE" })).status).toBe(200);
+  });
+
   test("a part without Content-Length is refused with 411", async () => {
     const id = await create({ filename: "chunked.bin" });
     const stream = new ReadableStream({
