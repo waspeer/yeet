@@ -102,6 +102,12 @@ test.describe("signed download link", () => {
       ["bytes=-5", 0, 4],
       ["bytes=-10", 0, 4], // a suffix longer than the file is the whole file
       ["BYTES=1-2", 1, 2], // the unit is case-insensitive
+      // Numbers too big for a double still mean "past the end": never 1e+23.
+      ["bytes=0-99999999999999999999999", 0, 4],
+      ["bytes=2-99999999999999999999999", 2, 4],
+      ["bytes=1-9007199254740993", 1, 4],
+      ["bytes=-99999999999999999999999", 0, 4],
+      ["bytes=000001-0000003", 1, 3], // leading zeros
     ] as const) {
       test(`"${range}" returns 206 with bytes ${start}-${end}`, async () => {
         const res = await fetch(link, { headers: { Range: range } });
@@ -114,7 +120,15 @@ test.describe("signed download link", () => {
       });
     }
 
-    for (const range of ["bytes=5-", "bytes=5-9", "bytes=99-", "bytes=-0"]) {
+    for (const range of [
+      "bytes=5-",
+      "bytes=5-9",
+      "bytes=99-",
+      "bytes=-0",
+      "bytes=99999999999999999999999-",
+      "bytes=99999999999999999999999-99999999999999999999999",
+      "bytes=-00",
+    ]) {
       test(`"${range}" is unsatisfiable: 416`, async () => {
         const res = await fetch(link, { headers: { Range: range } });
         expect(res.status).toBe(416);

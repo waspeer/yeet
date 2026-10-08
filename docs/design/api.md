@@ -427,6 +427,13 @@ a normalized header. Following RFC 9110 §14:
 - **Unsatisfiable (416, `Content-Range: bytes */<size>`):** a first position
   at or past the end (`bytes=5-` on a 5-byte file, any first position on an
   empty file), or `bytes=-0`.
+- **Huge numbers:** any number of digits is valid. Positions above
+  `Number.MAX_SAFE_INTEGER` (8 PiB, past the end of any object) are clamped
+  to it, so the range R2 gets is always plain decimal integers
+  (`bytes=0-99999999999999999999999` reaches R2 as `bytes=0-9007199254740991`,
+  never `bytes=0-1e+23`, which R2 ignored and answered with the whole file
+  under a `Content-Range` for part of it). Parsing and formatting live in
+  `packages/worker/src/range.ts`.
 
 ### Sentry
 

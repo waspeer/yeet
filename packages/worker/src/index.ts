@@ -26,6 +26,7 @@ import {
   RULES,
   type RateLimitResult,
 } from "./rate-limit.js";
+import { formatRange, parseRange } from "./range.js";
 import { withOptionalSentry } from "./sentry.js";
 import {
   downloadPage,
@@ -498,33 +499,6 @@ app.post("/logout", (c) => {
 app.get("/health", (c) => c.json({ status: "ok" }));
 
 app.get("/", (c) => c.html(landingPage()));
-
-/**
- * A single byte range: `bytes=<start>-[<end>]`, or `bytes=-<suffix>` (the last
- * `suffix` bytes).
- */
-type ByteRange = { start: number; end?: number } | { suffix: number };
-
-/**
- * The byte range of a Range header, or null to ignore the header and serve
- * the whole file (200). RFC 9110 §14.2 lets a server ignore a Range header it
- * finds invalid (bad syntax, a last position before the first) or does not
- * support (several ranges, another unit).
- */
-function parseRange(header: string | undefined): ByteRange | null {
-  const match = header?.match(/^bytes=[ \t]*(\d*)-(\d*)[ \t]*$/i);
-  if (!match) return null;
-  const [, first = "", last = ""] = match;
-  if (first === "") return last === "" ? null : { suffix: Number(last) };
-  const start = Number(first);
-  if (last === "") return { start };
-  const end = Number(last);
-  return end >= start ? { start, end } : null;
-}
-
-function formatRange(range: ByteRange): string {
-  return "suffix" in range ? `bytes=-${range.suffix}` : `bytes=${range.start}-${range.end ?? ""}`;
-}
 
 // GET /_dl/:id — the file itself, behind a short-lived signed link that the
 // password check hands out. Registered before /:id/:filename? so it wins.
