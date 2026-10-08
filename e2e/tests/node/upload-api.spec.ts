@@ -58,12 +58,13 @@ test.describe("upload API", () => {
 
     expect((await readUploadMeta(id))?.file_size).toBe(12_345);
     expect((await listUploads()).find((u) => u.id === id)?.file_size).toBe(12_345);
-    expect((await downloadBytes(url)).equals(data)).toBe(true);
-    // The part-size records are gone once complete.
+    // The part-size records are gone once complete. (Checked before the
+    // download, which adds a download record.)
     expect((await uploadObjects(id)).map((o) => o.key).sort()).toEqual([
       `uploads/${id}/.meta.json`,
       `uploads/${id}/no-size.bin`,
     ]);
+    expect((await downloadBytes(url)).equals(data)).toBe(true);
   });
 
   test("a size given at create or complete is checked against the stored object", async () => {

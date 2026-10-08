@@ -99,6 +99,8 @@ export function layout(title: string, body: string): string {
 }
 
 export function downloadPage(opts: {
+  /** The upload ID; the form posts to /<id>/download whether the page is at /<id> or /<id>/<filename>. */
+  id: string;
   filename: string;
   fileSize: number;
   expiresAt: string;
@@ -107,19 +109,20 @@ export function downloadPage(opts: {
   /** Shown instead of the wrong-password message, e.g. when rate-limited. */
   errorMessage?: string;
 }): string {
-  const { filename, fileSize, expiresAt, hasPassword, passwordError, errorMessage } = opts;
+  const { id, filename, fileSize, expiresAt, hasPassword, passwordError, errorMessage } = opts;
+  const action = `/${encodeURIComponent(id)}/download`;
   const error = errorMessage ?? (passwordError ? "Incorrect password. Please try again." : null);
   const meta = `${formatBytes(fileSize)}<br>Expires ${formatExpiry(expiresAt)}`;
 
   const actionBlock = hasPassword
-    ? `<form method="POST" action="download">
+    ? `<form method="POST" action="${action}">
         ${error ? `<div class="error">${escHtml(error)}</div>` : ""}
         <label for="pw">Password required</label>
         <input type="password" id="pw" name="password" autofocus placeholder="Enter password">
         <div class="center"><button type="submit" class="primary">Download</button></div>
       </form>`
     : `<div class="center">
-        <form method="POST" action="download">
+        <form method="POST" action="${action}">
           <button type="submit" class="primary">Download</button>
         </form>
       </div>`;

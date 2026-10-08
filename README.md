@@ -118,6 +118,8 @@ must be managed by Cloudflare. Then run `yeet login https://dl.example.com`.
 
 Files live in the bucket as `uploads/<id>/<filename>`, next to a small
 `uploads/<id>/.meta.json` with the name, size, expiry and password hash.
+Each download adds an empty `uploads/<id>/.downloads/<time>_<random>` object;
+that is how downloads are counted.
 
 ## Security notes
 

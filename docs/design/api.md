@@ -307,6 +307,66 @@ Evaluated on the Free plan:
 - **Rate-limited:** the page shows the form with "Too many attempts. Try again
   in N seconds." (`429`, `Retry-After`).
 
+### Download count: one object per download
+
+`recordDownload` used to read `.meta.json`, append the download and write it
+back in `waitUntil`. Downloads close together read the same sidecar and
+overwrote each other's record (on real Cloudflare 6 downloads were counted as
+5; under `wrangler dev`, 10 at once as 2). It also kept only the last 50
+records, so the count never went past 50. Evaluated:
+
+- **Conditional writes** (`put` with `onlyIf: { etagMatches }`, re-read and
+  retry on a conflict). Exact only while the retries last: with n concurrent
+  downloads the last one needs up to n rounds of get + put, so a burst either
+  exceeds the 50-subrequest budget or, with a retry cap, loses counts again.
+- **A Durable Object per upload** that serializes the read-modify-write. Exact,
+  but a second DO class (and migration), one DO request per download against
+  the daily quota the rate limiter also uses, and the DO would still have to
+  write the sidecar, so listing stays as it is.
+- **One empty object per download** (chosen). `<prefix>/<id>/.downloads/<at>_<random>`,
+  with `<at>` the ISO 8601 time and 8 random hex digits. Every download writes
+  its own key, so nothing can be lost; it is one `put` (one subrequest, the
+  same as the old sidecar write, minus the read) and no extra CPU.
+
+How the rest follows:
+
+- **Listing:** `listAll()` already lists every object under the prefix (one
+  call per 1000 objects, with custom metadata). It counts each upload's
+  `.downloads/` objects in that same pass and adds them to the summary:
+  `download_count` = the sidecar's count + the records, `recent_downloads` =
+  the last five of both (keys list in time order). No extra subrequests per
+  upload. The cost: each download is one more object in the listing, so 1000
+  downloads cost one more list call. Within the 50-subrequest budget this
+  allows roughly 49,000 objects (uploads × 2 plus downloads) before
+  `GET /api/uploads` or the cleanup would run out; ample for a personal
+  share service, and deleting or expiring an upload removes its records.
+- **Delete and cleanup:** both already delete every object under
+  `<prefix>/<id>/`, records included. Records without an upload (a download
+  that raced a delete or expiry) are listed as `stray`: `listAll()` reads no
+  sidecar for them, `GET /api/uploads` omits them and the cleanup deletes them.
+- **Compatibility:** sidecars keep `downloads` from earlier versions, which is
+  no longer written. Their count still shows (summary or sidecar), and new
+  records add to it; the cap of 50 no longer applies to new downloads. A file
+  named `.downloads` is a different key (`<id>/.downloads`, no slash) and is
+  not mistaken for a record.
+
+### Range requests on `/_dl/:id`
+
+The Worker parses `Range` itself and only passes R2 a range it accepted, as
+a normalized header. Following RFC 9110 §14:
+
+- **Served (206):** one range, `bytes=<first>-<last>`, `bytes=<first>-` or
+  `bytes=-<suffix>` (unit case-insensitive). A last position past the end is
+  clamped, a suffix longer than the file is the whole file. `Content-Range`
+  and `Content-Length` describe exactly the bytes sent.
+- **Ignored (200 with the whole file, no `Content-Range`):** anything else —
+  invalid syntax (`bytes=abc`, `bytes=-`), a last position before the first
+  (`bytes=3-1`), several ranges (`bytes=0-1,3-4`, not supported) or another
+  unit. Also a suffix range on an empty file, which has no bytes to address.
+- **Unsatisfiable (416, `Content-Range: bytes */<size>`):** a first position
+  at or past the end (`bytes=5-` on a 5-byte file, any first position on an
+  empty file), or `bytes=-0`.
+
 ### Sentry
 
 - **Loading:** `@sentry/cloudflare` is imported dynamically. The bundle

@@ -210,9 +210,22 @@ class ApiError extends Error {
   constructor(
     message: string,
     readonly status: number,
+    /** The message without advice to run `yeet login`, for `yeet login` itself. */
+    readonly forLogin = message,
   ) {
     super(message);
   }
+}
+
+/**
+ * The server refuses every token from this address for a while after too many
+ * wrong ones (429). Seconds to wait come from Retry-After, or the error text.
+ */
+function tooManyAttempts(res: Response, error: string | undefined): string {
+  const seconds =
+    Number(res.headers.get("Retry-After")) || Number(error?.match(/(\d+)\s*s\b/)?.[1]) || 0;
+  const wait = seconds > 0 ? `in ${seconds} second${seconds === 1 ? "" : "s"}` : "later";
+  return `Too many wrong upload tokens were tried from this address. Try again ${wait}.`;
 }
 
 /** Call the server API and parse the JSON response, with readable errors. */
@@ -250,10 +263,19 @@ async function api<T>(
   }
 
   if (!res.ok) {
+    const message = (data as { error?: string } | undefined)?.error;
+    // `yeet login` words these two without the advice to run itself (see login()).
     if (res.status === 401) {
       throw new ApiError("The server rejected the upload token. Run `yeet login` again.", 401);
     }
-    const message = (data as { error?: string } | undefined)?.error;
+    if (res.status === 429) {
+      const tooMany = tooManyAttempts(res, message);
+      throw new ApiError(
+        `${tooMany} If your token is wrong, run \`yeet login\` again after that.`,
+        429,
+        tooMany,
+      );
+    }
     if (res.status === 404 && message === undefined) {
       throw new ApiError(`${config.url} does not look like a yeet server (404 on ${path})`, 404);
     }
@@ -356,7 +378,10 @@ async function login(urlArg: string | undefined): Promise<void> {
   try {
     await api({ url, token }, "GET", "/me");
   } catch (err) {
-    die(err instanceof Error ? err.message : String(err));
+    if (err instanceof ApiError && err.status === 401) {
+      die(`That upload token is not correct for ${url}. Check it and try again.`);
+    }
+    die(err instanceof ApiError ? err.forLogin : err instanceof Error ? err.message : String(err));
   }
 
   writeStoredConfig({ ...readStoredConfig(), url, token });

@@ -485,6 +485,33 @@ app.get("/health", (c) => c.json({ status: "ok" }));
 
 app.get("/", (c) => c.html(landingPage()));
 
+/**
+ * A single byte range: `bytes=<start>-[<end>]`, or `bytes=-<suffix>` (the last
+ * `suffix` bytes).
+ */
+type ByteRange = { start: number; end?: number } | { suffix: number };
+
+/**
+ * The byte range of a Range header, or null to ignore the header and serve
+ * the whole file (200). RFC 9110 §14.2 lets a server ignore a Range header it
+ * finds invalid (bad syntax, a last position before the first) or does not
+ * support (several ranges, another unit).
+ */
+function parseRange(header: string | undefined): ByteRange | null {
+  const match = header?.match(/^bytes=[ \t]*(\d*)-(\d*)[ \t]*$/i);
+  if (!match) return null;
+  const [, first = "", last = ""] = match;
+  if (first === "") return last === "" ? null : { suffix: Number(last) };
+  const start = Number(first);
+  if (last === "") return { start };
+  const end = Number(last);
+  return end >= start ? { start, end } : null;
+}
+
+function formatRange(range: ByteRange): string {
+  return "suffix" in range ? `bytes=-${range.suffix}` : `bytes=${range.start}-${range.end ?? ""}`;
+}
+
 // GET /_dl/:id — the file itself, behind a short-lived signed link that the
 // password check hands out. Registered before /:id/:filename? so it wins.
 app.get("/_dl/:id", async (c) => {
@@ -504,24 +531,34 @@ app.get("/_dl/:id", async (c) => {
     return c.html(errorPage(TOKEN_TOO_SHORT), 500);
   }
 
+  const key = uploads.fileKey(id, meta.filename);
+  const range = parseRange(c.req.header("Range"));
+  const unsatisfiable = async (size?: number): Promise<Response> => {
+    size ??= (await c.env.BUCKET.head(key))?.size;
+    return new Response(null, {
+      status: 416,
+      headers: size === undefined ? {} : { "Content-Range": `bytes */${size}` },
+    });
+  };
+  if (range && "suffix" in range && range.suffix === 0) return unsatisfiable();
+
   let object: R2ObjectBody | R2Object | null;
   try {
-    object = await c.env.BUCKET.get(uploads.fileKey(id, meta.filename), {
-      range: c.req.raw.headers,
-    });
+    // R2 gets the parsed range as a normalized header, so it applies HTTP's
+    // rules (e.g. clamping a last position past the end) to exactly that.
+    object = await c.env.BUCKET.get(
+      key,
+      range ? { range: new Headers({ Range: formatRange(range) }) } : {},
+    );
   } catch {
-    return new Response(null, { status: 416 });
+    return unsatisfiable();
   }
   if (!object || !("body" in object)) return c.html(notFoundPage(), 404);
 
   // A range starting past the end is unsatisfiable; R2 would serve the whole file.
-  const rangeStart = c.req.header("Range")?.match(/^bytes=(\d+)-/)?.[1];
-  if (rangeStart !== undefined && Number(rangeStart) >= object.size) {
+  if (range && "start" in range && range.start >= object.size) {
     await object.body.cancel();
-    return new Response(null, {
-      status: 416,
-      headers: { "Content-Range": `bytes */${object.size}` },
-    });
+    return unsatisfiable(object.size);
   }
 
   const headers = new Headers();
@@ -535,18 +572,15 @@ app.get("/_dl/:id", async (c) => {
   headers.set("Cache-Control", "private, no-store");
   if (!headers.has("Content-Type")) headers.set("Content-Type", "application/octet-stream");
 
-  const range = object.range;
-  if (c.req.header("Range") && range) {
-    const offset =
-      "suffix" in range && range.suffix !== undefined
-        ? object.size - range.suffix
-        : ((range as { offset?: number }).offset ?? 0);
-    const length =
-      "suffix" in range && range.suffix !== undefined
-        ? range.suffix
-        : ((range as { length?: number }).length ?? object.size - offset);
-    headers.set("Content-Range", `bytes ${offset}-${offset + length - 1}/${object.size}`);
-    headers.set("Content-Length", String(length));
+  // An empty file has no bytes to address; it is served whole.
+  if (range && object.size > 0) {
+    const last = object.size - 1;
+    const [first, end] =
+      "suffix" in range
+        ? [Math.max(0, object.size - range.suffix), last]
+        : [range.start, Math.min(range.end ?? last, last)];
+    headers.set("Content-Range", `bytes ${first}-${end}/${object.size}`);
+    headers.set("Content-Length", String(end - first + 1));
     return new Response(object.body, { status: 206, headers });
   }
 
@@ -584,6 +618,7 @@ app.get("/:id/:filename?", async (c) => {
 
   return c.html(
     downloadPage({
+      id,
       filename: meta.filename,
       fileSize: meta.file_size ?? 0,
       expiresAt: meta.expires_at,
@@ -631,6 +666,7 @@ app.post("/:id/download", async (c) => {
       const page = (status: 401 | 429, errorMessage: string) =>
         c.html(
           downloadPage({
+            id,
             filename: meta.filename,
             fileSize: meta.file_size ?? 0,
             expiresAt: meta.expires_at,
@@ -674,7 +710,7 @@ app.post("/:id/download", async (c) => {
 
   // Record the download without holding up the redirect.
   c.executionCtx.waitUntil(
-    uploads.recordDownload(id, meta).catch((err) => {
+    uploads.recordDownload(id).catch((err) => {
       console.error(`[download] Failed to record download for ${id}:`, err);
     }),
   );
@@ -700,7 +736,8 @@ app.onError((err, c) => {
 
 async function runCleanup(env: Env): Promise<void> {
   const uploads = new Uploads(env.BUCKET, env.UPLOADS_PREFIX || "uploads");
-  const stale = (await uploads.listAll()).filter(({ meta }) => {
+  const stale = (await uploads.listAll()).filter(({ meta, stray }) => {
+    if (stray) return true; // download records without an upload
     if (!meta) return false; // unreadable sidecar: leave it for a human
     const abandoned =
       !!meta.pending_upload_id &&

@@ -7,6 +7,8 @@ import {
   expect,
   forgeDownloadUrl,
   listUploads,
+  putObject,
+  randomId,
   readUploadMeta,
   seedLegacyUpload,
   server,
@@ -64,8 +66,10 @@ test.describe("expiry at request time (no cron)", () => {
 
       await waitUntilExpired(forForm.id);
       // Still in the bucket: what follows is the request-time check, not cleanup.
+      // (forDl also has a download record, `.downloads/…`.)
       for (const { id } of [forDl, forPage, forForm]) {
-        expect(await uploadObjects(id)).toHaveLength(2);
+        const keys = (await uploadObjects(id)).map((o) => o.key);
+        expect(keys.filter((key) => !key.includes("/.downloads/"))).toHaveLength(2);
       }
 
       // /_dl does not delete anything, so check it first.
@@ -105,6 +109,31 @@ test.describe("daily cleanup (cron)", () => {
       await eventually(gone(id), { message: `cleanup to delete uploads/${id}/` });
       expect((await listUploads()).map((u) => u.id)).not.toContain(id);
       expect((await fetch(url)).status).toBe(404);
+    }));
+
+  test("removes the download records of an expired upload, and stray ones", () =>
+    exclusive("cron", async () => {
+      const { id, url } = await uploadViaApi({
+        filename: "downloaded.bin",
+        data: randomBytes(256),
+        expiresInSeconds: 3,
+      });
+      for (let i = 0; i < 2; i++) expect((await submitDownloadForm(url)).status).toBe(303);
+      await eventually(
+        async () => (await listUploads()).find((u) => u.id === id)?.download_count === 2,
+        { message: "download_count 2" },
+      );
+
+      // Download records without an upload, as a download racing a delete can leave.
+      const stray = randomId();
+      const strayKey = `uploads/${stray}/.downloads/${new Date().toISOString()}_0a1b2c3d`;
+      await putObject(strayKey, "");
+      expect((await listUploads()).map((u) => u.id)).not.toContain(stray);
+
+      await waitUntilExpired(id);
+      await triggerCron();
+      await eventually(gone(id), { message: `cleanup to delete uploads/${id}/` });
+      await eventually(gone(stray), { message: `cleanup to delete stray uploads/${stray}/` });
     }));
 
   test("removes an expired legacy upload that has no custom metadata", () =>

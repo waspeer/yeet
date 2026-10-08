@@ -5,6 +5,9 @@
 //   <prefix>/<id>/.meta.json     metadata sidecar (UploadMeta)
 //   <prefix>/<id>/.parts/<n>     size of part n, only while an upload of
 //                                unknown size is pending
+//   <prefix>/<id>/.downloads/<at>_<random>
+//                                one empty object per download (after 0.2),
+//                                <at> the ISO 8601 time; see recordDownload()
 
 export interface DownloadRecord {
   at: string; // ISO 8601
@@ -17,6 +20,10 @@ export interface UploadMeta {
   uploaded_at: string;
   expires_at: string;
   password_hash?: string;
+  /**
+   * Downloads recorded by yeet 0.2 and earlier, which rewrote the sidecar per
+   * download (and kept the last 50). Newer downloads are `.downloads/` objects.
+   */
   downloads?: DownloadRecord[];
   /** Set while the file is still being uploaded; holds the R2 multipart upload ID. */
   pending_upload_id?: string;
@@ -78,6 +85,22 @@ export function summarize(meta: UploadMeta): UploadSummary {
     ...(meta.pending_upload_id ? { pending_upload_id: meta.pending_upload_id } : {}),
     download_count: downloads.length,
     recent_downloads: downloads.slice(-5).map((download) => download.at),
+  };
+}
+
+/** Prefix (below an upload's directory) of its download records. */
+const DOWNLOADS = ".downloads/";
+
+/**
+ * A summary with the download records counted in: the sidecar's own downloads
+ * (yeet 0.2 and earlier) came before them.
+ */
+function withDownloads(summary: UploadSummary, downloads: string[]): UploadSummary {
+  if (downloads.length === 0) return summary;
+  return {
+    ...summary,
+    download_count: summary.download_count + downloads.length,
+    recent_downloads: [...summary.recent_downloads, ...downloads.slice(-5)].sort().slice(-5),
   };
 }
 
@@ -167,18 +190,34 @@ export class Uploads {
     return (await this.bucket.head(this.dir(id) + ".meta.json")) !== null;
   }
 
-  /** Append a download record to the metadata and persist it. Keeps the last 50. */
-  async recordDownload(id: string, meta: UploadMeta): Promise<void> {
-    const downloads = [...(meta.downloads ?? []), { at: new Date().toISOString() }].slice(-50);
-    await this.writeMeta(id, { ...meta, downloads });
+  /**
+   * Record a download as a new empty object, `.downloads/<ISO time>_<random>`.
+   * Never a read-modify-write of the sidecar: concurrent downloads each write
+   * their own key, so none is lost. listAll() counts them in the same listing
+   * that reads the summaries; delete() and the cleanup remove them with the
+   * upload.
+   */
+  async recordDownload(id: string): Promise<void> {
+    const random = [...crypto.getRandomValues(new Uint8Array(4))]
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("");
+    await this.bucket.put(`${this.dir(id)}${DOWNLOADS}${new Date().toISOString()}_${random}`, "");
   }
 
   /**
-   * Every upload with its object keys and metadata summary. Sidecars written
-   * by yeet < 0.2 carry no summary; those are read individually.
+   * Every upload with its object keys and metadata summary, download records
+   * included. Sidecars written by yeet < 0.2 carry no summary; those are read
+   * individually. `stray` marks download records left without an upload (a
+   * download that raced a delete): no sidecar is read for them, and the
+   * cleanup removes them.
    */
-  async listAll(): Promise<{ id: string; keys: string[]; meta: UploadSummary | null }[]> {
-    const groups = new Map<string, { keys: string[]; meta: UploadSummary | null }>();
+  async listAll(): Promise<
+    { id: string; keys: string[]; meta: UploadSummary | null; stray: boolean }[]
+  > {
+    const groups = new Map<
+      string,
+      { keys: string[]; meta: UploadSummary | null; sidecar: boolean; downloads: string[] }
+    >();
     let cursor: string | undefined;
     do {
       const page = await this.bucket.list({
@@ -189,19 +228,30 @@ export class Uploads {
       for (const object of page.objects) {
         const [id, ...rest] = object.key.slice(this.prefix.length + 1).split("/");
         if (!id || !isValidId(id) || rest.length === 0) continue;
-        const group = groups.get(id) ?? { keys: [], meta: null };
+        let group = groups.get(id);
+        if (!group)
+          groups.set(id, (group = { keys: [], meta: null, sidecar: false, downloads: [] }));
         group.keys.push(object.key);
-        if (rest.join("/") === ".meta.json") group.meta = fromCustomMetadata(object.customMetadata);
-        groups.set(id, group);
+        const name = rest.join("/");
+        if (name === ".meta.json") {
+          group.sidecar = true;
+          group.meta = fromCustomMetadata(object.customMetadata);
+        } else if (name.startsWith(DOWNLOADS)) {
+          // Listed in key order, which for ISO 8601 times is time order.
+          group.downloads.push(name.slice(DOWNLOADS.length).split("_")[0]!);
+        }
       }
       cursor = page.truncated ? page.cursor : undefined;
     } while (cursor);
 
     return Promise.all(
-      [...groups].map(async ([id, group]) => {
-        if (group.meta) return { id, ...group };
-        const meta = await this.readMeta(id).catch(() => null);
-        return { id, keys: group.keys, meta: meta && summarize(meta) };
+      [...groups].map(async ([id, { keys, meta, sidecar, downloads }]) => {
+        const stray = !sidecar && keys.length === downloads.length;
+        if (!meta && !stray) {
+          const full = await this.readMeta(id).catch(() => null);
+          meta = full && summarize(full);
+        }
+        return { id, keys, meta: meta && withDownloads(meta, downloads), stray };
       }),
     );
   }
