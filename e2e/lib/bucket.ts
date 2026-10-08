@@ -87,8 +87,11 @@ export async function putObject(
  * An object's metadata, custom metadata included (listObjects() leaves it
  * out), or null when it does not exist.
  */
-export async function headObject(key: string): Promise<BucketObject | null> {
-  const res = await fetch(explorerUrl(objectPath(key)), {
+export async function headObject(
+  key: string,
+  opts: { baseURL?: string } = {},
+): Promise<BucketObject | null> {
+  const res = await fetch(explorerUrl(objectPath(key), opts.baseURL), {
     headers: { "cf-metadata-only": "true" },
   });
   if (res.status === 404) return null;
@@ -100,8 +103,11 @@ export async function headObject(key: string): Promise<BucketObject | null> {
 }
 
 /** Read an object's bytes, or null when it does not exist. */
-export async function getObject(key: string): Promise<Buffer | null> {
-  const res = await fetch(explorerUrl(objectPath(key)));
+export async function getObject(
+  key: string,
+  opts: { baseURL?: string } = {},
+): Promise<Buffer | null> {
+  const res = await fetch(explorerUrl(objectPath(key), opts.baseURL));
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`Local explorer GET ${key} → ${res.status}`);
   return Buffer.from(await res.arrayBuffer());
