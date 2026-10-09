@@ -5,6 +5,7 @@ import {
 } from "../../../packages/worker/src/cleanup.js";
 import { encodeListCursor, parseListCursor } from "../../../packages/worker/src/parse.js";
 import {
+  JUMP_LIMIT,
   PAGE_JUMPS,
   PAGE_LIMIT,
   PAGE_READS,
@@ -146,7 +147,9 @@ async function walk(b: ScriptedBucket, maxPages = 20_000) {
 function expectBounds(work: { lists: number; listed: number; gets: number; total: number }[]) {
   for (const [i, w] of work.entries()) {
     expect(w.lists, `page ${i}: lists`).toBeLessThanOrEqual(1 + PAGE_JUMPS);
-    expect(w.listed, `page ${i}: objects`).toBeLessThanOrEqual((1 + PAGE_JUMPS) * PAGE_LIMIT);
+    expect(w.listed, `page ${i}: objects`).toBeLessThanOrEqual(
+      PAGE_LIMIT + PAGE_JUMPS * JUMP_LIMIT,
+    );
     expect(w.gets, `page ${i}: reads`).toBeLessThanOrEqual(PAGE_READS);
     expect(w.total, `page ${i}: R2 calls`).toBeLessThanOrEqual(1 + PAGE_READS);
   }

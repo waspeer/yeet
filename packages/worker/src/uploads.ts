@@ -106,11 +106,24 @@ export const PAGE_READS = 5;
 /**
  * Extra list calls one page may make, only to jump over the rest of a
  * `.downloads/` or `.parts/` run its list call ended in (see listAll()). So
- * a page makes at most 2 list calls and examines at most 2 × PAGE_LIMIT
- * objects; without such runs (anything yeet 0.2 and later writes for a
- * finished upload), 1 call and PAGE_LIMIT objects.
+ * a page makes at most 2 list calls and examines at most PAGE_LIMIT +
+ * JUMP_LIMIT objects; without such runs (anything yeet 0.2 and later
+ * writes for a finished upload), 1 call and PAGE_LIMIT objects.
  */
 export const PAGE_JUMPS = 1;
+
+/**
+ * Objects a jump over a `.downloads/` or `.parts/` run lists at most (its
+ * `limit`), for a page and for a cron run. The jump only has to reach what
+ * follows the run: the upload's sidecar and file (a yeet upload has at most
+ * 2 keys outside its runs); anything after that is a bonus the next page
+ * or run lists anyway, and a short jump is handled like any short page R2
+ * may return. Phase 1K measured a page with a jump of PAGE_LIMIT (300
+ * objects) at p50 8, p90 13, max 18 ms CPU (n = 51), against p50 5, p90 8
+ * for a full page of 150; at 50 (round 1L) a jump page lists at most 200
+ * objects. Estimate, not measured: p50 about 6, p90 about 10 ms.
+ */
+export const JUMP_LIMIT = 50;
 
 /**
  * Part records `POST /api/uploads/:id/complete` of an upload of unknown size
@@ -531,7 +544,8 @@ export class Uploads {
    * (`startAfter`), so it costs at most one call per upload; the upload is
    * then marked incomplete (its keys are not all listed). `jumpCalls`
    * allows that many such calls beyond `maxListCalls` (still within the
-   * budget), so that a listing of one call still gets past such a run.
+   * budget), so that a listing of one call still gets past such a run;
+   * `jumpLimit` caps the objects each of them lists.
    *
    * Stops when the budget is spent, and then returns the uploads listed so
    * far (never a partly listed last one) with `truncated: true` and the
@@ -550,6 +564,8 @@ export class Uploads {
       maxListCalls?: number;
       jumpCalls?: number;
       limit?: number;
+      /** The `limit` of the calls made under `jumpCalls` (default: `limit`). */
+      jumpLimit?: number;
     } = {},
   ): Promise<Listing> {
     const budget = opts.budget ?? LIST_BUDGET;
@@ -594,7 +610,7 @@ export class Uploads {
         prefix: base,
         ...next,
         include: ["customMetadata"],
-        ...limit,
+        ...(jump && opts.jumpLimit !== undefined ? { limit: opts.jumpLimit } : limit),
       });
       calls++;
       for (const object of page.objects) {
@@ -753,8 +769,8 @@ export class Uploads {
    *
    * Bounded per request whatever the bucket holds (CPU, not R2 calls, is
    * what limits a request on the Free plan): one list call of at most
-   * PAGE_LIMIT objects, at most PAGE_JUMPS more to jump over the rest of a
-   * `.downloads/` or `.parts/` run, and reads of sidecars without a summary,
+   * PAGE_LIMIT objects, at most PAGE_JUMPS more of at most JUMP_LIMIT to
+   * jump over the rest of a `.downloads/` or `.parts/` run, and reads of sidecars without a summary,
    * 1 + PAGE_READS R2 calls in all. listAll() keeps its guarantees per
    * page: no partly listed upload (but the one a stalled listing must get
    * past), the next page starts right before the first upload this one
@@ -770,6 +786,7 @@ export class Uploads {
       maxListCalls: 1,
       jumpCalls: PAGE_JUMPS,
       limit: PAGE_LIMIT,
+      jumpLimit: JUMP_LIMIT,
       ...(after !== undefined ? { after } : {}),
     });
     const uploads = listing.uploads

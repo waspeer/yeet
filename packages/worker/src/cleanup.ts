@@ -13,7 +13,14 @@
 // next run starts at the beginning again. So every upload is visited, in a
 // stable order, at least once every ceil(uploads / uploads per run) runs.
 
-import { isExpired, summarize, Uploads, type Bucket, type ListedUpload } from "./uploads.js";
+import {
+  isExpired,
+  JUMP_LIMIT,
+  summarize,
+  Uploads,
+  type Bucket,
+  type ListedUpload,
+} from "./uploads.js";
 
 /**
  * R2 calls a cleanup run may make at most. Not the binding limit any more
@@ -116,6 +123,7 @@ export async function runCleanup(
     maxListCalls: 1,
     jumpCalls: CLEANUP_JUMPS,
     limit: CLEANUP_LIST_LIMIT,
+    jumpLimit: JUMP_LIMIT,
     deferReads: SUMMARY_CALLS,
     after: start ?? undefined,
   });

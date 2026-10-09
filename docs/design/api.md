@@ -684,7 +684,12 @@ asserted in `e2e/tests/node/r2-work-bounds.spec.ts` on a bucket returning
 - **At most one more list call** (`PAGE_JUMPS`), only when the first ends
   inside a `.downloads/` or `.parts/` run: it continues after the run
   (`startAfter: <prefix>/<id>/<run>/~`), so an upload with thousands of
-  legacy records is still listed. At most 300 objects then.
+  legacy records is still listed. Its `limit: 50` (`JUMP_LIMIT`, round
+  1L; until then the page's 150) only has to reach the upload's sidecar
+  and file after the run; a short jump is handled like any short page.
+  At most 200 objects then. Phase 1K measured a jump page of 300 objects
+  at p50 8, p90 13, max 18 ms (n = 51); _estimate, not measured:_ about
+  p50 6, p90 10 at 200, from the slope between that and a full page.
 - **At most 5 reads** of sidecars without a summary (`PAGE_READS`, 10
   until round 1K; a jump takes the place of one): **at most 6 R2 calls**
   per page, plus the Bearer rate-limit call.
