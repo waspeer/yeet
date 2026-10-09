@@ -1,6 +1,6 @@
 // Legacy download records: the pre-release versions 1D/1E wrote one empty
 // object per download (`uploads/<id>/.downloads/<at>_<random>`). Nothing
-// writes or counts them any more. The listing jumps over them (one extra
+// writes or counts them any more. A page of the listing jumps over them (one extra
 // list call per upload at most), the cron deletes them, and DELETE removes
 // them with their upload. (How many R2 calls each takes is counted in
 // r2-budget.spec.ts; this checks the same code against wrangler's R2.)
@@ -23,7 +23,7 @@ import {
   server,
   submitDownloadForm,
   test,
-  triggerCron,
+  cronUntil,
   uploadObjects,
   uploadViaApi,
   writeUploadMeta,
@@ -79,12 +79,12 @@ test.describe("legacy download records", () => {
       });
       expect(await recordCount(heavy.id)).toBe(1200);
 
-      await triggerCron();
-      for (const id of [heavy.id, second.id]) {
-        await eventually(async () => (await recordCount(id)) === 0, {
-          message: `the cron to delete the records of ${id}`,
-        });
-      }
+      // A run deletes at most 300 records (one deleteUnder() round), so
+      // 1,200 take a few runs.
+      await cronUntil(
+        async () => (await recordCount(heavy.id)) === 0 && (await recordCount(second.id)) === 0,
+        { message: `the cron to delete the records of ${heavy.id} and ${second.id}` },
+      );
       expect((await uploadObjects(heavy.id)).map((o) => o.key).sort()).toEqual([
         `${server.uploadsPrefix}/${heavy.id}/.meta.json`,
         `${server.uploadsPrefix}/${heavy.id}/heavy.bin`,
@@ -109,11 +109,12 @@ test.describe("legacy download records", () => {
       await seedRecords(stray, 150);
       expect((await listUploads()).map((u) => u.id)).not.toContain(stray);
 
-      await triggerCron();
+      await cronUntil(
+        async () =>
+          (await uploadObjects(expired)).length === 0 && (await uploadObjects(stray)).length === 0,
+        { message: `the cron to delete uploads/${expired}/ and uploads/${stray}/` },
+      );
       for (const id of [expired, stray]) {
-        await eventually(async () => (await uploadObjects(id)).length === 0, {
-          message: `the cron to delete uploads/${id}/`,
-        });
         expect(await listObjects(`${server.uploadsPrefix}/${id}/`)).toHaveLength(0);
       }
     }));

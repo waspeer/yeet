@@ -20,7 +20,7 @@ import {
   submitDownloadForm,
   summarize,
   test,
-  triggerCron,
+  cronUntil,
   uploadObjects,
   uploadViaApi,
   writeUploadMeta,
@@ -88,7 +88,7 @@ test.describe("expiry at request time (no cron)", () => {
     }));
 });
 
-test.describe("daily cleanup (cron)", () => {
+test.describe("hourly cleanup (cron)", () => {
   test("removes an upload once it has expired", () =>
     exclusive("cron", async () => {
       const { id, url } = await uploadViaApi({
@@ -106,8 +106,7 @@ test.describe("daily cleanup (cron)", () => {
       // open the page here: that deletes expired uploads on its own.)
       expect(await uploadObjects(id)).toHaveLength(2);
 
-      await triggerCron();
-      await eventually(gone(id), { message: `cleanup to delete uploads/${id}/` });
+      await cronUntil(gone(id), { message: `cleanup to delete uploads/${id}/` });
       expect((await listUploads()).map((u) => u.id)).not.toContain(id);
       expect((await fetch(url)).status).toBe(404);
     }));
@@ -133,9 +132,9 @@ test.describe("daily cleanup (cron)", () => {
       expect((await listUploads()).map((u) => u.id)).not.toContain(stray);
 
       await waitUntilExpired(id);
-      await triggerCron();
-      await eventually(gone(id), { message: `cleanup to delete uploads/${id}/` });
-      await eventually(gone(stray), { message: `cleanup to delete stray uploads/${stray}/` });
+      await cronUntil(async () => (await gone(id)()) && (await gone(stray)()), {
+        message: `cleanup to delete uploads/${id}/ and stray uploads/${stray}/`,
+      });
     }));
 
   test("removes an expired legacy upload that has no custom metadata", () =>
@@ -143,8 +142,7 @@ test.describe("daily cleanup (cron)", () => {
       const { id } = await expiredControl();
       expect(await uploadObjects(id)).toHaveLength(2);
 
-      await triggerCron();
-      await eventually(gone(id), { message: `cleanup to delete legacy uploads/${id}/` });
+      await cronUntil(gone(id), { message: `cleanup to delete legacy uploads/${id}/` });
     }));
 
   test("removes uploads left pending for over 24 hours, keeps recent ones", () =>
@@ -173,11 +171,11 @@ test.describe("daily cleanup (cron)", () => {
         expect((await fetch(`${server.baseURL}/${id}/abandoned.bin`)).status).toBe(404);
       }
 
-      await triggerCron();
-      for (const id of abandoned) {
-        await eventually(gone(id), { message: `cleanup to delete abandoned uploads/${id}/` });
-      }
-      // The same run kept the upload that is still in progress.
+      await cronUntil(
+        async () => (await Promise.all(abandoned.map((id) => gone(id)()))).every(Boolean),
+        { message: `cleanup to delete abandoned uploads ${abandoned.join(", ")}` },
+      );
+      // The same runs kept the upload that is still in progress.
       expect(await uploadObjects(recent)).toHaveLength(1);
       expect((await deleteUpload(recent)).status).toBe(200);
     }));
@@ -209,9 +207,9 @@ test.describe("daily cleanup (cron)", () => {
 
       // The cleanup gets past both: it deletes the expired control and the
       // expired oversized one, and leaves the malformed one for a human.
-      await triggerCron();
-      await eventually(gone(control.id), { message: "the cron run to remove the control" });
-      await eventually(gone(big), { message: "the cron run to remove the oversized sidecar" });
+      await cronUntil(async () => (await gone(control.id)()) && (await gone(big)()), {
+        message: "the cron runs to remove the control and the oversized sidecar",
+      });
       expect((await uploadObjects(bad)).map((o) => o.key).sort()).toEqual([
         `${prefix}/${bad}/.meta.json`,
         `${prefix}/${bad}/odd.bin`,
@@ -235,8 +233,7 @@ test.describe("daily cleanup (cron)", () => {
       const listed = (await listUploads()).find((u) => u.id === kept);
       expect(listed?.filename).toBe(long);
       const control2 = await expiredControl();
-      await triggerCron();
-      await eventually(gone(control2.id), { message: "the second cron run to remove its control" });
+      await cronUntil(gone(control2.id), { message: "the next cron runs to remove their control" });
       expect((await headObject(`${prefix}/${kept}/.meta.json`))?.custom_metadata).toEqual({});
 
       for (const id of [bad, kept]) expect((await deleteUpload(id)).status).toBe(200);
@@ -253,15 +250,15 @@ test.describe("daily cleanup (cron)", () => {
       expect(objects).toHaveLength(2);
       for (const object of objects) expect(object.custom_metadata).toEqual({});
 
-      await triggerCron();
-      // Once the expired control is gone, this cleanup run has done its deleting.
-      await eventually(gone(control.id), { message: "the cron run to remove the control" });
-      expect(await uploadObjects(id)).toHaveLength(2);
-      // The cleanup gave its sidecar the summary later listings read instead.
+      // The cleanup deletes the expired control and gives the legacy
+      // sidecar the summary later listings read instead.
       const sidecar = `${server.uploadsPrefix}/${id}/.meta.json`;
-      await eventually(async () => !!(await headObject(sidecar))?.custom_metadata["summary"], {
-        message: "the cron to add the summary to the legacy sidecar",
-      });
+      await cronUntil(
+        async () =>
+          (await gone(control.id)()) && !!(await headObject(sidecar))?.custom_metadata["summary"],
+        { message: "the cron runs to remove the control and summarise the legacy sidecar" },
+      );
+      expect(await uploadObjects(id)).toHaveLength(2);
       expect(JSON.parse((await headObject(sidecar))!.custom_metadata["summary"]!)).toEqual(
         summarize((await readUploadMeta(id))!),
       );

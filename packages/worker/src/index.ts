@@ -778,7 +778,7 @@ app.onError((err, c) => {
 });
 
 // ---------------------------------------------------------------------------
-// Daily cleanup of expired and abandoned uploads
+// Hourly cleanup of expired and abandoned uploads (a bounded slice per run)
 // ---------------------------------------------------------------------------
 
 async function cleanup(env: Env): Promise<void> {

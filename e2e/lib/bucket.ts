@@ -164,14 +164,37 @@ export async function seedLegacyUpload(opts: {
 }
 
 /**
- * Run the Worker's scheduled handler (the daily cleanup) through wrangler's
+ * Run the Worker's scheduled handler (the hourly cleanup) through wrangler's
  * --test-scheduled endpoint. The cleanup runs in waitUntil(), so callers should
  * poll for its effect with eventually() rather than assume it has finished.
  */
-export async function triggerCron(cron = "0 3 * * *"): Promise<void> {
+export async function triggerCron(cron = "0 * * * *"): Promise<void> {
   const res = await fetch(`${server.baseURL}/__scheduled?cron=${encodeURIComponent(cron)}`);
   const text = await res.text();
   if (!res.ok) throw new Error(`/__scheduled returned ${res.status}: ${text}`);
+}
+
+/**
+ * Run the cleanup until `check` holds: trigger a run, poll `check` for up to
+ * `perRunMs`, and trigger the next if it does not hold yet, up to `maxRuns`
+ * runs. Each run handles one bounded slice of the bucket (about 150
+ * uploads), and the test bucket is shared by every test of the run, so an
+ * upload may need a few runs to be reached; a run that has finished its
+ * slice and saved its cursor makes the next one continue after it.
+ */
+export async function cronUntil(
+  check: () => Promise<unknown>,
+  { message = "condition", maxRuns = 40, perRunMs = 1500 } = {},
+): Promise<number> {
+  for (let run = 1; run <= maxRuns; run++) {
+    await triggerCron();
+    const deadline = Date.now() + perRunMs;
+    do {
+      if (await check().catch(() => false)) return run;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    } while (Date.now() < deadline);
+  }
+  throw new Error(`Still waiting for ${message} after ${maxRuns} cron runs`);
 }
 
 export interface UploadMeta extends LegacyMeta {

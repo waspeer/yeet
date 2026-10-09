@@ -1,6 +1,7 @@
 import {
   CLEANUP_BUDGET,
-  CLEANUP_LIST_BUDGET,
+  CLEANUP_LIST_LIMIT,
+  CLEANUP_SUMMARIES,
   runCleanup,
 } from "../../../packages/worker/src/cleanup.js";
 import {
@@ -281,7 +282,7 @@ test.describe("R2 calls of the cron", () => {
     };
 
     let runs = 0;
-    for (; runs < 20; runs++) {
+    for (; runs < 1000; runs++) {
       const done = left();
       if (Object.values(done).every((n) => n === 0)) break;
       bucket.resetCalls();
@@ -289,8 +290,10 @@ test.describe("R2 calls of the cron", () => {
       expect(bucket.total, `run ${runs + 1}`).toBe(report.subrequests);
       expect(report.subrequests, `run ${runs + 1}`).toBeLessThanOrEqual(CLEANUP_BUDGET);
     }
-    expect(left()).toEqual({ stale: 0, stray: 0, records: 0, unsummarized: 0 });
-    expect(runs).toBeLessThanOrEqual(13);
+    console.log(`large bucket: clean after ${runs} runs`);
+    // Round 1I: 133 runs (13 before): a run lists 200 objects (100 on this
+    // bucket) and deletes at most 200 legacy records, not up to 45 calls' worth.
+    expect(runs).toBeLessThanOrEqual(140);
     // Nothing current was deleted, and every sidecar now has its summary.
     for (const id of keep) {
       const sidecar = bucket.objects.get(`${PREFIX}/${id}/.meta.json`);
@@ -302,7 +305,7 @@ test.describe("R2 calls of the cron", () => {
 
     // Runs on the clean bucket go through it in slices and then start over.
     const cursors: (string | null)[] = [];
-    for (let i = 0; i < 6 && cursors.at(-1) !== null; i++) {
+    for (let i = 0; i < 200 && cursors.at(-1) !== null; i++) {
       bucket.resetCalls();
       const report = await runCleanup(bucket, PREFIX, NOW);
       expect(report.subrequests).toBeLessThanOrEqual(CLEANUP_BUDGET);
@@ -330,9 +333,9 @@ test.describe("R2 calls of the cron", () => {
     const bucket = new FakeBucket();
     const ids = Array.from({ length: 300 }, (_, i) => idOf(i));
     for (const id of ids) seedUpload(bucket, id, { legacySidecar: true });
-    // Cursor read and write, one list page, then a read and a conditional
-    // write per sidecar: (45 - 3) / 2 = 21.
-    const perRun = Math.floor((CLEANUP_BUDGET - 3) / 2);
+    // Round 1I: CLEANUP_SUMMARIES (10) a run, no longer as many as the
+    // budget of 45 calls allows ((45 - 3) / 2 = 21 before).
+    const perRun = CLEANUP_SUMMARIES;
     let done = 0;
     for (let run = 0; done < ids.length; run++) {
       bucket.resetCalls();
@@ -351,9 +354,8 @@ test.describe("R2 calls of the cron", () => {
 
   test("junk pages, then sidecars without a summary: the cron gets to all of them", async () => {
     const bucket = new FakeBucket();
-    // The listing's last page holds 50 junk keys and the first 25 uploads.
-    for (let i = 0; i < (CLEANUP_LIST_BUDGET - 1) * 100 + 50; i++)
-      bucket.seed(`${PREFIX}/a${i}.junk`);
+    // Runs of nothing but junk, then a slice of 50 junk keys and the first uploads.
+    for (let i = 0; i < 3 * CLEANUP_LIST_LIMIT + 50; i++) bucket.seed(`${PREFIX}/a${i}.junk`);
     const ids = Array.from({ length: 200 }, (_, i) => `m${String(i).padStart(4, "0")}`);
     for (const id of ids) seedUpload(bucket, id, { legacySidecar: true });
     const unsummarized = () =>

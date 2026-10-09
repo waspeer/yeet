@@ -1,4 +1,4 @@
-import { CLEANUP_BUDGET, runCleanup } from "../../../packages/worker/src/cleanup.js";
+import { CLEANUP_BUDGET, CLEANUP_SUMMARIES, runCleanup } from "../../../packages/worker/src/cleanup.js";
 import { backfillSummaries } from "../../../packages/worker/src/backfill.js";
 import {
   LIST_BUDGET,
@@ -129,7 +129,7 @@ test.describe("1G verifier: cron on adversarial buckets", () => {
         if (!isStaleShape(s) && !s.noSidecar) b.live.add(id);
         if (pick(0.01)) for (let j = 0; j < 300; j++) b.seed(`${P}/${id}~junk${j}`); // top-level junk
       }
-      const { run, maxCalls } = await runUntil(b, 2000, () => {
+      const { run, maxCalls } = await runUntil(b, 4000, () => {
         for (const [id, s] of shapes) {
           const keys = b.sorted(`${P}/${id}/`);
           if (isStaleShape(s) && keys.length) return false;
@@ -140,7 +140,7 @@ test.describe("1G verifier: cron on adversarial buckets", () => {
       });
       console.log(`seed ${seedNo}: converged after ${run} runs, max calls ${maxCalls}`);
       expect(b.violations).toEqual([]);
-      expect(run).toBeLessThan(2000);
+      expect(run).toBeLessThan(4000);
       // Live uploads keep their file and sidecar; summaries match bodies.
       for (const id of b.live) {
         const s = shapes.get(id)!;
@@ -173,10 +173,10 @@ test.describe("1G verifier: cron on adversarial buckets", () => {
     for (let i = 0; i < 30; i++) { seedUpload(b, `a${i}`, { legacy: true }); b.live.add(`a${i}`); }
     seedUpload(b, "big", { expired: true, junkAfter: 30000, records: 3000 });
     for (let i = 0; i < 30; i++) { seedUpload(b, `c${i}`, { legacy: true }); b.live.add(`c${i}`); }
-    const { run } = await runUntil(b, 100, () => b.sorted(`${P}/big/`).length === 0);
+    const { run } = await runUntil(b, 250, () => b.sorted(`${P}/big/`).length === 0);
     console.log(`big stale upload gone after ${run} runs`);
     expect(b.violations).toEqual([]);
-    expect(run).toBeLessThan(100);
+    expect(run).toBeLessThan(250);
   });
 
   test("one stale upload whose 30,000 non-bulk keys sort BEFORE its sidecar (not a yeet upload)", async () => {
@@ -212,19 +212,26 @@ test.describe("1G verifier: cron on adversarial buckets", () => {
     }
   });
 
-  test("e2e/README claim: one run does everything with at most 20 unsummarized sidecars", async () => {
+  test(`e2e/README claim: one run does everything with at most ${CLEANUP_SUMMARIES} unsummarized sidecars`, async () => {
+    // Round 1I: a run gives at most CLEANUP_SUMMARIES (10) sidecars their
+    // summary (it was 21, as many as the old budget of 45 calls allowed).
+    const n = CLEANUP_SUMMARIES;
     const results: Record<number, { summarized: number; deleted: number; cursor: string | null }> = {};
-    for (const k of [19, 20, 21]) {
+    for (const k of [n - 1, n, n + 1]) {
       const b = new CheckedBucket();
       for (let i = 0; i < k; i++) seedUpload(b, `a${String(i).padStart(3, "0")}`, { legacy: true });
       seedUpload(b, "zexp", { expired: true });
       const { summarized, deleted, cursor } = await runCleanup(b, P, NOW);
       results[k] = { summarized, deleted, cursor };
     }
-    expect(results[19]).toEqual({ summarized: 19, deleted: 1, cursor: null });
-    expect(results[20]).toEqual({ summarized: 20, deleted: 1, cursor: null });
-    // 21 summaries take the whole budget: the deletion waits for the next run.
-    expect(results[21]).toEqual({ summarized: 21, deleted: 0, cursor: `${P}/a0200` });
+    expect(results[n - 1]).toEqual({ summarized: n - 1, deleted: 1, cursor: null });
+    expect(results[n]).toEqual({ summarized: n, deleted: 1, cursor: null });
+    // One more: the run stops after its last summary; the rest waits for the next run.
+    expect(results[n + 1]).toEqual({
+      summarized: n,
+      deleted: 0,
+      cursor: `${P}/a${String(n - 1).padStart(3, "0")}0`,
+    });
   });
 
   test("stall branch: listing of a single huge upload returns it once and resumes after it", async () => {
