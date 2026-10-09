@@ -226,14 +226,29 @@ class ApiError extends Error {
 }
 
 /**
- * Seconds to wait from a Retry-After header (delta-seconds or an HTTP date),
- * or undefined if there is none or it is unusable.
+ * The three spellings of an HTTP date (RFC 9110 §5.6.7): IMF-fixdate
+ * ("Sun, 06 Nov 1994 08:49:37 GMT"), RFC 850 ("Sunday, 06-Nov-94 08:49:37
+ * GMT") and asctime ("Sun Nov  6 08:49:37 1994"). Checked before Date.parse(),
+ * which also reads "-5", "+5" or "1.5" as dates (in 2001, so "retry now").
+ */
+const IMF_FIXDATE = /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/;
+const RFC_850_DATE = /^[A-Z][a-z]+day, \d{2}-[A-Z][a-z]{2}-\d{2} \d{2}:\d{2}:\d{2} GMT$/;
+const ASCTIME_DATE = /^[A-Z][a-z]{2} [A-Z][a-z]{2} [ \d]\d \d{2}:\d{2}:\d{2} \d{4}$/;
+
+/**
+ * Seconds to wait from a Retry-After header: delta-seconds (digits only) or
+ * an HTTP date. Undefined if there is none or it is anything else ("-5",
+ * "1.5", "1e3"), so the caller's own backoff applies.
  */
 function retryAfterSeconds(res: Response): number | undefined {
   const value = res.headers.get("Retry-After")?.trim();
   if (!value) return undefined;
   if (/^\d+$/.test(value)) return Number(value);
-  const at = Date.parse(value);
+  let at: number;
+  if (IMF_FIXDATE.test(value) || RFC_850_DATE.test(value)) at = Date.parse(value);
+  // asctime carries no zone but means GMT; Date.parse() would take local time.
+  else if (ASCTIME_DATE.test(value)) at = Date.parse(`${value} GMT`);
+  else return undefined;
   return Number.isNaN(at) ? undefined : Math.max(0, Math.ceil((at - Date.now()) / 1000));
 }
 

@@ -511,7 +511,35 @@ test.describe("1J verifier: Retry-After on list pages", () => {
     expect(past.gaps[0]).toBeLessThan(500);
   });
 
-  async function withHttpDate(offsetMs: number) {
+  // Round 1K: the other two HTTP date spellings (RFC 9110 §5.6.7). asctime
+  // has no zone and means GMT.
+  const rfc850 = (d: Date) => {
+    const [, day, rest] = d.toUTCString().match(/^(\w{3}), (.*)$/)!;
+    const days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+    const [dd, mon, yyyy, time] = rest!.split(" ");
+    return `${days.find((name) => name.startsWith(day!))}, ${dd}-${mon}-${yyyy!.slice(2)} ${time} GMT`;
+  };
+  const asctime = (d: Date) => {
+    const [, day, dd, mon, yyyy, time] = d
+      .toUTCString()
+      .match(/^(\w{3}), (\d{2}) (\w{3}) (\d{4}) (\S+) GMT$/)!;
+    return `${day} ${mon} ${String(Number(dd)).padStart(2, " ")} ${time} ${yyyy}`;
+  };
+  for (const [name, format] of [
+    ["RFC 850", rfc850],
+    ["asctime", asctime],
+  ] as const) {
+    test(`an HTTP date ~3 s ahead in ${name} spelling is waited for`, async () => {
+      test.setTimeout(30_000);
+      const ahead = await withHttpDate(3500, format);
+      console.log(`${name} +3.5 s: gaps ${ahead.gaps}`);
+      expect(ahead.code).toBe(0);
+      expect(ahead.gaps[0]).toBeGreaterThanOrEqual(2000);
+      expect(ahead.gaps[0]).toBeLessThan(5500);
+    });
+  }
+
+  async function withHttpDate(offsetMs: number, format = (d: Date) => d.toUTCString()) {
     let result!: { code: number | null; gaps: number[] };
     await withServer(
       (hit, attempt) =>
@@ -521,7 +549,7 @@ test.describe("1J verifier: Retry-After on list pages", () => {
             ? {
                 status: 503,
                 body: { error: "busy" },
-                headers: { "Retry-After": new Date(Date.now() + offsetMs).toUTCString() },
+                headers: { "Retry-After": format(new Date(Date.now() + offsetMs)) },
               }
             : page(1, null),
       async (env, log) => {
@@ -533,11 +561,12 @@ test.describe("1J verifier: Retry-After on list pages", () => {
     return result;
   }
 
-  // FINDING (low): values that are no number of seconds and no HTTP date but
-  // that Date.parse() still accepts ("-5", "+5", "1.5") are taken as a date in
-  // 2001, i.e. "retry now", instead of being ignored (backoff 1, 2, 4 s).
-  for (const value of ["-5", "1.5", "abc", "1e3"]) {
-    test(`Retry-After ${JSON.stringify(value)} on a 503`, async () => {
+  // FINDING (low), fixed in round 1K: values that are no number of seconds
+  // and no HTTP date but that Date.parse() still accepts ("-5", "+5", "1.5")
+  // were taken as a date in 2001, i.e. "retry now". Now they are ignored like
+  // any other unusable value: the backoff (1, 2, 4 s) applies.
+  for (const value of ["-5", "+5", "1.5", "abc", "1e3"]) {
+    test(`Retry-After ${JSON.stringify(value)} on a 503 is ignored: backoff`, async () => {
       test.setTimeout(30_000);
       const r = await listWithPage2(
         { status: 503, body: { error: "busy" }, headers: { "Retry-After": value } },
@@ -545,8 +574,7 @@ test.describe("1J verifier: Retry-After on list pages", () => {
       );
       console.log(`503 RA ${value}: exit ${r.code}, gap ${r.gaps[0]} ms`);
       expect(r.code).toBe(0);
-      if (value === "-5" || value === "1.5") expect(r.gaps[0]).toBeLessThan(500);
-      else expect(r.gaps[0]).toBeGreaterThanOrEqual(1000 - 50);
+      expect(r.gaps[0]).toBeGreaterThanOrEqual(1000 - 50);
     });
   }
 
