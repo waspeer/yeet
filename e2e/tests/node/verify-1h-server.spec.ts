@@ -1,3 +1,4 @@
+import { MAX_UNSIZED_PARTS } from "../../../packages/worker/src/uploads.js";
 import { randomBytes } from "node:crypto";
 import {
   api,
@@ -23,8 +24,9 @@ test("size unknown, too many part records: refused without completing the multip
   const res1 = await api(`/api/uploads/${id}/parts/1`, { method: "PUT", body: randomBytes(10) });
   expect(res1.status).toBe(200);
   const one = (await res1.json()) as { part_number: number; etag: string };
+  // Round 1K: MAX_UNSIZED_PARTS + 1 records are refused (4,101 before).
   const keys = Array.from(
-    { length: 4100 },
+    { length: MAX_UNSIZED_PARTS },
     (_, i) => `${server.uploadsPrefix}/${id}/.parts/${i + 2}`,
   );
   for (let i = 0; i < keys.length; i += 50) {

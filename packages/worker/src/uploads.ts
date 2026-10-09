@@ -112,13 +112,24 @@ export const PAGE_READS = 10;
 export const PAGE_JUMPS = 1;
 
 /**
+ * Part records `POST /api/uploads/:id/complete` of an upload of unknown size
+ * reads at most (one per part sent, records of parts not in the request
+ * included). Above it the request is refused (400) before anything changes,
+ * telling the client to start again with the size: CPU, not R2 calls, is
+ * the binding limit, and the complete of 4,000 records took 82 to 138 ms
+ * CPU on Workers Free (phase 1J, n = 3). 300 parts are up to about 15.7 GB
+ * at the 50 MiB part size. The CLI and the upload page always send the
+ * size, so they never take this path.
+ */
+export const MAX_UNSIZED_PARTS = 300;
+
+/**
  * R2 calls `POST /api/uploads/:id/complete` of an upload of unknown size may
  * spend on its part records (readPartSizes() and their deletion): the 50
  * subrequests the Free plan was assumed to allow, minus its 4 other ones
  * (the Bearer rate-limit call, the sidecar read, the multipart complete and
- * the sidecar write). With 100 records per list call that is 4,100 parts.
- * The real limit is 1,000 R2 calls (phase 1H); this stays as a bound on the
- * work, whose CPU is not measured (see docs/design/api.md).
+ * the sidecar write). A second guard behind MAX_UNSIZED_PARTS: it only
+ * refuses first if R2 returns fewer than 7 records per list call.
  */
 export const PART_RECORDS_BUDGET = 50 - 4;
 
@@ -421,14 +432,17 @@ export class Uploads {
 
   /**
    * The recorded part sizes of an upload, and the keys of their records, or
-   * null if listing them (one call per page, with metadata) and deleting
-   * them afterwards (deleteKeys(): one call per 1,000) would take more than
-   * `budget` R2 calls. It stops listing as soon as that is certain, so it
-   * makes at most `budget` calls itself.
+   * null if there are more than `maxRecords` of them, or if listing them
+   * (one call per page, with metadata) and deleting them afterwards
+   * (deleteKeys(): one call per 1,000) would take more than `budget` R2
+   * calls. It stops listing as soon as either is certain: it lists at most
+   * `maxRecords + 1` records (each call's `limit`) and makes at most
+   * `budget` calls itself.
    */
   async readPartSizes(
     id: string,
     budget = Infinity,
+    maxRecords = Infinity,
   ): Promise<{ sizes: Map<number, number>; keys: string[] } | null> {
     const prefix = `${this.dir(id)}.parts/`;
     const sizes = new Map<number, number>();
@@ -440,13 +454,21 @@ export class Uploads {
       // This call, and at least the deletes of the records found so far.
       if (calls + 1 + deletes() > budget) return null;
       calls++;
-      const page = await this.bucket.list({ prefix, cursor, include: ["customMetadata"] });
+      // Enough to tell that there are more than maxRecords, and no more.
+      const left = maxRecords + 1 - keys.length;
+      const page = await this.bucket.list({
+        prefix,
+        cursor,
+        include: ["customMetadata"],
+        ...(left < 1000 ? { limit: left } : {}),
+      });
       for (const object of page.objects) {
         keys.push(object.key);
         const partNumber = Number(object.key.slice(prefix.length));
         const size = Number(object.customMetadata?.size);
         if (Number.isInteger(partNumber) && Number.isSafeInteger(size)) sizes.set(partNumber, size);
       }
+      if (keys.length > maxRecords) return null;
       cursor = page.truncated ? page.cursor : undefined;
     } while (cursor);
     return calls + deletes() > budget ? null : { sizes, keys };

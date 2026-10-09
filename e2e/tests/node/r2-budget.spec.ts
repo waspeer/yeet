@@ -6,6 +6,7 @@ import {
 } from "../../../packages/worker/src/cleanup.js";
 import {
   LIST_BUDGET,
+  MAX_UNSIZED_PARTS,
   PART_RECORDS_BUDGET,
   RECORD_ATTEMPTS,
   summarize,
@@ -512,21 +513,32 @@ test.describe("R2 calls of completing an upload of unknown size", () => {
   // POST /api/uploads/:id/complete without a size at create, call by call as
   // in packages/worker/src/index.ts: the Bearer rate-limit call (not an R2
   // call: the bucket allows one less), the sidecar read, the part records
-  // (readPartSizes()), the multipart complete, the sidecar write and the
-  // deletion of the records. Returns what happened and the subrequests made.
-  async function complete(bucket: FakeBucket, id: string) {
+  // (readPartSizes(), at most MAX_UNSIZED_PARTS of them), the multipart
+  // complete, the sidecar write and the deletion of the records. Returns
+  // what happened, the subrequests made and the records listed.
+  async function complete(bucket: FakeBucket, id: string, parts: number) {
     bucket.resetCalls();
     bucket.maxCalls = 50 - 1;
+    const listed = { n: 0 };
+    const list = bucket.list.bind(bucket);
+    bucket.list = async (options) => {
+      const page = await list(options);
+      listed.n += page.objects.length;
+      return page;
+    };
     const uploads = new Uploads(bucket, PREFIX);
     try {
       const meta = (await uploads.readMeta(id))!;
-      const records = await uploads.readPartSizes(id, PART_RECORDS_BUDGET);
-      if (!records) return { outcome: "refused", subrequests: 1 + bucket.total };
+      if (parts > MAX_UNSIZED_PARTS) return { outcome: "refused", subrequests: 1 + bucket.total };
+      const records = await uploads.readPartSizes(id, PART_RECORDS_BUDGET, MAX_UNSIZED_PARTS);
+      if (!records) {
+        return { outcome: "refused", subrequests: 1 + bucket.total, listed: listed.n };
+      }
       await bucket.resumeMultipartUpload(`${PREFIX}/${id}/${meta.filename}`, "mp").complete();
       const { pending_upload_id: _, ...finished } = meta;
       await uploads.writeMeta(id, { ...finished, file_size: records.sizes.size * 5 });
       await uploads.deleteKeys(records.keys);
-      return { outcome: "completed", subrequests: 1 + bucket.total };
+      return { outcome: "completed", subrequests: 1 + bucket.total, listed: listed.n };
     } catch {
       // Past 50 subrequests (the limit assumed before phase 1H), fail the request.
       const after = bucket.calls["complete"] ? " after complete" : "";
@@ -535,46 +547,77 @@ test.describe("R2 calls of completing an upload of unknown size", () => {
     }
   }
 
-  test(`at most ${PART_RECORDS_BUDGET + 4} subrequests; too many parts are refused before completing`, async () => {
-    const results: Record<number, { outcome: string; subrequests: number }> = {};
-    for (const parts of [1, 100, 101, 4000, 4100, 4101, 4600, 4601, 4700, 4701, 10_000]) {
+  test(`at most ${MAX_UNSIZED_PARTS} part records; more are refused before completing`, async () => {
+    // Round 1K: the limit is MAX_UNSIZED_PARTS records (CPU: 4,000 records
+    // took 82 to 138 ms on Workers Free in phase 1J), no longer the 4,100
+    // that fitted the 46 R2 calls of PART_RECORDS_BUDGET.
+    const results: Record<number, unknown> = {};
+    for (const parts of [1, 100, 101, 299, 300, 301, 4100, 4101, 10_000]) {
       const bucket = new FakeBucket();
       seedUpload(bucket, idOf(0), { pendingSince: NOW, parts });
-      results[parts] = await complete(bucket, idOf(0));
-      if (results[parts]!.outcome === "refused") {
+      // Every record is a part in the request (the CLI's parts array).
+      const result = await complete(bucket, idOf(0), parts);
+      results[parts] = result;
+      if (result.outcome === "refused") {
         // Nothing changed: still pending, every record still there.
         expect(bucket.calls["complete"] ?? 0).toBe(0);
         expect(bucket.calls["put"] ?? 0).toBe(0);
         expect(bucket.keys(`${PREFIX}/${idOf(0)}/.parts/`)).toHaveLength(parts);
-      } else if (results[parts]!.outcome === "completed") {
+      } else if (result.outcome === "completed") {
         expect(bucket.keys(`${PREFIX}/${idOf(0)}/`)).toEqual([`${PREFIX}/${idOf(0)}/.meta.json`]);
       }
     }
-    // 4 + ceil(parts / 100) list calls + ceil(parts / 1000) deletes, at most 50.
+    // Completed: 4 + ceil(parts / 100) list calls + ceil(parts / 1000) deletes.
+    // Refused: a parts array over the limit before any listing (2: the
+    // rate-limit call and the sidecar read).
     expect(results).toEqual({
-      1: { outcome: "completed", subrequests: 6 },
-      100: { outcome: "completed", subrequests: 6 },
-      101: { outcome: "completed", subrequests: 7 },
-      4000: { outcome: "completed", subrequests: 48 },
-      4100: { outcome: "completed", subrequests: 50 },
-      4101: { outcome: "refused", subrequests: 43 },
-      4600: { outcome: "refused", subrequests: 43 },
-      4601: { outcome: "refused", subrequests: 43 },
-      4700: { outcome: "refused", subrequests: 43 },
-      4701: { outcome: "refused", subrequests: 43 },
-      10_000: { outcome: "refused", subrequests: 43 },
+      1: { outcome: "completed", subrequests: 6, listed: 1 },
+      100: { outcome: "completed", subrequests: 6, listed: 100 },
+      101: { outcome: "completed", subrequests: 7, listed: 101 },
+      299: { outcome: "completed", subrequests: 8, listed: 299 },
+      300: { outcome: "completed", subrequests: 8, listed: 300 },
+      301: { outcome: "refused", subrequests: 2 },
+      4100: { outcome: "refused", subrequests: 2 },
+      4101: { outcome: "refused", subrequests: 2 },
+      10_000: { outcome: "refused", subrequests: 2 },
     });
   });
 
-  test("fewer records per list call: refused within the budget, before completing", async () => {
-    const bucket = new FakeBucket({ pageSize: 37 });
-    seedUpload(bucket, idOf(0), { pendingSince: NOW, parts: 1700 });
-    const refused = await complete(bucket, idOf(0));
+  test(`more than ${MAX_UNSIZED_PARTS} records, fewer parts sent: refused after listing at most ${MAX_UNSIZED_PARTS + 1}`, async () => {
+    // Records of parts not in the request count too (a client that sent
+    // parts again under other numbers, say). The list calls' limit stops the
+    // listing at MAX_UNSIZED_PARTS + 1 records, whatever R2 would return.
+    for (const pageSize of [37, 100]) {
+      for (const records of [MAX_UNSIZED_PARTS + 1, 4101, 10_000]) {
+        const bucket = new FakeBucket({ pageSize });
+        seedUpload(bucket, idOf(0), { pendingSince: NOW, parts: records });
+        const result = await complete(bucket, idOf(0), 1);
+        expect(result, `${pageSize}/${records}`).toEqual({
+          outcome: "refused",
+          subrequests: 2 + Math.ceil((MAX_UNSIZED_PARTS + 1) / pageSize),
+          listed: MAX_UNSIZED_PARTS + 1,
+        });
+        expect(bucket.calls["complete"] ?? 0).toBe(0);
+        expect(bucket.keys(`${PREFIX}/${idOf(0)}/.parts/`)).toHaveLength(records);
+      }
+    }
+  });
+
+  test("fewer records per list call: the R2 call budget still refuses, before completing", async () => {
+    // A second guard: at 6 records per call, 300 records take 50 list calls,
+    // more than PART_RECORDS_BUDGET (46); at 7, 43 calls and a delete fit.
+    const six = new FakeBucket({ pageSize: 6 });
+    seedUpload(six, idOf(0), { pendingSince: NOW, parts: MAX_UNSIZED_PARTS });
+    const refused = await complete(six, idOf(0), MAX_UNSIZED_PARTS);
     expect(refused.outcome).toBe("refused");
     expect(refused.subrequests).toBeLessThanOrEqual(2 + PART_RECORDS_BUDGET);
-    const small = new FakeBucket({ pageSize: 37 });
-    seedUpload(small, idOf(0), { pendingSince: NOW, parts: 1500 });
-    // 41 list calls and 2 deletes.
-    expect(await complete(small, idOf(0))).toEqual({ outcome: "completed", subrequests: 47 });
+    expect(six.keys(`${PREFIX}/${idOf(0)}/.parts/`)).toHaveLength(MAX_UNSIZED_PARTS);
+    const seven = new FakeBucket({ pageSize: 7 });
+    seedUpload(seven, idOf(0), { pendingSince: NOW, parts: MAX_UNSIZED_PARTS });
+    expect(await complete(seven, idOf(0), MAX_UNSIZED_PARTS)).toEqual({
+      outcome: "completed",
+      subrequests: 4 + Math.ceil(MAX_UNSIZED_PARTS / 7) + 1,
+      listed: MAX_UNSIZED_PARTS,
+    });
   });
 });
