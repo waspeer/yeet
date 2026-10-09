@@ -5,7 +5,8 @@
 // (see there). This module holds the logic, on the same Bucket interface as
 // the Worker, so it is tested on the in-memory buckets of e2e/.
 //
-// - Dry run unless `apply`: then it only counts.
+// - Dry run unless `apply`: then it reads every sidecar without a summary
+//   (to classify it exactly as `apply` would) but writes nothing.
 // - Idempotent: it writes only sidecars without a usable summary (the same
 //   check as the listing's, summaryFromCustomMetadata()), so a second run
 //   finds nothing to do.
@@ -31,6 +32,12 @@ export interface BackfillReport {
   sidecars: number;
   /** Of those, without a readable summary. */
   missing: number;
+  /**
+   * Of those, the ones whose summary can be written: what `apply` would
+   * write in a dry run; with `apply`, the written ones plus those changed
+   * between read and write.
+   */
+  writable: number;
   /** Summaries written (0 in a dry run). */
   written: number;
   /** Not written: the sidecar changed or went away between read and write. */
@@ -57,6 +64,7 @@ export async function backfillSummaries(
   const report: BackfillReport = {
     sidecars: 0,
     missing: 0,
+    writable: 0,
     written: 0,
     changed: 0,
     unreadable: 0,
@@ -76,10 +84,6 @@ export async function backfillSummaries(
       if (summaryFromCustomMetadata(object.customMetadata)) continue;
       report.missing++;
       report.ids.push(id);
-      if (!opts.apply) {
-        log(`would add a summary: ${object.key}`);
-        continue;
-      }
       const { etag, meta } = await uploads.readSidecar(id);
       if (!etag) {
         report.changed++;
@@ -96,6 +100,11 @@ export async function backfillSummaries(
         log(`summary too large for custom metadata, left alone: ${object.key}`);
         continue;
       }
+      report.writable++;
+      if (!opts.apply) {
+        log(`would add a summary: ${object.key}`);
+        continue;
+      }
       if (await uploads.writeMeta(id, meta, { etagMatches: etag })) {
         report.written++;
         log(`added a summary: ${object.key}`);
@@ -107,4 +116,24 @@ export async function backfillSummaries(
     cursor = page.truncated ? page.cursor : undefined;
   } while (cursor);
   return report;
+}
+
+/**
+ * What the script tells the user after a run (stderr), or null: how many
+ * summaries `--apply` would write, and how many sidecars can never get one.
+ */
+export function backfillAdvice(report: BackfillReport, apply: boolean): string | null {
+  const lines: string[] = [];
+  if (!apply && report.writable > 0) {
+    lines.push(`Run again with --apply to write ${report.writable} summaries.`);
+  }
+  const never = report.unreadable + report.tooLarge;
+  if (never > 0) {
+    lines.push(
+      `${never} sidecar${never === 1 ? "" : "s"} cannot get a summary ` +
+        `(${report.unreadable} not valid or not shaped like a sidecar, ${report.tooLarge} too large); ` +
+        "run with --verbose to name them, and see docs/design/api.md.",
+    );
+  }
+  return lines.length > 0 ? lines.join("\n") : null;
 }

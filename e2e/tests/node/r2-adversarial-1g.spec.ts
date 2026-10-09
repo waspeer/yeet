@@ -312,8 +312,9 @@ test.describe("1G verifier: backfill", () => {
     };
     const dry = await backfillSummaries(b, "/uploads/", { apply: false });
     expect(b.calls.put ?? 0).toBe(0);
-    expect(b.calls.get ?? 0).toBe(0);
-    expect(dry).toMatchObject({ sidecars: 3, missing: 3, written: 0 });
+    // Round 1I: the dry run reads the sidecars without a summary, to classify them.
+    expect(b.calls.get ?? 0).toBe(3);
+    expect(dry).toMatchObject({ sidecars: 3, missing: 3, writable: 3, written: 0 });
     const rep = await backfillSummaries(b, "/uploads/", { apply: true });
     expect(rep).toMatchObject({ sidecars: 3, missing: 3, written: 1, changed: 2 });
     for (const [k, o] of before) expect(b.objects.get(k), k).toEqual(o);

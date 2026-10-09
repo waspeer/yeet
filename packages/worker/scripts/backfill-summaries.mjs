@@ -75,7 +75,7 @@ try {
     outfile: modulePath,
     logLevel: "error",
   });
-  const { backfillSummaries } = await import(pathToFileURL(modulePath).href);
+  const { backfillAdvice, backfillSummaries } = await import(pathToFileURL(modulePath).href);
 
   const configPath = join(tmp, "wrangler.json");
   await writeFile(
@@ -103,9 +103,8 @@ try {
   });
   const { ids: _, ...counts } = report;
   process.stdout.write(`${JSON.stringify({ apply: args.apply, ...counts })}\n`);
-  if (!args.apply && report.missing > 0) {
-    process.stderr.write(`Run again with --apply to write ${report.missing} summaries.\n`);
-  }
+  const advice = backfillAdvice(report, args.apply);
+  if (advice) process.stderr.write(`${advice}\n`);
 } finally {
   await proxy?.dispose();
   await rm(tmp, { recursive: true, force: true });

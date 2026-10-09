@@ -624,7 +624,12 @@ node scripts/backfill-summaries.mjs --remote --bucket <bucket_name> --apply  # w
   the content type, so e.g. the `mtime` rclone stores in custom metadata
   is gone afterwards. yeet does not read it; the cron's summary step does
   the same. The JSON body is unchanged.
-- **Safe:** a dry run unless `--apply`. Idempotent: a second run finds
+- **Safe:** a dry run unless `--apply`. The dry run reads every sidecar
+  without a summary (gets only, no writes) and classifies it exactly as
+  `--apply` would, so its `writable`, `unreadable` and `tooLarge` counts
+  and its closing "Run again with --apply to write N summaries" are what
+  `--apply` will find (before round 1I it counted every missing summary as
+  writable and reported `unreadable` and `tooLarge` as 0). Idempotent: a second run finds
   nothing to do. Each write is conditional on the etag it read, so a
   download counted (or an upload deleted) in between is never overwritten;
   it is reported as `changed`, and the Worker wrote that sidecar's summary
@@ -632,12 +637,14 @@ node scripts/backfill-summaries.mjs --remote --bucket <bucket_name> --apply  # w
   (`{}`, `[]`, `"downloads": 5`, …) are left alone (`unreadable`), and so
   are ones whose summary would exceed 2,048 bytes (`tooLarge`); see
   "Sidecars that never get a summary" above.
-- **Cost:** one list call per page of objects, plus a get and a put per
-  sidecar written. These are API calls from your machine, not Worker
+- **Cost:** one list call per page of objects, plus a get per sidecar
+  without a summary (dry run too) and a put per sidecar written. These are API calls from your machine, not Worker
   subrequests.
 - **Output:** one JSON line, e.g.
-  `{"apply":true,"sidecars":120,"missing":118,"written":118,"changed":0,"unreadable":0,"tooLarge":0}`;
-  `--verbose` names each key on stderr.
+  `{"apply":true,"sidecars":120,"missing":118,"writable":117,"written":117,"changed":0,"unreadable":1,"tooLarge":0}`;
+  `--verbose` names each key on stderr. On stderr it also says how many
+  summaries `--apply` would write (dry run) and how many sidecars can never
+  get one.
 - **Tested** on the in-memory bucket and, end to end, on a `wrangler dev`
   bucket (`e2e/tests/node/backfill.spec.ts`). Not yet run against real R2:
   start with a dry run.
