@@ -1,4 +1,9 @@
-import { CLEANUP_BUDGET, CLEANUP_LIST_LIMIT, CLEANUP_SUMMARIES, runCleanup } from "../../../packages/worker/src/cleanup.js";
+import {
+  CLEANUP_BUDGET,
+  CLEANUP_LIST_LIMIT,
+  CLEANUP_SUMMARIES,
+  runCleanup,
+} from "../../../packages/worker/src/cleanup.js";
 import { backfillSummaries } from "../../../packages/worker/src/backfill.js";
 import {
   LIST_BUDGET,
@@ -45,7 +50,8 @@ class CheckedBucket extends StrictBucket {
       if (!k.endsWith("/.meta.json")) continue;
       const dir = k.slice(0, -".meta.json".length);
       const left = this.sorted(dir);
-      if (left.length > 0) this.violations.push(`sidecar ${k} deleted, ${left.length} keys left e.g. ${left[0]}`);
+      if (left.length > 0)
+        this.violations.push(`sidecar ${k} deleted, ${left.length} keys left e.g. ${left[0]}`);
     }
   }
 }
@@ -81,7 +87,8 @@ function seedUpload(b: StrictBucket, id: string, s: Shape) {
       s.legacy || s.unreadable ? {} : { summary: JSON.stringify(summarize(meta)) },
     );
   }
-  for (let i = 0; i < (s.records ?? 0); i++) b.seed(`${dir}.downloads/2026-06-01T00:00:00.${String(i).padStart(6, "0")}Z_x`);
+  for (let i = 0; i < (s.records ?? 0); i++)
+    b.seed(`${dir}.downloads/2026-06-01T00:00:00.${String(i).padStart(6, "0")}Z_x`);
   for (let n = 1; n <= (s.parts ?? 0); n++) b.seed(`${dir}.parts/${n}`, "", { size: "5" });
   for (let n = 0; n < (s.junkAfter ?? 0); n++) b.seed(`${dir}zz/${n}`);
   for (let n = 0; n < (s.junkBefore ?? 0); n++) b.seed(`${dir}-j/${n}`);
@@ -138,7 +145,14 @@ test.describe("1G verifier: cron on adversarial buckets", () => {
           const keys = b.sorted(`${P}/${id}/`);
           if (isStaleShape(s) && keys.length) return false;
           if (keys.some((k) => k.includes("/.downloads/"))) return false;
-          if (!isStaleShape(s) && s.legacy && !s.unreadable && !s.noSidecar && !b.objects.get(`${P}/${id}/.meta.json`)!.meta.summary) return false;
+          if (
+            !isStaleShape(s) &&
+            s.legacy &&
+            !s.unreadable &&
+            !s.noSidecar &&
+            !b.objects.get(`${P}/${id}/.meta.json`)!.meta.summary
+          )
+            return false;
         }
         return true;
       });
@@ -150,15 +164,18 @@ test.describe("1G verifier: cron on adversarial buckets", () => {
         const s = shapes.get(id)!;
         const sc = b.objects.get(`${P}/${id}/.meta.json`)!;
         expect(sc, id).toBeTruthy();
-        if (!s.unreadable) expect(JSON.parse(sc.meta.summary!)).toEqual(summarize(JSON.parse(sc.body)));
+        if (!s.unreadable)
+          expect(JSON.parse(sc.meta.summary!)).toEqual(summarize(JSON.parse(sc.body)));
       }
     });
   }
 
   test("thousands of consecutive unreadable sidecars, then stale uploads: all stale deleted", async () => {
     const b = new CheckedBucket();
-    for (let i = 0; i < 3000; i++) seedUpload(b, `a${String(i).padStart(5, "0")}`, { unreadable: true });
-    for (let i = 0; i < 300; i++) seedUpload(b, `b${String(i).padStart(5, "0")}`, { expired: true, legacy: i % 2 === 0 });
+    for (let i = 0; i < 3000; i++)
+      seedUpload(b, `a${String(i).padStart(5, "0")}`, { unreadable: true });
+    for (let i = 0; i < 300; i++)
+      seedUpload(b, `b${String(i).padStart(5, "0")}`, { expired: true, legacy: i % 2 === 0 });
     const { run, maxCalls } = await runUntil(b, 500, () => b.sorted(`${P}/b`).length === 0);
     console.log(`unreadable run: ${run} runs, max ${maxCalls}`);
     expect(run).toBeLessThan(500);
@@ -167,16 +184,31 @@ test.describe("1G verifier: cron on adversarial buckets", () => {
 
   test("sidecar-only legacy uploads, all expired: all deleted, never >45", async () => {
     const b = new CheckedBucket({ randomPages: true, seed: 9 });
-    for (let i = 0; i < 2000; i++) seedUpload(b, `s${String(i).padStart(5, "0")}`, { expired: true, legacy: true, noFile: true });
-    const { run } = await runUntil(b, 1000, () => b.sorted(`${P}/`).filter((k) => !k.endsWith("cleanup-cursor")).length === 0);
+    for (let i = 0; i < 2000; i++)
+      seedUpload(b, `s${String(i).padStart(5, "0")}`, {
+        expired: true,
+        legacy: true,
+        noFile: true,
+      });
+    const { run } = await runUntil(
+      b,
+      1000,
+      () => b.sorted(`${P}/`).filter((k) => !k.endsWith("cleanup-cursor")).length === 0,
+    );
     expect(run).toBeLessThan(1000);
   });
 
   test("one stale upload with 30,000 keys after its sidecar, between live uploads", async () => {
     const b = new CheckedBucket();
-    for (let i = 0; i < 30; i++) { seedUpload(b, `a${i}`, { legacy: true }); b.live.add(`a${i}`); }
+    for (let i = 0; i < 30; i++) {
+      seedUpload(b, `a${i}`, { legacy: true });
+      b.live.add(`a${i}`);
+    }
     seedUpload(b, "big", { expired: true, junkAfter: 30000, records: 3000 });
-    for (let i = 0; i < 30; i++) { seedUpload(b, `c${i}`, { legacy: true }); b.live.add(`c${i}`); }
+    for (let i = 0; i < 30; i++) {
+      seedUpload(b, `c${i}`, { legacy: true });
+      b.live.add(`c${i}`);
+    }
     const { run } = await runUntil(b, runsAt200(250), () => b.sorted(`${P}/big/`).length === 0);
     console.log(`big stale upload gone after ${run} runs`);
     expect(b.violations).toEqual([]);
@@ -199,7 +231,10 @@ test.describe("1G verifier: cron on adversarial buckets", () => {
 
   test("cron summary step never clobbers a download counted between its get and put", async () => {
     const b = new CheckedBucket();
-    for (let i = 0; i < 10; i++) { seedUpload(b, `r${i}`, { legacy: true }); b.live.add(`r${i}`); }
+    for (let i = 0; i < 10; i++) {
+      seedUpload(b, `r${i}`, { legacy: true });
+      b.live.add(`r${i}`);
+    }
     const raced = new Set<string>();
     b.beforePut = (key) => {
       if (!key.endsWith("/.meta.json") || raced.has(key)) return;
@@ -220,7 +255,8 @@ test.describe("1G verifier: cron on adversarial buckets", () => {
     // Round 1I: a run gives at most CLEANUP_SUMMARIES (10) sidecars their
     // summary (it was 21, as many as the old budget of 45 calls allowed).
     const n = CLEANUP_SUMMARIES;
-    const results: Record<number, { summarized: number; deleted: number; cursor: string | null }> = {};
+    const results: Record<number, { summarized: number; deleted: number; cursor: string | null }> =
+      {};
     for (const k of [n - 1, n, n + 1]) {
       const b = new CheckedBucket();
       for (let i = 0; i < k; i++) seedUpload(b, `a${String(i).padStart(3, "0")}`, { legacy: true });
@@ -257,7 +293,11 @@ test.describe("1G verifier: cron on adversarial buckets", () => {
       for (let i = 0; i < 10; i++) seedUpload(b, `p${i}`, { expired: true, legacy: true });
       seedUpload(b, "live", { records: 150 + seed * 7, filename: "zz.bin" });
       b.live.add("live");
-      for (let r = 0; r < 20; r++) { b.reset(); b.maxCalls = CLEANUP_BUDGET; await runCleanup(b, P, NOW); }
+      for (let r = 0; r < 20; r++) {
+        b.reset();
+        b.maxCalls = CLEANUP_BUDGET;
+        await runCleanup(b, P, NOW);
+      }
       expect(b.violations, `seed ${seed}`).toEqual([]);
       expect(b.objects.has(`${P}/live/.meta.json`) && b.objects.has(`${P}/live/zz.bin`)).toBe(true);
     }
@@ -287,7 +327,11 @@ test.describe("1G verifier: deleteUnder sidecar-last", () => {
         const r = await super.list(o);
         if (o.include) return r;
         const objects = r.objects.slice(0, 1);
-        return { objects, truncated: r.objects.length > 1 || r.truncated, ...(r.cursor ? { cursor: r.cursor } : {}) };
+        return {
+          objects,
+          truncated: r.objects.length > 1 || r.truncated,
+          ...(r.cursor ? { cursor: r.cursor } : {}),
+        };
       }
     }
     const b = new OnePerPage();
@@ -302,11 +346,25 @@ test.describe("1G verifier: deleteUnder sidecar-last", () => {
 test.describe("1G verifier: backfill", () => {
   test("touches nothing but upload sidecars; races are not overwritten", async () => {
     const b = new StrictBucket({ maxCalls: Infinity, randomPages: true, seed: 5 });
-    const meta: UploadMeta = { filename: "f", file_size: 1, uploaded_at: new Date(NOW).toISOString(), expires_at: new Date(NOW + DAY).toISOString() };
+    const meta: UploadMeta = {
+      filename: "f",
+      file_size: 1,
+      uploaded_at: new Date(NOW).toISOString(),
+      expires_at: new Date(NOW + DAY).toISOString(),
+    };
     const body = JSON.stringify(meta);
     const others = [
-      `${P}/.meta.json`, `${P}/x/y/.meta.json`, `${P}/a.b/.meta.json`, `${P}X/a/.meta.json`, `other/a/.meta.json`,
-      `${P}/a/.meta.json/x`, `${P}/a/.meta.jsonx`, `${P}/a/f`, `${P}/a/.parts/1`, `${P}/a/.downloads/1`, `${P}/.cleanup-cursor`,
+      `${P}/.meta.json`,
+      `${P}/x/y/.meta.json`,
+      `${P}/a.b/.meta.json`,
+      `${P}X/a/.meta.json`,
+      `other/a/.meta.json`,
+      `${P}/a/.meta.json/x`,
+      `${P}/a/.meta.jsonx`,
+      `${P}/a/f`,
+      `${P}/a/.parts/1`,
+      `${P}/a/.downloads/1`,
+      `${P}/.cleanup-cursor`,
     ];
     for (const k of others) b.seed(k, body);
     b.seed(`${P}/a/.meta.json`, body);
@@ -334,7 +392,12 @@ test.describe("1G verifier: backfill", () => {
   });
 
   test("a summary that is not one ('null', '5', '{}'): backfill and listing agree it is missing", async () => {
-    const meta: UploadMeta = { filename: "f", file_size: 1, uploaded_at: new Date(NOW).toISOString(), expires_at: new Date(NOW + DAY).toISOString() };
+    const meta: UploadMeta = {
+      filename: "f",
+      file_size: 1,
+      uploaded_at: new Date(NOW).toISOString(),
+      expires_at: new Date(NOW + DAY).toISOString(),
+    };
     for (const summary of ["null", "5", "{}", '"x"', "[]"]) {
       const b = new StrictBucket({ maxCalls: Infinity });
       b.seed(`${P}/a/.meta.json`, JSON.stringify(meta), { summary });
@@ -343,18 +406,25 @@ test.describe("1G verifier: backfill", () => {
       expect(l.uploads[0]!.meta, summary).toEqual(summarize(meta)); // read from the body
       const rep = await backfillSummaries(b, P, { apply: true });
       expect(rep, summary).toMatchObject({ missing: 1, written: 1 });
-      expect(JSON.parse(b.objects.get(`${P}/a/.meta.json`)!.meta.summary!)).toEqual(summarize(meta));
+      expect(JSON.parse(b.objects.get(`${P}/a/.meta.json`)!.meta.summary!)).toEqual(
+        summarize(meta),
+      );
       expect((await new Uploads(b, P).listAll()).uploads[0]!.unsummarized, summary).toBe(false);
     }
   });
 
-  test("valid JSON that is not a sidecar ({}, [], 5, \"x\") gets no summary", async () => {
+  test('valid JSON that is not a sidecar ({}, [], 5, "x") gets no summary', async () => {
     const b = new StrictBucket({ maxCalls: Infinity });
     const bodies = ["{}", "[]", "5", '"x"', "null", '{"filename":"f"}'];
     bodies.forEach((body, i) => b.seed(`${P}/n${i}/.meta.json`, body));
     const before = new Map([...b.objects].map(([k, o]) => [k, { ...o }]));
     const rep = await backfillSummaries(b, P, { apply: true });
-    expect(rep).toMatchObject({ sidecars: bodies.length, missing: bodies.length, written: 0, unreadable: bodies.length });
+    expect(rep).toMatchObject({
+      sidecars: bodies.length,
+      missing: bodies.length,
+      written: 0,
+      unreadable: bodies.length,
+    });
     expect(new Map([...b.objects].map(([k, o]) => [k, { ...o }]))).toEqual(before);
   });
 });
@@ -431,7 +501,11 @@ test.describe("1H: sidecars that cannot be summarised never stop a run or a list
 
   /** Like R2 (miniflare's limit): custom metadata over 8,192 bytes is refused. */
   class MetadataLimitBucket extends CheckedBucket {
-    override async put(key: string, value: string, options: Parameters<StrictBucket["put"]>[2] = {}) {
+    override async put(
+      key: string,
+      value: string,
+      options: Parameters<StrictBucket["put"]>[2] = {},
+    ) {
       const size = Object.entries(options.customMetadata ?? {}).reduce(
         (sum, [k, v]) => sum + Buffer.byteLength(k) + Buffer.byteLength(v),
         0,
@@ -488,7 +562,10 @@ test.describe("1H: sidecars that cannot be summarised never stop a run or a list
     });
     const bytes = (m: UploadMeta) => "summary".length + JSON.stringify(summarize(m)).length;
     const fits = "x".repeat(MAX_SUMMARY_BYTES - bytes(meta("")));
-    for (const [filename, stored] of [[fits, true], [fits + "x", false]] as const) {
+    for (const [filename, stored] of [
+      [fits, true],
+      [fits + "x", false],
+    ] as const) {
       const b = new StrictBucket({ maxCalls: Infinity });
       expect(await new Uploads(b, P).writeMeta("a", meta(filename))).toBe(true);
       expect(!!b.objects.get(`${P}/a/.meta.json`)!.meta.summary).toBe(stored);
@@ -500,9 +577,14 @@ test("1G verifier: GET listing never exceeds 40 calls on adversarial shapes", as
   for (const seed of [11, 12, 13]) {
     const b = new StrictBucket({ randomPages: true, seed, maxCalls: LIST_BUDGET });
     const rnd = seededRandom(seed);
-    for (let i = 0; i < 800; i++) seedUpload(b, `g${String(i).padStart(4, "0")}`, {
-      legacy: rnd() < 0.5, unreadable: rnd() < 0.1, records: rnd() < 0.05 ? 1500 : 0, parts: rnd() < 0.05 ? 1500 : 0, junkAfter: rnd() < 0.02 ? 300 : 0,
-    });
+    for (let i = 0; i < 800; i++)
+      seedUpload(b, `g${String(i).padStart(4, "0")}`, {
+        legacy: rnd() < 0.5,
+        unreadable: rnd() < 0.1,
+        records: rnd() < 0.05 ? 1500 : 0,
+        parts: rnd() < 0.05 ? 1500 : 0,
+        junkAfter: rnd() < 0.02 ? 300 : 0,
+      });
     let after: string | undefined;
     for (let r = 0; r < 200; r++) {
       b.reset();

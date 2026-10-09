@@ -1,5 +1,14 @@
-import { CLEANUP_BUDGET, CLEANUP_LIST_LIMIT, runCleanup } from "../../../packages/worker/src/cleanup.js";
-import { LIST_BUDGET, summarize, Uploads, type UploadMeta } from "../../../packages/worker/src/uploads.js";
+import {
+  CLEANUP_BUDGET,
+  CLEANUP_LIST_LIMIT,
+  runCleanup,
+} from "../../../packages/worker/src/cleanup.js";
+import {
+  LIST_BUDGET,
+  summarize,
+  Uploads,
+  type UploadMeta,
+} from "../../../packages/worker/src/uploads.js";
 import { expect, test } from "../../lib/index.js";
 import { StrictBucket, byteCompare, seededRandom } from "../../lib/strict-r2.js";
 
@@ -38,9 +47,15 @@ function seed(b: StrictBucket, id: string, o: Opt = {}): UploadMeta {
     ...(o.pending !== undefined ? { pending_upload_id: `mp-${id}` } : {}),
   };
   if (o.pending === undefined) b.seed(dir + meta.filename, "x");
-  b.seed(dir + ".meta.json", JSON.stringify(meta), o.legacy ? {} : { summary: JSON.stringify(summarize(meta)) });
+  b.seed(
+    dir + ".meta.json",
+    JSON.stringify(meta),
+    o.legacy ? {} : { summary: JSON.stringify(summarize(meta)) },
+  );
   for (let i = 0; i < (o.records ?? 0); i++)
-    b.seed(`${dir}.downloads/${new Date(Date.UTC(2026, 5, 1) + i).toISOString()}_${i.toString(16).padStart(8, "0")}`);
+    b.seed(
+      `${dir}.downloads/${new Date(Date.UTC(2026, 5, 1) + i).toISOString()}_${i.toString(16).padStart(8, "0")}`,
+    );
   for (let n = 1; n <= (o.parts ?? 0); n++) b.seed(`${dir}.parts/${n}`, "", { size: "5" });
   for (let n = 0; n < (o.junkInside ?? 0); n++) b.seed(`${dir}zz-junk/${n}`);
   return meta;
@@ -65,7 +80,10 @@ async function chain(b: StrictBucket, budget = LIST_BUDGET, maxRounds = 500) {
   for (;;) {
     b.reset();
     b.maxCalls = 50;
-    const r = await new Uploads(b, P).listAll({ budget, ...(after !== undefined ? { after } : {}) });
+    const r = await new Uploads(b, P).listAll({
+      budget,
+      ...(after !== undefined ? { after } : {}),
+    });
     expect(b.total).toBe(r.subrequests);
     expect(r.subrequests).toBeLessThanOrEqual(budget);
     perCall.push(r.subrequests);
@@ -96,7 +114,8 @@ test.describe("adversarial listing", () => {
   test("junk pages then unsummarized sidecars: resume chain must not skip uploads", async () => {
     for (const budget of [40, 25]) {
       const b = new StrictBucket();
-      for (let i = 0; i < (budget - 1) * 100; i++) b.seed(`${P}/a${String(i).padStart(5, "0")}.junk`);
+      for (let i = 0; i < (budget - 1) * 100; i++)
+        b.seed(`${P}/a${String(i).padStart(5, "0")}.junk`);
       for (let i = 0; i < 200; i++) seed(b, `m${String(i).padStart(4, "0")}`, { legacy: true });
       const seen: string[] = [];
       let after: string | undefined;
@@ -121,7 +140,27 @@ test.describe("adversarial listing", () => {
 
   test("IDs differing late / prefix-related, tiny budgets", async () => {
     const chars = "-0189AZ_az".split("");
-    const ids = new Set<string>(["a", "a-", "a0", "a_", "aa", "ab", "a--", "a-0", "abc", "abc-", "abc0", "abc_", "abcA", "abc-x", "ab-", "Z", "_", "-", "0"]);
+    const ids = new Set<string>([
+      "a",
+      "a-",
+      "a0",
+      "a_",
+      "aa",
+      "ab",
+      "a--",
+      "a-0",
+      "abc",
+      "abc-",
+      "abc0",
+      "abc_",
+      "abcA",
+      "abc-x",
+      "ab-",
+      "Z",
+      "_",
+      "-",
+      "0",
+    ]);
     for (const c1 of chars) for (const c2 of chars) ids.add(`xyzxy${c1}${c2}`);
     for (const c1 of chars) ids.add(`xyzxy${c1}`);
     const failures: string[] = [];
@@ -130,8 +169,24 @@ test.describe("adversarial listing", () => {
         const b = new StrictBucket({ randomPages: rp });
         let i = 0;
         for (const id of ids) {
-          const fn = ["file.bin", "-dash", "!bang", " space", "~tilde", "\u{1F600}.png", "é.txt", ".hidden", "0zero", "￿"][i++ % 10]!;
-          seed(b, id, { filename: fn, legacy: i % 7 === 0, records: i % 11 === 0 ? 150 : 0, parts: 0 });
+          const fn = [
+            "file.bin",
+            "-dash",
+            "!bang",
+            " space",
+            "~tilde",
+            "\u{1F600}.png",
+            "é.txt",
+            ".hidden",
+            "0zero",
+            "￿",
+          ][i++ % 10]!;
+          seed(b, id, {
+            filename: fn,
+            legacy: i % 7 === 0,
+            records: i % 11 === 0 ? 150 : 0,
+            parts: 0,
+          });
         }
         // junk around
         b.seed(`${P}/.cleanup-cursor`, "{}");
@@ -145,7 +200,9 @@ test.describe("adversarial listing", () => {
           const truth = truthIds(b);
           const missing = truth.filter((x) => !seen.includes(x));
           const dup = seen.length - new Set(seen).size;
-          console.log(`budget ${budget} rp ${rp}: missing ${missing.length} dup ${dup} order ${JSON.stringify(seen) === JSON.stringify(truth)}`);
+          console.log(
+            `budget ${budget} rp ${rp}: missing ${missing.length} dup ${dup} order ${JSON.stringify(seen) === JSON.stringify(truth)}`,
+          );
           failures.push(...(missing.length || dup ? [`b${budget} rp${rp}`] : []));
         } catch (e) {
           console.log(`budget ${budget} rp ${rp}: ERROR ${String(e).slice(0, 200)}`);
@@ -161,7 +218,12 @@ test.describe("adversarial listing", () => {
     for (let i = 0; i < 300; i++) {
       seed(b, `r${String(i).padStart(4, "0")}`, { records: 1200 + (i % 3) * 100 });
     }
-    for (let i = 0; i < 50; i++) seed(b, `p${String(i).padStart(4, "0")}`, { pending: NOW - 1000, parts: 2000, filename: "!a" });
+    for (let i = 0; i < 50; i++)
+      seed(b, `p${String(i).padStart(4, "0")}`, {
+        pending: NOW - 1000,
+        parts: 2000,
+        filename: "!a",
+      });
     for (let i = 0; i < 3000; i++) seed(b, `s${String(i).padStart(4, "0")}`, { legacy: true });
     for (let i = 0; i < 20; i++) seed(b, `j${String(i).padStart(4, "0")}`, { junkInside: 2500 });
     for (let i = 0; i < 6000; i++) b.seed(`${P}/k${i}.junk`);
@@ -201,18 +263,25 @@ test.describe("adversarial cron", () => {
       const id = `c${String(i).padStart(4, "0")}`;
       const m = i % 9;
       if (m === 0) (seed(b, id, { expired: true, records: i % 4 === 0 ? 400 : 0 }), stale.add(id));
-      else if (m === 1) (seed(b, id, { pending: NOW - 2 * DAY, parts: i % 2 ? 500 : 2 }), stale.add(id));
+      else if (m === 1)
+        (seed(b, id, { pending: NOW - 2 * DAY, parts: i % 2 ? 500 : 2 }), stale.add(id));
       else if (m === 2) seed(b, id, { records: i % 5 === 0 ? 700 : 150 });
       else if (m === 3) seed(b, id, { legacy: true });
       else if (m === 4) seed(b, id, { pending: NOW - 1000, parts: 600 });
-      else if (m === 5) seed(b, id, { legacy: true, expired: true }), stale.add(id);
+      else if (m === 5) (seed(b, id, { legacy: true, expired: true }), stale.add(id));
       else seed(b, id, { filename: ["\u{1F600}", "-x", "é", "~"][i % 4] });
       if (!stale.has(id)) keep.set(id, 0);
     }
-    for (let i = 0; i < 5; i++) for (let r = 0; r < 600; r++) b.seed(`${P}/zstray${i}/.downloads/2026-06-01T00:00:00.${r}Z_0`);
+    for (let i = 0; i < 5; i++)
+      for (let r = 0; r < 600; r++)
+        b.seed(`${P}/zstray${i}/.downloads/2026-06-01T00:00:00.${r}Z_0`);
     for (let i = 0; i < 3000; i++) b.seed(`${P}/k${i}.junk`);
     const keepKeys = new Map<string, string[]>();
-    for (const id of keep.keys()) keepKeys.set(id, b.sorted(`${P}/${id}/`).filter((k) => !k.includes("/.downloads/")));
+    for (const id of keep.keys())
+      keepKeys.set(
+        id,
+        b.sorted(`${P}/${id}/`).filter((k) => !k.includes("/.downloads/")),
+      );
 
     let i = 0;
     let maxCalls = 0;
@@ -223,15 +292,24 @@ test.describe("adversarial cron", () => {
       maxCalls = Math.max(maxCalls, r.subrequests);
       expect(r.subrequests).toBeLessThanOrEqual(CLEANUP_BUDGET);
       if (i % 10 !== 9) continue;
-      for (const [id, ks] of keepKeys) for (const k of ks) if (!b.objects.has(k)) throw new Error(`valid key deleted: ${k} run ${i}`);
+      for (const [id, ks] of keepKeys)
+        for (const k of ks)
+          if (!b.objects.has(k)) throw new Error(`valid key deleted: ${k} run ${i}`);
       const keys = b.sorted(`${P}/`);
       const st = [...stale].filter((id) => b.sorted(`${P}/${id}/`).length > 0).length;
       const rec = keys.filter((k) => k.includes("/.downloads/")).length;
-      const un = [...keep.keys()].filter((id) => !b.objects.get(`${P}/${id}/.meta.json`)!.meta.summary).length;
-      if (i % 100 === 99) console.log(`run ${i + 1}: stale ${st} records ${rec} unsummarized ${un} keys ${keys.length}`);
+      const un = [...keep.keys()].filter(
+        (id) => !b.objects.get(`${P}/${id}/.meta.json`)!.meta.summary,
+      ).length;
+      if (i % 100 === 99)
+        console.log(
+          `run ${i + 1}: stale ${st} records ${rec} unsummarized ${un} keys ${keys.length}`,
+        );
       if (i === maxRuns - 1) {
         const left = [...stale].filter((id) => b.sorted(`${P}/${id}/`).length > 0);
-        throw new Error(`not converged after ${maxRuns} runs; stale uploads left: ${left.slice(0, 20).join(" ")}`);
+        throw new Error(
+          `not converged after ${maxRuns} runs; stale uploads left: ${left.slice(0, 20).join(" ")}`,
+        );
       }
       if (st === 0 && rec === 0 && un === 0) break;
     }
@@ -294,7 +372,8 @@ test.describe("adversarial cron", () => {
     expect(cs.at(-1)).toBeNull();
     // creation during runs
     const b2 = new StrictBucket({ randomPages: true });
-    for (let i = 0; i < 3000; i++) seed(b2, `f${String(i).padStart(4, "0")}`, { expired: i % 3 === 0 });
+    for (let i = 0; i < 3000; i++)
+      seed(b2, `f${String(i).padStart(4, "0")}`, { expired: i % 3 === 0 });
     let n = 0;
     const created: string[] = [];
     const random = seededRandom(2);
@@ -307,7 +386,12 @@ test.describe("adversarial cron", () => {
     // Round 1I: about 25 uploads a run on random pages of up to 100 objects.
     await runs(b2, 250);
     for (const id of created) expect(b2.objects.has(`${P}/${id}/.meta.json`), id).toBe(true);
-    expect(b2.sorted(`${P}/`).filter((k) => k.endsWith(".meta.json")).every((k) => !JSON.parse(b2.objects.get(k)!.body).expires_at.startsWith("2026-10-08T02"))).toBe(true);
+    expect(
+      b2
+        .sorted(`${P}/`)
+        .filter((k) => k.endsWith(".meta.json"))
+        .every((k) => !JSON.parse(b2.objects.get(k)!.body).expires_at.startsWith("2026-10-08T02")),
+    ).toBe(true);
   });
 
   test("junk keys right before a legacy-record upload: valid upload not deleted as stray", async () => {
@@ -319,7 +403,18 @@ test.describe("adversarial cron", () => {
     seed(b, "v0002");
     const fileKey = `${P}/v0001/file.bin`;
     const r = await new Uploads(b, P).listAll({ budget: 25 });
-    console.log("junk-before-legacy listing:", JSON.stringify(r.uploads.map((u) => ({ id: u.id, stray: u.stray, complete: u.complete, n: u.keys.length }))), r.truncated);
+    console.log(
+      "junk-before-legacy listing:",
+      JSON.stringify(
+        r.uploads.map((u) => ({
+          id: u.id,
+          stray: u.stray,
+          complete: u.complete,
+          n: u.keys.length,
+        })),
+      ),
+      r.truncated,
+    );
     b.reset();
     await runCleanup(b, P, NOW);
     expect(b.objects.has(fileKey), "valid upload deleted").toBe(true);
@@ -353,7 +448,12 @@ test.describe("adversarial download count", () => {
       const meta = seed(b, "d0001");
       const key = `${P}/d0001/.meta.json`;
       if (legacy) {
-        const m = { ...meta, downloads: Array.from({ length: 50 }, (_, i) => ({ at: `2026-01-01T00:00:${String(i).padStart(2, "0")}.000Z` })) };
+        const m = {
+          ...meta,
+          downloads: Array.from({ length: 50 }, (_, i) => ({
+            at: `2026-01-01T00:00:${String(i).padStart(2, "0")}.000Z`,
+          })),
+        };
         b.seed(key, JSON.stringify(m), {});
       }
       let injected = 0;
@@ -363,13 +463,23 @@ test.describe("adversarial download count", () => {
           const cur = JSON.parse(b.objects.get(k)!.body) as UploadMeta;
           const base = cur.download_count ?? cur.downloads?.length ?? 0;
           const { downloads: _d, ...rest } = cur;
-          const next = { ...rest, download_count: base + 1, recent_downloads: [...(cur.recent_downloads ?? []), new Date(NOW).toISOString()].sort().slice(-5) };
+          const next = {
+            ...rest,
+            download_count: base + 1,
+            recent_downloads: [...(cur.recent_downloads ?? []), new Date(NOW).toISOString()]
+              .sort()
+              .slice(-5),
+          };
           b.seed(k, JSON.stringify(next), { summary: JSON.stringify(summarize(next)) });
           injected++;
         }
       };
       const u = new Uploads(b, P);
-      const res = await Promise.all(Array.from({ length: 10 }, (_, i) => u.recordDownload("d0001", new Date(NOW + i).toISOString())));
+      const res = await Promise.all(
+        Array.from({ length: 10 }, (_, i) =>
+          u.recordDownload("d0001", new Date(NOW + i).toISOString()),
+        ),
+      );
       const ok = res.filter(Boolean).length;
       const stored = JSON.parse(b.objects.get(key)!.body) as UploadMeta;
       expect(stored.download_count).toBe((legacy ? 50 : 0) + ok + injected);
@@ -401,7 +511,9 @@ test.describe("adversarial download count", () => {
         b2.seed(k, JSON.stringify({ ...m, pending_upload_id: "new" }), {});
       }
     };
-    expect(await new Uploads(b2, P).recordDownload("d0003", "2026-10-08T00:00:00.000Z")).toBe(false);
+    expect(await new Uploads(b2, P).recordDownload("d0003", "2026-10-08T00:00:00.000Z")).toBe(
+      false,
+    );
     expect(JSON.parse(b2.objects.get(k2)!.body).pending_upload_id).toBe("new");
   });
 
@@ -409,22 +521,33 @@ test.describe("adversarial download count", () => {
     const b = new StrictBucket({ maxCalls: Infinity });
     seed(b, "d0004");
     const u = new Uploads(b, P);
-    for (let i = 0; i < 30; i++) expect(await u.recordDownload("d0004", new Date(NOW + i * 1000).toISOString())).toBe(true);
+    for (let i = 0; i < 30; i++)
+      expect(await u.recordDownload("d0004", new Date(NOW + i * 1000).toISOString())).toBe(true);
     const s = JSON.parse(b.objects.get(`${P}/d0004/.meta.json`)!.body);
     expect(s.download_count).toBe(30);
-    expect(s.recent_downloads).toEqual(Array.from({ length: 5 }, (_, i) => new Date(NOW + (25 + i) * 1000).toISOString()));
+    expect(s.recent_downloads).toEqual(
+      Array.from({ length: 5 }, (_, i) => new Date(NOW + (25 + i) * 1000).toISOString()),
+    );
   });
 });
 
 test.describe("cron: targeted checks", () => {
   test("cron stopped mid-way resumes at the first unfinished upload", async () => {
     const b = new StrictBucket();
-    for (let i = 0; i < 3000; i++) seed(b, `u${String(i).padStart(5, "0")}`, i < 20 ? { expired: true, records: 1500 } : {});
+    for (let i = 0; i < 3000; i++)
+      seed(b, `u${String(i).padStart(5, "0")}`, i < 20 ? { expired: true, records: 1500 } : {});
     const r = await runCleanup(b, P, NOW);
-    const unfinished = Array.from({ length: 20 }, (_, i) => `u${String(i).padStart(5, "0")}`).filter((id) => b.sorted(`${P}/${id}/`).length > 0);
+    const unfinished = Array.from(
+      { length: 20 },
+      (_, i) => `u${String(i).padStart(5, "0")}`,
+    ).filter((id) => b.sorted(`${P}/${id}/`).length > 0);
     console.log("cursor", r.cursor, "unfinished", unfinished.length);
     expect(unfinished.length).toBeGreaterThan(0);
-    for (const id of unfinished) expect(r.cursor === null || byteCompare(`${P}/${id}/`, r.cursor) > 0, `${id} after ${r.cursor}`).toBe(true);
+    for (const id of unfinished)
+      expect(
+        r.cursor === null || byteCompare(`${P}/${id}/`, r.cursor) > 0,
+        `${id} after ${r.cursor}`,
+      ).toBe(true);
   });
   test("an upload dir with a file but no sidecar is left alone", async () => {
     const b = new StrictBucket();
@@ -435,7 +558,13 @@ test.describe("cron: targeted checks", () => {
   });
   test("summary step keeps a legacy downloads array's count", async () => {
     const b = new StrictBucket();
-    const m = { filename: "f", file_size: 1, uploaded_at: new Date(NOW - DAY).toISOString(), expires_at: new Date(NOW + DAY).toISOString(), downloads: [{ at: "2026-01-01T00:00:00.000Z" }, { at: "2026-01-02T00:00:00.000Z" }] };
+    const m = {
+      filename: "f",
+      file_size: 1,
+      uploaded_at: new Date(NOW - DAY).toISOString(),
+      expires_at: new Date(NOW + DAY).toISOString(),
+      downloads: [{ at: "2026-01-01T00:00:00.000Z" }, { at: "2026-01-02T00:00:00.000Z" }],
+    };
     b.seed(`${P}/y0001/f`, "x");
     b.seed(`${P}/y0001/.meta.json`, JSON.stringify(m));
     await runs(b, 1);

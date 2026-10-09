@@ -95,8 +95,12 @@ try {
     persist: args.local ? { path: join(persistTo, "v3") } : false,
   });
 
-  const where = args.remote ? `remote bucket ${args.bucket}` : `local bucket ${args.bucket} in ${persistTo}`;
-  process.stderr.write(`${args.apply ? "Writing" : "Dry run (no --apply)"}: ${where}, prefix ${args.prefix}/\n`);
+  const where = args.remote
+    ? `remote bucket ${args.bucket}`
+    : `local bucket ${args.bucket} in ${persistTo}`;
+  process.stderr.write(
+    `${args.apply ? "Writing" : "Dry run (no --apply)"}: ${where}, prefix ${args.prefix}/\n`,
+  );
   const report = await backfillSummaries(proxy.env.BUCKET, args.prefix, {
     apply: args.apply,
     log: args.verbose ? (line) => process.stderr.write(`${line}\n`) : undefined,

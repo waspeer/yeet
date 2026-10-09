@@ -185,7 +185,12 @@ test.describe("1I verifier: page walks of GET /api/uploads", () => {
       const id = `w${String(i).padStart(4, "0")}`;
       ids.push(id);
       // Every seventh has a `.downloads/` or `.parts/` run longer than a page.
-      seed(b, id, i % 7 === 0 ? (i % 2 ? { records: 700 } : { legacy: true, records: 400 }) : {}, i);
+      seed(
+        b,
+        id,
+        i % 7 === 0 ? (i % 2 ? { records: 700 } : { legacy: true, records: 400 }) : {},
+        i,
+      );
     }
     // R2 answers every jump (the second list call of a page) with an empty page.
     b.script = (n) => (n === 1 ? 0 : undefined);

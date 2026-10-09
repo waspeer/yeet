@@ -22,7 +22,8 @@ export function seededRandom(seed: number): () => number {
   };
 }
 
-const cmp = (a: string, b: string) => Buffer.compare(Buffer.from(a, "utf-8"), Buffer.from(b, "utf-8"));
+const cmp = (a: string, b: string) =>
+  Buffer.compare(Buffer.from(a, "utf-8"), Buffer.from(b, "utf-8"));
 
 interface Obj {
   body: string;
@@ -97,8 +98,13 @@ export class StrictBucket implements Bucket {
   private firstAfter(after: string | undefined): number {
     const a = this.all();
     if (after === undefined) return 0;
-    let lo = 0, hi = a.length;
-    while (lo < hi) { const mid = (lo + hi) >> 1; if (cmp(a[mid]!, after) > 0) hi = mid; else lo = mid + 1; }
+    let lo = 0,
+      hi = a.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (cmp(a[mid]!, after) > 0) hi = mid;
+      else lo = mid + 1;
+    }
     return lo;
   }
   remove(k: string) {
@@ -107,18 +113,32 @@ export class StrictBucket implements Bucket {
   sorted(prefix = "") {
     return this.range(prefix, undefined, Infinity).page;
   }
-  private range(prefix: string, after: string | undefined, limit: number): { page: string[]; more: boolean } {
+  private range(
+    prefix: string,
+    after: string | undefined,
+    limit: number,
+  ): { page: string[]; more: boolean } {
     const a = this.all();
     let i = this.firstAfter(after);
     // jump to prefix start
-    if (prefix) { let lo = 0, hi = a.length; while (lo < hi) { const mid = (lo + hi) >> 1; if (cmp(a[mid]!, prefix) >= 0) hi = mid; else lo = mid + 1; } i = Math.max(i, lo); }
+    if (prefix) {
+      let lo = 0,
+        hi = a.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (cmp(a[mid]!, prefix) >= 0) hi = mid;
+        else lo = mid + 1;
+      }
+      i = Math.max(i, lo);
+    }
     const page: string[] = [];
     while (i < a.length && a[i]!.startsWith(prefix) && page.length < limit) page.push(a[i++]!);
     const more = i < a.length && a[i]!.startsWith(prefix);
     return { page, more };
   }
   private async call(name: string, detail = "") {
-    if (this.total >= this.maxCalls) throw new Error(`Too many subrequests: ${name} after ${this.total}`);
+    if (this.total >= this.maxCalls)
+      throw new Error(`Too many subrequests: ${name} after ${this.total}`);
     this.calls[name] = (this.calls[name] ?? 0) + 1;
     this.log.push(`${name} ${detail}`);
     await Promise.resolve();
@@ -183,7 +203,9 @@ export class StrictBucket implements Bucket {
     return {
       objects: page.map((key) => ({
         key,
-        customMetadata: options.include?.includes("customMetadata") ? { ...this.objects.get(key)!.meta } : undefined,
+        customMetadata: options.include?.includes("customMetadata")
+          ? { ...this.objects.get(key)!.meta }
+          : undefined,
       })),
       truncated,
       ...(cursor ? { cursor } : {}),

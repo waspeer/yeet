@@ -309,7 +309,7 @@ Evaluated on the Free plan:
   it alone decides. A wrong or empty one gets 401 (and counts) even with a
   valid session cookie.
   - An empty `Authorization` header never reaches the Worker: `wrangler
-    dev` removes it (an empty header of another name arrives), and so does
+dev` removes it (an empty header of another name arrives), and so does
     Cloudflare's edge (measured in phase 1H with a probe Worker that
     reports the headers it gets). Such a request is therefore treated like
     one without the header (session cookie, not counted). The Worker's own
@@ -389,28 +389,28 @@ Numbers that are signed or used as keys must be spelled one way only:
     (`readPartSizes()`, with metadata) and deletes them afterwards, one
     call per 1,000. That was made to fit the 50 subrequests the Free plan
     was assumed to allow: at 100 records per list call, 4 + ceil(n / 100)
-    + ceil(n / 1,000) ≤ 50, so at most **4,100 parts** (exactly 50
-    subrequests). The real limit is 1,000 R2 calls (phase 1H); the budget
-    stays, as a bound on the work. *Estimate, to be measured:* real R2
-    returns about 415 records per call, so the 46 calls would read up to
-    about 18,000 records, whose CPU is likely over 10 ms; the CLI and the
-    upload page never take this path (see below). With more records it stops
-    listing as soon as they cannot fit (`PART_RECORDS_BUDGET`, 46 calls)
-    and answers `400 {"error": "Too many parts to complete an upload of
-    unknown size in one request; start the upload again with its size"}`
-    before completing anything; the upload stays pending. Records of parts
-    not in the request count too. If R2 returns fewer records per list
-    call the limit is lower; more, higher. Counted on the in-memory bucket
-    (`e2e/tests/node/r2-budget.spec.ts`); before this check, 4,101 to
-    4,700 parts failed *after* the multipart complete (from 4,601 even
-    before the sidecar write, leaving a completed file under a pending
-    sidecar). The CLI and the upload page always send the size, so they
-    never take this path; only a hand-made client could. Not covered: a
-    size given at `complete` that does not match the stored object makes
-    the request delete the upload too (a listing and deletes of all its
-    keys), which by the same count passes 50 above about 3,800 parts
-    (computed, not measured); the request then fails half-way, and the cron
-    deletes the rest after 24 hours.
+    - ceil(n / 1,000) ≤ 50, so at most **4,100 parts** (exactly 50
+      subrequests). The real limit is 1,000 R2 calls (phase 1H); the budget
+      stays, as a bound on the work. _Estimate, to be measured:_ real R2
+      returns about 415 records per call, so the 46 calls would read up to
+      about 18,000 records, whose CPU is likely over 10 ms; the CLI and the
+      upload page never take this path (see below). With more records it stops
+      listing as soon as they cannot fit (`PART_RECORDS_BUDGET`, 46 calls)
+      and answers `400 {"error": "Too many parts to complete an upload of
+unknown size in one request; start the upload again with its size"}`
+      before completing anything; the upload stays pending. Records of parts
+      not in the request count too. If R2 returns fewer records per list
+      call the limit is lower; more, higher. Counted on the in-memory bucket
+      (`e2e/tests/node/r2-budget.spec.ts`); before this check, 4,101 to
+      4,700 parts failed _after_ the multipart complete (from 4,601 even
+      before the sidecar write, leaving a completed file under a pending
+      sidecar). The CLI and the upload page always send the size, so they
+      never take this path; only a hand-made client could. Not covered: a
+      size given at `complete` that does not match the stored object makes
+      the request delete the upload too (a listing and deletes of all its
+      keys), which by the same count passes 50 above about 3,800 parts
+      (computed, not measured); the request then fails half-way, and the cron
+      deletes the rest after 24 hours.
   - **Why not check per part:** with the size unknown, a short part is only
     wrong once a higher one exists. That would cost a bucket listing on every
     `PUT`.
@@ -483,8 +483,7 @@ itself. They replace the assumptions the earlier rounds were built on
   round 1I, a budget of 40 R2 calls; n = 10 requests per bucket):
   - 2,150 uploads with a summary and 60 without (995 listed, truncated):
     43–71 ms CPU, median 48.
-  - 2,211 uploads, all with a summary (all listed): 67–103 ms CPU, median
-    82.
+  - 2,211 uploads, all with a summary (all listed): 67–103 ms CPU, median 82.
   - 9,211 uploads (8,199 listed, truncated): 225–320 ms CPU for the first
     7; the next 3 were refused by Cloudflare with `503` and outcome
     `exceededCpu`. After the cron deleted 915 of them (8,296 left, n = 3):
@@ -497,6 +496,7 @@ itself. They replace the assumptions the earlier rounds were built on
   27–71 µs per upload plus 1–6 ms per request. This is an inference
   from requests that listed 1,000 to 8,000 uploads, not a measurement
   of a page.
+
 - **The cron** (`runCleanup()` called through the probe Worker, the design
   before round 1I: up to 25 list calls and 45 R2 calls; n = 5 runs): 45 and
   65 ms CPU for runs that gave 20 and 18 sidecars their summary, 141–179
@@ -528,9 +528,11 @@ measured on a real deploy** (see "To measure next").
 ```jsonc
 // GET /api/uploads, or GET /api/uploads?cursor=<cursor>
 {
-  "uploads": [ /* finished uploads of this page, newest first */ ],
+  "uploads": [
+    /* finished uploads of this page, newest first */
+  ],
   "cursor": "dXBsb2Fkcy9hQjN4X1Ew", // where the next page starts; null on the last page
-  "truncated": true                 // only when cursor is not null: more pages exist
+  "truncated": true, // only when cursor is not null: more pages exist
 }
 ```
 
@@ -568,7 +570,7 @@ asserted in `e2e/tests/node/r2-work-bounds.spec.ts` on a bucket returning
   the phase 1H summary of 27–47 µs per upload (149 uploads ≈ 4–7 ms).
   The 1I verifier's recomputation, 27–71 µs per upload plus 1–6 ms per
   request, puts a page of 149 uploads at about 6–13 ms: possibly over
-  10 ms. *An inference, not a measurement*; the next measurement on a
+  10 ms. _An inference, not a measurement_; the next measurement on a
   real deploy decides whether `PAGE_LIMIT` goes down (see "To measure
   next").
 - **At most one more list call** (`PAGE_JUMPS`), only when the first ends
@@ -611,12 +613,12 @@ page, never an error.
 **Pages per bucket** (`e2e/tests/node/r2-capacity.spec.ts`,
 `r2-work-bounds.spec.ts`; 415 objects per list call):
 
-| bucket                                  | uploads per page | pages |
-| --------------------------------------- | ---------------- | ----- |
-| 5,000 uploads with a summary            | 149              | 34    |
-| 1,000 uploads, half without a summary   | about 20         | 50    |
-| 1,000 uploads, none with a summary      | 10               | 100   |
-| 5,000 uploads, none with a summary      | 10               | 500   |
+| bucket                                | uploads per page | pages |
+| ------------------------------------- | ---------------- | ----- |
+| 5,000 uploads with a summary          | 149              | 34    |
+| 1,000 uploads, half without a summary | about 20         | 50    |
+| 1,000 uploads, none with a summary    | 10               | 100   |
+| 5,000 uploads, none with a summary    | 10               | 500   |
 
 149 because 300 objects are 150 uploads and the last one of a page that
 goes on is left for the next. `wrangler dev` returns at most 100 objects
@@ -727,7 +729,7 @@ ms for up to 25 list calls) the 1I verifier inferred about 14.8–17.3 µs
 CPU per object listed, so 600 objects are about 8.9–10.4 ms, and at least
 about 0.7–1.3 ms per summary written, so a run that writes 10 summaries
 and lists 200 objects (about 10–16 ms) is plausibly over 10 ms too.
-*Inferences, not measurements*; the next measurement on a real deploy
+_Inferences, not measurements_; the next measurement on a real deploy
 decides whether `CLEANUP_LIST_LIMIT` or `CLEANUP_SUMMARIES` go down (see
 "To measure next").
 
@@ -757,13 +759,13 @@ before the fix, 11 after, to clean up 3 uploads of 600 records or parts).
 `r2-work-bounds.spec.ts`; 415 objects per list call, every tenth upload
 expired; a run is an hour):
 
-| bucket                                       | first run                    | runs to finish |
-| -------------------------------------------- | ---------------------------- | -------------- |
-| 1,000 uploads with a summary                 | 9 deleted, 5 calls           | 11             |
-| 5,000 uploads with a summary                 | 9 deleted, 5 calls           | 51             |
-| 1,000 uploads, none with a summary           | 10 summaries, 1 deleted      | 100            |
-| 5,000 uploads, none with a summary           | 10 summaries, 1 deleted, 25 calls | 500       |
-| the same, none expired                       | 10 summaries                 | 500            |
+| bucket                             | first run                         | runs to finish |
+| ---------------------------------- | --------------------------------- | -------------- |
+| 1,000 uploads with a summary       | 9 deleted, 5 calls                | 11             |
+| 5,000 uploads with a summary       | 9 deleted, 5 calls                | 51             |
+| 1,000 uploads, none with a summary | 10 summaries, 1 deleted           | 100            |
+| 5,000 uploads, none with a summary | 10 summaries, 1 deleted, 25 calls | 500            |
+| the same, none expired             | 10 summaries                      | 500            |
 
 So a bucket of N uploads with summaries is gone through in ceil(N / 99)
 hours (99 = the 100 uploads of 200 objects, minus the last, left for the
@@ -834,7 +836,7 @@ node scripts/backfill-summaries.mjs --remote --bucket <bucket_name> --apply  # w
 
 - **Targets:** `--remote` binds the bucket through wrangler's remote
   bindings (`getPlatformProxy()`, so it needs `wrangler login`); `--local
-  [--persist-to <dir>]` uses a `wrangler dev` bucket on disk (stop
+[--persist-to <dir>]` uses a `wrangler dev` bucket on disk (stop
   `wrangler dev` first). One of the two is required. `--prefix` defaults to
   `uploads`; pass your `UPLOADS_PREFIX` if you changed it.
 - **What it touches:** only `<prefix>/<id>/.meta.json` objects without a

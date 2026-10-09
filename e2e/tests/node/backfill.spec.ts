@@ -73,16 +73,27 @@ test.describe("backfilling summaries (in memory)", () => {
     bucket.seed(`${PREFIX}/ok/.meta.json`, JSON.stringify(metaOf(1)));
     bucket.seed(`${PREFIX}/bad/.meta.json`, "not JSON");
     bucket.seed(`${PREFIX}/odd/.meta.json`, JSON.stringify({ ...metaOf(2), downloads: 5 }));
-    bucket.seed(`${PREFIX}/big/.meta.json`, JSON.stringify(metaOf(3, { filename: "é".repeat(2000) })));
+    bucket.seed(
+      `${PREFIX}/big/.meta.json`,
+      JSON.stringify(metaOf(3, { filename: "é".repeat(2000) })),
+    );
     const before = snapshot(bucket);
     const dry = await backfillSummaries(bucket, PREFIX, { apply: false });
     expect(snapshot(bucket)).toBe(before);
     const apply = await backfillSummaries(bucket, PREFIX, { apply: true });
     const counts = (report: typeof dry) =>
-      Object.fromEntries(Object.entries(report).filter(([key]) => key !== "ids" && key !== "written"));
+      Object.fromEntries(
+        Object.entries(report).filter(([key]) => key !== "ids" && key !== "written"),
+      );
     expect(counts(dry)).toEqual(counts(apply));
     expect(dry).toMatchObject({ missing: 4, unreadable: 2, tooLarge: 1, writable: 1, written: 0 });
-    expect(apply).toMatchObject({ missing: 4, unreadable: 2, tooLarge: 1, writable: 1, written: 1 });
+    expect(apply).toMatchObject({
+      missing: 4,
+      unreadable: 2,
+      tooLarge: 1,
+      writable: 1,
+      written: 1,
+    });
   });
 
   test("--apply: every sidecar gets its summary, nothing else changes; a second run does nothing", async () => {
@@ -107,10 +118,12 @@ test.describe("backfilling summaries (in memory)", () => {
       expect(JSON.parse(object.customMetadata["summary"]!), key).toEqual(summarize(meta));
     }
     // A legacy downloads array's count carries over into the summary.
-    expect(JSON.parse(bucket.objects.get(`${PREFIX}/u000/.meta.json`)!.customMetadata["summary"]!))
-      .toMatchObject({ download_count: 1 });
+    expect(
+      JSON.parse(bucket.objects.get(`${PREFIX}/u000/.meta.json`)!.customMetadata["summary"]!),
+    ).toMatchObject({ download_count: 1 });
     for (const [key, object] of others) expect(bucket.objects.get(key), key).toEqual(object);
-    for (const [key, object] of summarizedBefore) expect(bucket.objects.get(key), key).toEqual(object);
+    for (const [key, object] of summarizedBefore)
+      expect(bucket.objects.get(key), key).toEqual(object);
 
     bucket.resetCalls();
     const again = await backfillSummaries(bucket, PREFIX, { apply: true });
@@ -138,7 +151,9 @@ test.describe("backfilling summaries (in memory)", () => {
     expect(report).toMatchObject({ missing: 2, written: 1, changed: 1 });
     const stored = bucket.objects.get(key)!;
     expect((JSON.parse(stored.body) as UploadMeta).download_count).toBe(1);
-    expect(JSON.parse(stored.customMetadata["summary"]!)).toEqual(summarize(JSON.parse(stored.body)));
+    expect(JSON.parse(stored.customMetadata["summary"]!)).toEqual(
+      summarize(JSON.parse(stored.body)),
+    );
   });
 
   test("only upload sidecars are touched; unreadable ones are left alone", async () => {
@@ -156,7 +171,9 @@ test.describe("backfilling summaries (in memory)", () => {
 });
 
 /** Run the migration script; resolves with its exit code and output. */
-function runScript(args: string[]): Promise<{ code: number | null; stdout: string; stderr: string }> {
+function runScript(
+  args: string[],
+): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn(
       process.execPath,
@@ -207,18 +224,37 @@ test("the migration script on a local wrangler dev bucket: dry run, apply, idemp
   }
 
   const target = ["--local", "--persist-to", persistDir, "--bucket", server.bucketName];
-  const counts = (run: { stdout: string }) => JSON.parse(run.stdout.trim()) as Record<string, unknown>;
+  const counts = (run: { stdout: string }) =>
+    JSON.parse(run.stdout.trim()) as Record<string, unknown>;
 
   const dry = await runScript(target);
   expect(dry.code, dry.stderr).toBe(0);
-  expect(counts(dry)).toEqual({ apply: false, sidecars: 5, missing: 4, writable: 3, written: 0, changed: 0, unreadable: 1, tooLarge: 0 });
+  expect(counts(dry)).toEqual({
+    apply: false,
+    sidecars: 5,
+    missing: 4,
+    writable: 3,
+    written: 0,
+    changed: 0,
+    unreadable: 1,
+    tooLarge: 0,
+  });
   expect(dry.stderr).toContain("Run again with --apply to write 3 summaries.");
   expect(dry.stderr).toContain("1 sidecar cannot get a summary");
 
   // The dry run wrote nothing: --apply still finds all three.
   const apply = await runScript([...target, "--apply"]);
   expect(apply.code, apply.stderr).toBe(0);
-  expect(counts(apply)).toEqual({ apply: true, sidecars: 5, missing: 4, writable: 3, written: 3, changed: 0, unreadable: 1, tooLarge: 0 });
+  expect(counts(apply)).toEqual({
+    apply: true,
+    sidecars: 5,
+    missing: 4,
+    writable: 3,
+    written: 3,
+    changed: 0,
+    unreadable: 1,
+    tooLarge: 0,
+  });
 
   const again = await runScript([...target, "--apply"]);
   expect(again.code, again.stderr).toBe(0);
@@ -237,7 +273,9 @@ test("the migration script on a local wrangler dev bucket: dry run, apply, idemp
       expect(JSON.parse(sidecar!.custom_metadata["summary"]!), id).toEqual(summarize(metas[i]!));
       const body = await getObject(`${prefix}/${id}/.meta.json`, { baseURL: srv.baseURL });
       expect(JSON.parse(body!.toString("utf-8")), id).toEqual(metas[i]);
-      const file = await getObject(`${prefix}/${id}/${metas[i]!.filename}`, { baseURL: srv.baseURL });
+      const file = await getObject(`${prefix}/${id}/${metas[i]!.filename}`, {
+        baseURL: srv.baseURL,
+      });
       expect(file!.toString("utf-8")).toBe("x".repeat(metas[i]!.file_size!));
     }
   } finally {
