@@ -572,14 +572,23 @@ followed by keys that belong to no upload is complete (a fix of round
 1I: before, it was always treated as possibly partly listed). If a page
 lists nothing but the start of one upload:
 
-- **with more than 2 of its keys listed** (more keys than a yeet upload has
-  outside its `.downloads/` and `.parts/` runs; more than a page lists,
-  not a yeet upload): it is returned unread, and the next page starts
-  after it, so pages never stall;
+- **with more than 2 of its keys listed outside its `.downloads/` and
+  `.parts/` runs** (more than a yeet upload has there; more than a page
+  lists, not a yeet upload): it is returned unread, and the next page
+  starts after it, so pages never stall;
+- **with more than 2 keys listed, nearly all in a `.downloads/` run, and
+  its sidecar not reached** (the page ended in the run and R2 answered the
+  jump over it with a short or empty page; the sidecar sorts after
+  `.downloads/`): its sidecar is read (1 call, within `PAGE_READS`) and
+  the upload is returned with it, and the next page starts after it. If
+  the read fails, nothing is returned and the cursor stays where it was.
+  Before round 1J such an upload was returned without a summary, so left
+  out, and the next page started after it: skipped for that walk.
 - **with at most 2** (R2 returned a short page, as it may; even empty ones):
   nothing is returned and the cursor stays where it was, so the next
-  request tries again rather than skipping an upload. Real R2 returned
-  full pages in phase 1H.
+  request tries again rather than skipping an upload. If R2 kept doing
+  that, `yeet list` would stop at its page cap (see below). Real R2
+  returned full pages in phase 1H.
 
 Pending uploads, and sidecars that are unreadable or not shaped like one
 (see "Sidecars that never get a summary" below), are left out of the
@@ -703,6 +712,14 @@ write sorting before its `.meta.json` than a run lists (outside
 reaches its sidecar, so none sees it as stale; each returns it unread and
 goes on after it instead of stalling (`e2e/tests/node/r2-adversarial-1g.spec.ts`,
 with 30,000 such keys). yeet itself never writes such keys.
+
+**A jump answered with a short or empty page** (see "Listing a page"):
+the run reads the sidecar of the upload whose `.downloads/` run it ended
+in (1 call of its budget), and so knows whether it is stale. Before round
+1J it handled the upload as current and deleted only its records, which
+was harmless: a later run lists it whole once few enough records are
+left (`e2e/tests/node/verify-1i.spec.ts`, with every jump empty: 12 runs
+before the fix, 11 after, to clean up 3 uploads of 600 records or parts).
 
 **Runs per bucket** (`e2e/tests/node/r2-capacity.spec.ts` and
 `r2-work-bounds.spec.ts`; 415 objects per list call, every tenth upload

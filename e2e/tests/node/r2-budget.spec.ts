@@ -185,11 +185,20 @@ test.describe("R2 calls of a listing", () => {
     const bucket = new FakeBucket();
     seedUpload(bucket, idOf(0), { records: 500 });
     bucket.resetCalls();
-    // One call: a page of `.downloads/` records, then the budget is spent.
-    const result = await new Uploads(bucket, PREFIX).listAll({ budget: 1 });
-    expect(result.uploads.map((u) => [u.id, u.complete, u.stray])).toEqual([
-      [idOf(0), false, false],
+    // A page of `.downloads/` records, then the one list call allowed is spent;
+    // the sidecar was never listed, so it is read (round 1J; before, the
+    // upload was returned without a summary and the next listing started
+    // after it).
+    const result = await new Uploads(bucket, PREFIX).listAll({ budget: 2, maxListCalls: 1 });
+    expect(result.uploads.map((u) => [u.id, u.complete, u.stray, !!u.meta])).toEqual([
+      [idOf(0), false, false, true],
     ]);
+    expect(bucket.calls.get).toBe(1);
+    bucket.resetCalls();
+    // Without room for that read, nothing: the next listing starts where this one did.
+    const none = await new Uploads(bucket, PREFIX).listAll({ budget: 1 });
+    expect(none).toMatchObject({ uploads: [], truncated: true });
+    expect(none.resumeAfter).toBeUndefined();
 
     // Fully listed records without a sidecar or file are stray; the cron
     // deletes them as such.

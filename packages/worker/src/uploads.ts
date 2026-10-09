@@ -509,7 +509,11 @@ export class Uploads {
    * Stops when the budget is spent, and then returns the uploads listed so
    * far (never a partly listed last one) with `truncated: true` and the
    * key to continue after (`resumeAfter`), which `after` takes: right before
-   * the first upload it leaves out, so a resumed listing skips none.
+   * the first upload it leaves out, so a resumed listing skips none. If it
+   * listed nothing but the start of one upload whose sidecar it never
+   * reached because R2 returned a short or empty page after a `.downloads/`
+   * run, it reads that sidecar (1 call, within the budget) and returns the
+   * upload with it, rather than skip it or stall on it.
    */
   async listAll(
     opts: {
@@ -531,6 +535,10 @@ export class Uploads {
     interface Group extends Omit<ListedUpload, "stray" | "unsummarized"> {
       sidecar: boolean;
       others: number;
+      /** Keys listed outside its `.downloads/` and `.parts/` runs. */
+      outside: number;
+      /** Its sidecar was read because the listing never reached it (see below). */
+      probed: boolean;
       /** A key right before this upload's first, or undefined for the start of the bucket. */
       before: string | undefined;
     }
@@ -579,6 +587,8 @@ export class Uploads {
             legacyRecords: false,
             sidecar: false,
             others: 0,
+            outside: 0,
+            probed: false,
             // After the previous upload rather than its last key listed,
             // which may lie inside a run the listing jumped over.
             before: group ? this.keyAfter(group.id) : previousKey,
@@ -592,6 +602,7 @@ export class Uploads {
           continue;
         }
         group.others++;
+        if (!name.startsWith(".parts/")) group.outside++;
         if (name === ".meta.json") {
           group.sidecar = true;
           group.meta = summaryFromCustomMetadata(object.customMetadata);
@@ -644,19 +655,42 @@ export class Uploads {
       // it may (even empty ones); then nothing is returned and the next
       // listing starts where this one did.)
       if (firstLeft && resumeAfter === start && firstLeft.keys.length > 2) {
-        // Nothing before it was listed: the budget does not stretch to this
-        // one upload (more keys than it lists, not a yeet upload). Return it
-        // unread, and incomplete if partly listed, so that the next listing
-        // gets past it rather than stalling.
-        unread = firstLeft;
-        kept.push(firstLeft);
-        resumeAfter = this.keyAfter(firstLeft.id);
+        if (!firstLeft.sidecar && firstLeft.outside <= 2) {
+          // Its keys are mostly a `.downloads/` or `.parts/` run, and the
+          // listing ended before its sidecar: R2 returned a short or empty
+          // page on the jump over the run. It may be an upload like any
+          // other, so it must not be skipped: read its sidecar (one call)
+          // and return it with what that says, or, without room for the
+          // read or if the read fails, return nothing and let the next
+          // listing start where this one did.
+          if (calls + 1 <= budget) {
+            calls++;
+            const read = await this.readSidecar(firstLeft.id).catch(() => undefined);
+            if (read) {
+              // No sidecar (null etag): no upload to list, only its keys.
+              firstLeft.sidecar = read.etag !== null;
+              firstLeft.meta = read.meta ? summarize(read.meta) : null;
+              firstLeft.probed = true;
+              unread = firstLeft;
+              kept.push(firstLeft);
+              resumeAfter = this.keyAfter(firstLeft.id);
+            }
+          }
+        } else {
+          // Nothing before it was listed: the budget does not stretch to this
+          // one upload (more keys than it lists, not a yeet upload). Return it
+          // unread, and incomplete if partly listed, so that the next listing
+          // gets past it rather than stalling.
+          unread = firstLeft;
+          kept.push(firstLeft);
+          resumeAfter = this.keyAfter(firstLeft.id);
+        }
       }
     }
 
     const uploads = await Promise.all(
       kept.map(async (group): Promise<ListedUpload> => {
-        const { sidecar, others, before: _, ...listed } = group;
+        const { sidecar, others, outside: _o, probed, before: _, ...listed } = group;
         let meta = listed.meta;
         if (sidecar && !meta && group !== unread && opts.deferReads === undefined) {
           calls++;
@@ -671,7 +705,8 @@ export class Uploads {
           meta,
           // Only if every key was listed: a sidecar may follow the records.
           stray: listed.complete && !sidecar && others === 0,
-          unsummarized: sidecar && !listed.meta,
+          // (A sidecar probed above was read already.)
+          unsummarized: sidecar && !listed.meta && !probed,
         };
       }),
     );

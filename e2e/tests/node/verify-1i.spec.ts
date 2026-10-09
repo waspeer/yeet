@@ -157,26 +157,55 @@ function expectBounds(work: { lists: number; listed: number; gets: number; total
 }
 
 test.describe("1I verifier: page walks of GET /api/uploads", () => {
-  // FINDING: the short-page guard protects a first upload with at most 2 keys
-  // listed, but an upload with a `.downloads/` run longer than the page,
-  // whose jump call R2 answers with an empty (truncated) page, is returned
-  // "unread" with no summary (its sidecar was never listed), dropped from
-  // the page, and the next page starts after it: skipped for this walk.
-  //
-  // This test pins the CURRENT behaviour so the suite stays green; when it is
-  // fixed, the expectation becomes ["a00000", "b00000"].
-  test("FINDING: an empty page on the jump skips the upload whose run it jumps", async () => {
+  // Was a FINDING of the 1I verifier, fixed in round 1J: an upload with a
+  // `.downloads/` run longer than the page, whose jump call R2 answers with
+  // an empty (truncated) page, was returned "unread" with no summary (its
+  // sidecar was never listed), dropped from the page, and the next page
+  // started after it: skipped for the whole walk. Now listAll() reads its
+  // sidecar (one get, within PAGE_READS) instead.
+  test("an empty page on the jump does not skip the upload whose run it jumps", async () => {
     const b = new ScriptedBucket({ ...REAL_R2_CAPS, maxCalls: Infinity });
     seed(b, "a00000", { records: 400 });
     seed(b, "b00000");
     // The jump of the first page (its second list call) comes back empty.
     let page = 0;
     b.script = (n) => (page === 0 && n === 1 ? 0 : undefined);
-    const { seen } = await walk(b, { between: () => page++ });
-    expect(seen.sort()).toEqual(["b00000"]);
+    const { seen, work } = await walk(b, { between: () => page++ });
+    expect(seen.sort()).toEqual(["a00000", "b00000"]);
+    expectBounds(work);
     // Without the empty page it is listed.
     b.script = undefined;
     expect((await walk(b)).seen.sort()).toEqual(["a00000", "b00000"]);
+  });
+
+  test("1J: every jump empty, on every page: no upload skipped, bounds kept, the walk ends", async () => {
+    const b = new ScriptedBucket({ ...REAL_R2_CAPS, maxCalls: Infinity });
+    const ids: string[] = [];
+    for (let i = 0; i < 60; i++) {
+      const id = `w${String(i).padStart(4, "0")}`;
+      ids.push(id);
+      // Every seventh has a `.downloads/` or `.parts/` run longer than a page.
+      seed(b, id, i % 7 === 0 ? (i % 2 ? { records: 700 } : { legacy: true, records: 400 }) : {}, i);
+    }
+    // R2 answers every jump (the second list call of a page) with an empty page.
+    b.script = (n) => (n === 1 ? 0 : undefined);
+    const { seen, work, done } = await walk(b);
+    expect(done).toBe(true);
+    expect(seen.sort()).toEqual(ids);
+    expectBounds(work);
+  });
+
+  test("1J: junk keys between the run and the sidecar still get a page past the upload, unread", async () => {
+    const b = new ScriptedBucket({ ...REAL_R2_CAPS, maxCalls: Infinity });
+    seed(b, "a00000", { records: 400 });
+    // 400 keys yeet does not write, between `.downloads/` and `.meta.json`.
+    for (let n = 0; n < 400; n++) b.seed(`${P}/a00000/.e/${n}`);
+    seed(b, "b00000");
+    b.maxCalls = 1 + PAGE_READS;
+    const page = await new Uploads(b, P).listPage();
+    expect(page.uploads).toEqual([]);
+    expect(page.next).toBe(`${P}/a000000`);
+    expect(b.calls.get ?? 0).toBe(0);
   });
 
   test("empty pages that are not on a jump: retried, nothing skipped, no duplicate", async () => {
@@ -521,6 +550,38 @@ test.describe("1I verifier: cron runs", () => {
         expect(b.objects.has(`${P}/${id}/.meta.json`), id).toBe(true);
       }
     }
+  });
+
+  // The cron's side of the 1I finding: harmless there (the verifier's
+  // reading, confirmed here and before the 1J fix alike). A sidecar sorts
+  // before `.parts/`, so only a `.downloads/` run can hide it; the run then
+  // deletes records of the upload, current or not, and lists it whole once
+  // few enough are left.
+  test("1J: every jump empty: expired and current uploads with legacy records, live keys untouched, converges", async () => {
+    const b = new ScriptedBucket({ ...REAL_R2_CAPS, maxCalls: Infinity });
+    seed(b, "e0", { expired: true, records: 600 });
+    seed(b, "p0", { pendingSince: NOW - 2 * DAY, parts: 600 });
+    seed(b, "q0", { records: 600 }); // current, with legacy records
+    b.live.add("q0");
+    // R2 answers every jump (a run's second list call) with an empty page.
+    b.script = (n) => (n === 1 ? 0 : undefined);
+    let runs = 0;
+    const left = () =>
+      b.sorted(`${P}/e0/`).length +
+      b.sorted(`${P}/p0/`).length +
+      b.sorted(`${P}/q0/.downloads/`).length;
+    while (left() > 0 && runs < 50) {
+      runs++;
+      b.reset();
+      b.maxCalls = CLEANUP_BUDGET;
+      await runCleanup(b, P, NOW);
+      expect(b.calls.list ?? 0).toBeLessThanOrEqual(3);
+    }
+    console.log(`every jump empty: ${runs} runs, ${left()} keys left`);
+    expect(left()).toBe(0);
+    expect(b.violations).toEqual([]);
+    expect(b.objects.has(`${P}/q0/.meta.json`)).toBe(true);
+    expect(b.objects.has(`${P}/q0/f.bin`)).toBe(true);
   });
 
   test("a stale pending upload with many part records is aborted once per run and still finishes", async () => {
