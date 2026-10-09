@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // One-time migration of a bucket written by yeet < 0.2 (or rclone): gives
 // every upload sidecar without a summary its summary custom metadata in one
-// go. The Worker's hourly cron does the same, but at most 10 per run; until a
+// go. The Worker's hourly cron does the same, but at most 3 per run; until a
 // sidecar has its summary, the listing spends a read on it (and shows only
-// 10 per page of a bucket full of them). Logic and safety rules: src/backfill.ts.
+// 5 per page of a bucket full of them). Logic and safety rules: src/backfill.ts.
 //
 //   node scripts/backfill-summaries.mjs --remote --bucket yeet            # dry run
 //   node scripts/backfill-summaries.mjs --remote --bucket yeet --apply    # write

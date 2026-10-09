@@ -1,3 +1,4 @@
+import { MAX_UNSIZED_PARTS } from "../../../packages/worker/src/uploads.js";
 import { randomBytes } from "node:crypto";
 import {
   api,
@@ -232,14 +233,10 @@ test.describe("upload API", () => {
     await api(`/api/uploads/${id}`, { method: "DELETE" });
   });
 
-  test("size unknown: more part records than one request can list and delete is a 400 before completing", async () => {
-    // 4,101 records take 42 list calls (100 per call with metadata) and 5
-    // deletes: more than the 46 subrequests complete has for them. Seeded
-    // directly; wrangler dev itself enforces no limit.
-    const id = await create({ filename: "many-parts.bin" });
-    const one = await putPartJson(id, 1, randomBytes(10));
+  /** Part records 2..n+1 of an upload, written directly (as `PUT` would, size 10). */
+  async function seedPartRecords(id: string, n: number) {
     const keys = Array.from(
-      { length: 4100 },
+      { length: n },
       (_, i) => `${server.uploadsPrefix}/${id}/.parts/${i + 2}`,
     );
     for (let i = 0; i < keys.length; i += 50) {
@@ -247,18 +244,64 @@ test.describe("upload API", () => {
         keys.slice(i, i + 50).map((key) => putObject(key, "", { customMetadata: { size: "10" } })),
       );
     }
+  }
+  const TOO_MANY =
+    `Too many parts to complete an upload of unknown size (at most ${MAX_UNSIZED_PARTS}); ` +
+    `start the upload again and send its size ("size" in POST /api/uploads)`;
+
+  test(`size unknown: more than ${MAX_UNSIZED_PARTS} part records is a 400 before completing`, async () => {
+    // Round 1K: MAX_UNSIZED_PARTS records at most (before: as many as 46 R2
+    // calls could list and delete, 4,100 at 100 per call). Records of parts
+    // not in the request count too. Seeded directly.
+    const id = await create({ filename: "many-parts.bin" });
+    const one = await putPartJson(id, 1, randomBytes(10));
+    await seedPartRecords(id, MAX_UNSIZED_PARTS);
 
     const res = await complete(id, { parts: [one] });
     expect(res.status).toBe(400);
-    expect(await res.json()).toEqual({
-      error:
-        "Too many parts to complete an upload of unknown size in one request; " +
-        "start the upload again with its size",
-    });
+    expect(await res.json()).toEqual({ error: TOO_MANY });
     // Nothing changed: still pending, every record still there.
     expect((await readUploadMeta(id))?.pending_upload_id).toBeTruthy();
-    expect(await listObjects(`${server.uploadsPrefix}/${id}/.parts/`)).toHaveLength(4101);
+    expect(await listObjects(`${server.uploadsPrefix}/${id}/.parts/`)).toHaveLength(
+      MAX_UNSIZED_PARTS + 1,
+    );
     expect((await api(`/api/uploads/${id}`, { method: "DELETE" })).status).toBe(200);
+  });
+
+  test(`size unknown: exactly ${MAX_UNSIZED_PARTS} part records complete, and the records are deleted`, async () => {
+    const id = await create({ filename: "limit-parts.bin" });
+    const one = await putPartJson(id, 1, randomBytes(10));
+    await seedPartRecords(id, MAX_UNSIZED_PARTS - 1);
+
+    const res = await complete(id, { parts: [one] });
+    expect(res.status).toBe(200);
+    expect((await readUploadMeta(id))?.file_size).toBe(10);
+    expect(await listObjects(`${server.uploadsPrefix}/${id}/.parts/`)).toHaveLength(0);
+    expect((await api(`/api/uploads/${id}`, { method: "DELETE" })).status).toBe(200);
+  });
+
+  test(`size unknown: a parts array of more than ${MAX_UNSIZED_PARTS} is a 400 at once`, async () => {
+    const id = await create({ filename: "long-array.bin" });
+    const parts = Array.from({ length: MAX_UNSIZED_PARTS + 1 }, (_, i) => ({
+      part_number: i + 1,
+      etag: "made-up",
+    }));
+    const res = await complete(id, { parts });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: TOO_MANY });
+    expect((await readUploadMeta(id))?.pending_upload_id).toBeTruthy();
+    // With the size known at create, the same array is not refused for its
+    // length (R2's own error for the made-up etags instead).
+    const sized = await create({
+      filename: "long-array-sized.bin",
+      size: (MAX_UNSIZED_PARTS + 1) * PART_SIZE,
+    });
+    const other = await complete(sized, { parts });
+    expect(other.status).toBe(400);
+    expect((await other.json()).error).not.toBe(TOO_MANY);
+    for (const upload of [id, sized]) {
+      expect((await api(`/api/uploads/${upload}`, { method: "DELETE" })).status).toBe(200);
+    }
   });
 
   test("an invalid parts array is a 400 before anything is completed", async () => {

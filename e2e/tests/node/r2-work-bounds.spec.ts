@@ -145,7 +145,8 @@ test.describe("work of one GET /api/uploads page (real R2 page sizes)", () => {
     expect(max(work, "listed")).toBe(PAGE_LIMIT);
     expect(max(work, "gets")).toBe(0);
     expect([...seen].sort()).toEqual(finished);
-    // 300 objects are 150 uploads, the last one left for the next page: 149 a page.
+    // PAGE_LIMIT objects are PAGE_LIMIT / 2 uploads, the last one left for
+    // the next page: 74 a page at 150 (round 1K), 149 at 300.
     console.log(`5,000 uploads: ${work.length} pages`);
     expect(work.length).toBe(Math.ceil(5000 / (PAGE_LIMIT / 2 - 1)));
   });
@@ -290,7 +291,8 @@ test.describe("work of one cron run (real R2 page sizes)", () => {
       expectRunBounds(work);
       expect(max(work, "lists")).toBe(1);
       expect(expiredLeft(b)).toBe(false);
-      // 200 objects are 100 uploads, the last left for the next run.
+      // CLEANUP_LIST_LIMIT objects are half as many uploads, the last left
+      // for the next run.
       console.log(`${n} uploads: one pass (every expired one deleted) in ${runs} runs`);
       expect(runs).toBe(Math.ceil(n / (CLEANUP_LIST_LIMIT / 2 - 1)));
     });

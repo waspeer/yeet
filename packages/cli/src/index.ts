@@ -226,14 +226,29 @@ class ApiError extends Error {
 }
 
 /**
- * Seconds to wait from a Retry-After header (delta-seconds or an HTTP date),
- * or undefined if there is none or it is unusable.
+ * The three spellings of an HTTP date (RFC 9110 §5.6.7): IMF-fixdate
+ * ("Sun, 06 Nov 1994 08:49:37 GMT"), RFC 850 ("Sunday, 06-Nov-94 08:49:37
+ * GMT") and asctime ("Sun Nov  6 08:49:37 1994"). Checked before Date.parse(),
+ * which also reads "-5", "+5" or "1.5" as dates (in 2001, so "retry now").
+ */
+const IMF_FIXDATE = /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/;
+const RFC_850_DATE = /^[A-Z][a-z]+day, \d{2}-[A-Z][a-z]{2}-\d{2} \d{2}:\d{2}:\d{2} GMT$/;
+const ASCTIME_DATE = /^[A-Z][a-z]{2} [A-Z][a-z]{2} [ \d]\d \d{2}:\d{2}:\d{2} \d{4}$/;
+
+/**
+ * Seconds to wait from a Retry-After header: delta-seconds (digits only) or
+ * an HTTP date. Undefined if there is none or it is anything else ("-5",
+ * "1.5", "1e3"), so the caller's own backoff applies.
  */
 function retryAfterSeconds(res: Response): number | undefined {
   const value = res.headers.get("Retry-After")?.trim();
   if (!value) return undefined;
   if (/^\d+$/.test(value)) return Number(value);
-  const at = Date.parse(value);
+  let at: number;
+  if (IMF_FIXDATE.test(value) || RFC_850_DATE.test(value)) at = Date.parse(value);
+  // asctime carries no zone but means GMT; Date.parse() would take local time.
+  else if (ASCTIME_DATE.test(value)) at = Date.parse(`${value} GMT`);
+  else return undefined;
   return Number.isNaN(at) ? undefined : Math.max(0, Math.ceil((at - Date.now()) / 1000));
 }
 
@@ -242,8 +257,20 @@ function retryAfterSeconds(res: Response): number | undefined {
  * wrong ones (429). Seconds to wait come from Retry-After, or the error text.
  */
 function tooManyAttempts(seconds: number): string {
-  const wait = seconds > 0 ? `in ${seconds} second${seconds === 1 ? "" : "s"}` : "later";
-  return `Too many wrong upload tokens were tried from this address. Try again ${wait}.`;
+  return `Too many wrong upload tokens were tried from this address. Try again ${waitText(seconds)}.`;
+}
+
+/**
+ * When to try again, for a message: "in 45 seconds", "in 15 minutes", "in 3
+ * hours" (rounded up), or "later" for no wait known or one over a day (a
+ * server may send any Retry-After, 100000000000000000000 included).
+ */
+function waitText(seconds: number): string {
+  const unit = (n: number, name: string) => `in ${n} ${name}${n === 1 ? "" : "s"}`;
+  if (!(seconds > 0) || seconds > 86_400) return "later";
+  if (seconds < 120) return unit(seconds, "second");
+  if (seconds < 120 * 60) return unit(Math.ceil(seconds / 60), "minute");
+  return unit(Math.ceil(seconds / 3600), "hour");
 }
 
 /** Call the server API and parse the JSON response, with readable errors. */
@@ -331,7 +358,16 @@ async function withRetries<T>(attempt: () => Promise<T>, tries = 4): Promise<T> 
       const transient = status === 0 || status >= 500 || status === 429;
       if (!transient || i >= tries) throw err;
       const retryAfter = err instanceof ApiError ? err.retryAfter : undefined;
-      if (retryAfter !== undefined && retryAfter > MAX_RETRY_AFTER_S) throw err;
+      if (retryAfter !== undefined && retryAfter > MAX_RETRY_AFTER_S) {
+        // Say when to try again (a 429's message already does).
+        if (!(err instanceof ApiError) || status === 429) throw err;
+        throw new ApiError(
+          `${err.message.replace(/\.$/, "")}. Try again ${waitText(retryAfter)}.`,
+          status,
+          err.forLogin,
+          retryAfter,
+        );
+      }
       await sleep(retryAfter !== undefined ? retryAfter * 1000 : 1000 * 2 ** (i - 1));
     }
   }
@@ -454,8 +490,9 @@ interface UploadsPage {
 }
 
 /**
- * The most pages `yeet list` fetches. A page holds about 150 uploads (at
- * least 10), so this is far beyond any real bucket; it stops a server that
+ * The most pages `yeet list` fetches. A page holds about 75 uploads (at
+ * least 5), so 1,000 pages are about 74,000 uploads, or 5,000 sidecars of
+ * yeet < 0.2 without a summary; it stops a server that
  * keeps answering with more pages from keeping the CLI busy forever.
  */
 const MAX_LIST_PAGES = 1000;

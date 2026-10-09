@@ -43,6 +43,19 @@ function createdId(page: Page): Promise<string> {
     .then(async (res) => ((await res.json()) as { id: string }).id);
 }
 
+/**
+ * Resolves with the JSON body of the page's next `POST /api/uploads`. The
+ * page must always send `size`: without it, `complete` refuses uploads of
+ * more than MAX_UNSIZED_PARTS parts (round 1K).
+ */
+function createBody(page: Page): Promise<Record<string, unknown>> {
+  return page
+    .waitForRequest(
+      (req) => req.method() === "POST" && new URL(req.url()).pathname === "/api/uploads",
+    )
+    .then((req) => req.postDataJSON() as Record<string, unknown>);
+}
+
 function isPart(request: Request, n?: number): boolean {
   const match = new URL(request.url()).pathname.match(/^\/api\/uploads\/[^/]+\/parts\/(\d+)$/);
   return request.method() === "PUT" && !!match && (n === undefined || Number(match[1]) === n);
@@ -90,10 +103,12 @@ test.describe("upload page", () => {
       await instrumentUploadPage(page);
       await logIn(page);
       const id = createdId(page);
+      const body = createBody(page);
       await choose(page, via, file.path);
 
       const url = await shareLink(page);
       expect(url).toMatch(new RegExp(`/${await id}/small%20${via}\\.bin$`));
+      expect(await body).toMatchObject({ size: file.size });
       await expect(page.locator("#done-name")).toHaveText(file.name);
       expect((await pageStats(page)).progress.at(-1)).toBe(100);
 
@@ -148,8 +163,11 @@ test.describe("upload page", () => {
   test("an empty file uploads and downloads as 0 bytes", async ({ page, tmp }) => {
     const file = await fileWith(tmp, "empty.txt", "");
     await logIn(page);
+    const body = createBody(page);
     await choose(page, "input", file.path);
     const url = await shareLink(page);
+    // size 0 is sent, not left out.
+    expect(await body).toMatchObject({ size: 0 });
     expect(await downloadSha256(url)).toEqual({ sha256: file.sha256, size: 0 });
   });
 

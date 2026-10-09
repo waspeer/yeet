@@ -758,7 +758,8 @@ test.describe("1I verifier: yeet list against a stand-in server", () => {
         expect(took).toBeLessThan(5000);
         expect(r.stdout).toContain("2 files");
         expect(r.stdout).toContain("only part of your uploads is shown");
-        expect(r.stdout).toContain("Try again in 900 seconds");
+        // Round 1K: rounded to minutes (it said "in 900 seconds" before).
+        expect(r.stdout).toContain("Try again in 15 minutes");
       },
     );
   });
