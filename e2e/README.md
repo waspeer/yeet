@@ -294,9 +294,11 @@ These talk to wrangler's Local Explorer API
 - `randomId()` → a 6-character upload ID.
 - `triggerCron(cron = "0 * * * *")`: calls `/__scheduled`, which starts one run.
   The cleanup runs in `waitUntil()`, so poll for its effect.
-- `cronUntil(check, { message?, maxRuns = 40, perRunMs = 1500 })` → the runs it
-  took: triggers a run, polls `check` for up to `perRunMs`, and triggers the
-  next until `check` holds (one run handles one slice of the shared bucket).
+- `cronUntil(check, { message?, maxRuns = CRON_RUNS, perRunMs = 1500 })` → the
+  runs it took: triggers a run, polls `check` for up to `perRunMs`, and triggers
+  the next until `check` holds (one run handles one slice of the shared bucket).
+  `CRON_RUNS` is 40 at a `CLEANUP_LIST_LIMIT` of 200 and grows if the limit is
+  lowered; `CRON_TEST_TIMEOUT_MS` is a test timeout with room for that many.
 
 ### Fixtures — `fixtures.ts`
 
@@ -344,7 +346,8 @@ page" test uses no route.
 
 `eventually(check, { timeoutMs?, intervalMs?, message? })` polls until `check`
 returns a truthy value; `exclusive(name, fn, { timeoutMs? })` runs `fn` under a
-lock shared by all workers of the run; `sleep(ms)`; `makeTempDir(prefix?)`; `serverLog()`
+lock shared by all workers of the run (waiting for it up to `CRON_TEST_TIMEOUT_MS`
+by default); `sleep(ms)`; `makeTempDir(prefix?)`; `serverLog()`
 returns wrangler's output so far (e.g. to count `PUT …/parts/N` requests).
 
 ## Known limits

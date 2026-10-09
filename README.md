@@ -140,7 +140,8 @@ frees their storage.
 
 Uploads made with a yeet older than 0.2 cost the listing a storage call
 each (pages of them hold 10) until the cleanup has updated them, 10 per
-run. To update them all at once, see "Migrating a bucket of yeet < 0.2" in
+run; with more than 10,000 of them, `yeet list` stops at its limit of
+1,000 pages and shows only part until they are. To update them all at once, see "Migrating a bucket of yeet < 0.2" in
 [docs/design/api.md](docs/design/api.md). These figures are estimates
 until measured on a real deploy; see "Measurements (phase 1H)" there.
 

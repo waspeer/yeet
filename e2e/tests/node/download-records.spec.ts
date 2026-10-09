@@ -10,6 +10,7 @@
 
 import { randomBytes } from "node:crypto";
 import {
+  CRON_TEST_TIMEOUT_MS,
   deleteUpload,
   eventually,
   exclusive,
@@ -57,7 +58,7 @@ async function seedRecords(id: string, n: number): Promise<void> {
 test.describe("legacy download records", () => {
   test("are not counted, and the cron deletes them but keeps the upload", () =>
     exclusive("cron", async () => {
-      test.setTimeout(120_000);
+      test.setTimeout(Math.max(120_000, CRON_TEST_TIMEOUT_MS));
       // Two uploads with more records than one list page holds, and uploads
       // around them: the listing jumps over the records and still finds every upload.
       const before = await seedLegacyUpload({ filename: "before.bin", data: randomBytes(8) });
@@ -97,7 +98,7 @@ test.describe("legacy download records", () => {
 
   test("the cron removes an expired upload with thousands of them, and stray ones", () =>
     exclusive("cron", async () => {
-      test.setTimeout(120_000);
+      test.setTimeout(Math.max(120_000, CRON_TEST_TIMEOUT_MS));
       const { id: expired } = await seedLegacyUpload({
         filename: "expired.bin",
         data: randomBytes(32),
@@ -121,7 +122,7 @@ test.describe("legacy download records", () => {
 
   test("DELETE removes an upload with thousands of them", () =>
     exclusive("cron", async () => {
-      test.setTimeout(120_000);
+      test.setTimeout(Math.max(120_000, CRON_TEST_TIMEOUT_MS));
       const { id } = await uploadViaApi({ filename: "gone.bin", data: randomBytes(32) });
       await seedRecords(id, 2100);
       expect((await deleteUpload(id)).status).toBe(200);

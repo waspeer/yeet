@@ -1,5 +1,6 @@
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { CRON_TEST_TIMEOUT_MS } from "./bucket.js";
 import { server } from "./env.js";
 
 export const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -22,12 +23,14 @@ export function makeTempDir(prefix = "tmp-"): Promise<string> {
  * Run `fn` while holding a run-wide lock called `name`, shared by all
  * Playwright workers (a directory in the run's temp root; mkdir is atomic).
  * Use it for tests that would disturb each other through shared server state,
- * such as the cron, which cleans up every expired upload at once.
+ * such as the cron, which cleans up every expired upload at once. Waits for
+ * the lock as long as a cron test may take (CRON_TEST_TIMEOUT_MS), which
+ * grows if CLEANUP_LIST_LIMIT is lowered.
  */
 export async function exclusive<T>(
   name: string,
   fn: () => Promise<T>,
-  { timeoutMs = 60_000 } = {},
+  { timeoutMs = CRON_TEST_TIMEOUT_MS } = {},
 ): Promise<T> {
   await mkdir(join(server.tmpRoot, "locks"), { recursive: true });
   const lock = join(server.tmpRoot, "locks", name);

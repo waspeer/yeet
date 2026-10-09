@@ -492,11 +492,18 @@ itself. They replace the assumptions the earlier rounds were built on
 
   So CPU grows with the uploads listed, roughly 27–47 µs per upload (20 to
   40 ms per 1,000), far above 10 ms; Workers Free tolerates some excess
-  before it refuses requests.
+  before it refuses requests. Recomputed from the tail data by the
+  verifier of round 1I, allowing for a fixed cost per request: about
+  27–71 µs per upload plus 1–6 ms per request. This is an inference
+  from requests that listed 1,000 to 8,000 uploads, not a measurement
+  of a page.
 - **The cron** (`runCleanup()` called through the probe Worker, the design
   before round 1I: up to 25 list calls and 45 R2 calls; n = 5 runs): 45 and
   65 ms CPU for runs that gave 20 and 18 sidecars their summary, 141–179
-  ms for runs that deleted 4 to 507 uploads.
+  ms for runs that deleted 4 to 507 uploads. The 1I verifier inferred
+  from these about 14.8–17.3 µs per object listed, and at least about
+  0.7–1.3 ms per summary written (a get and a conditional put), not
+  measured separately.
 - **R2:** a `list()` with `include: ["customMetadata"]` returned about 415
   objects per call, without it about 848, never 1,000 even with
   `limit: 1000`. The limit on R2 binding calls is **1,000 per invocation**,
@@ -546,17 +553,24 @@ measured on a real deploy** (see "To measure next").
   A client that ignores `cursor` (yeet 0.2's CLI) gets the first page and
   prints its note that only part of the uploads is shown. A new CLI
   against a server without pages (`truncated` without `cursor`) prints
-  that page with the same note.
+  that page with the same note. (That is a 0.2 CLI built from `fe688c9`
+  or later; earlier pre-release builds, such as `feb7b2f`, also
+  versioned 0.2.0 and never published on npm, show the first page
+  without the note.)
 
 **Work per request** (`listPage()` in `uploads.ts`, on top of `listAll()`;
 asserted in `e2e/tests/node/r2-work-bounds.spec.ts` on a bucket returning
 415 objects per list call, as real R2 did):
 
 - **One list call** with custom metadata and `limit: 300` (`PAGE_LIMIT`):
-  at most 300 objects, about 150 finished uploads. 300 because the phase
-  1H numbers (27–47 µs per upload) put 150 uploads at about 4–7 ms of CPU,
-  leaving room for the rest of the request; real R2 returns more than 300
-  per call, so the `limit` is the bound.
+  at most 300 objects, about 150 finished uploads. Real R2 returns more
+  than 300 per call, so the `limit` is the bound. 300 was chosen from
+  the phase 1H summary of 27–47 µs per upload (149 uploads ≈ 4–7 ms).
+  The 1I verifier's recomputation, 27–71 µs per upload plus 1–6 ms per
+  request, puts a page of 149 uploads at about 6–13 ms: possibly over
+  10 ms. *An inference, not a measurement*; the next measurement on a
+  real deploy decides whether `PAGE_LIMIT` goes down (see "To measure
+  next").
 - **At most one more list call** (`PAGE_JUMPS`), only when the first ends
   inside a `.downloads/` or `.parts/` run: it continues after the run
   (`startAfter: <prefix>/<id>/<run>/~`), so an upload with thousands of
@@ -572,14 +586,23 @@ followed by keys that belong to no upload is complete (a fix of round
 1I: before, it was always treated as possibly partly listed). If a page
 lists nothing but the start of one upload:
 
-- **with more than 2 of its keys listed** (more keys than a yeet upload has
-  outside its `.downloads/` and `.parts/` runs; more than a page lists,
-  not a yeet upload): it is returned unread, and the next page starts
-  after it, so pages never stall;
+- **with more than 2 of its keys listed outside its `.downloads/` and
+  `.parts/` runs** (more than a yeet upload has there; more than a page
+  lists, not a yeet upload): it is returned unread, and the next page
+  starts after it, so pages never stall;
+- **with more than 2 keys listed, nearly all in a `.downloads/` run, and
+  its sidecar not reached** (the page ended in the run and R2 answered the
+  jump over it with a short or empty page; the sidecar sorts after
+  `.downloads/`): its sidecar is read (1 call, within `PAGE_READS`) and
+  the upload is returned with it, and the next page starts after it. If
+  the read fails, nothing is returned and the cursor stays where it was.
+  Before round 1J such an upload was returned without a summary, so left
+  out, and the next page started after it: skipped for that walk.
 - **with at most 2** (R2 returned a short page, as it may; even empty ones):
   nothing is returned and the cursor stays where it was, so the next
-  request tries again rather than skipping an upload. Real R2 returned
-  full pages in phase 1H.
+  request tries again rather than skipping an upload. If R2 kept doing
+  that, `yeet list` would stop at its page cap (see below). Real R2
+  returned full pages in phase 1H.
 
 Pending uploads, and sidecars that are unreadable or not shaped like one
 (see "Sidecars that never get a summary" below), are left out of the
@@ -599,11 +622,24 @@ page, never an error.
 goes on is left for the next. `wrangler dev` returns at most 100 objects
 per list call, so it shows 49 per page.
 
+**More than 10,000 sidecars without a summary** take more than 1,000
+pages at 10 a page: `yeet list` stops at its cap of 1,000 pages
+(`MAX_LIST_PAGES`) and prints only part, with its note, until enough of
+them have their summary. The cron gives 10 an hour; the one-time script
+`packages/worker/scripts/backfill-summaries.mjs` (see "Migrating a bucket
+of yeet < 0.2" below) gives all of them theirs in one go.
+
 **`yeet list`** fetches every page, one request after the other, and
 prints all uploads newest first. A page that fails with a network error,
 5xx (503 is what Cloudflare answers over the CPU limit) or 429 is retried
-with backoff (1, 2 and 4 s); if it still fails, `yeet list` prints what it
-has with a note and exits 1 (if the first page fails, that is the error).
+with backoff (1, 2 and 4 s), or after the server's `Retry-After` if it
+sent one; one longer than 10 s is not waited for (since round 1J: a
+`429` after too many wrong tokens asks for up to a minute, which the
+backoff used to retry anyway). If it still fails, or answers with
+something that is not a page (a `200` that is not JSON, say), `yeet list`
+prints what it has with a note (saying when to try again, for a `429`)
+and exits 1; if the first page fails, that is the error. (Before round
+1J a later page that was not JSON was an error that printed nothing.)
 It fetches at most 1,000 pages, so a server that keeps answering with a
 cursor cannot keep it busy forever. Tested against a stand-in server in
 `e2e/tests/node/cli.spec.ts`, and end to end in `list-pages.spec.ts`.
@@ -686,9 +722,14 @@ subrequests were assumed: a run's own work needs at most 31 (cursor read
 and write, 2 lists, 20 for summaries, 3 for `deleteUnder()`, 4 batch
 deletes), so the rest only limits multipart aborts. On the
 in-memory buckets of the tests, runs make 5 to 31. 200 rather than a page's 300
-because a run may list three times: the phase 1H cron runs cost about
-15 µs CPU per object listed (141–179 ms for up to 25 calls), so 600
-objects are about 9 ms. *Estimate, to be measured on a real deploy.*
+because a run may list three times. From the phase 1H cron runs (141–179
+ms for up to 25 list calls) the 1I verifier inferred about 14.8–17.3 µs
+CPU per object listed, so 600 objects are about 8.9–10.4 ms, and at least
+about 0.7–1.3 ms per summary written, so a run that writes 10 summaries
+and lists 200 objects (about 10–16 ms) is plausibly over 10 ms too.
+*Inferences, not measurements*; the next measurement on a real deploy
+decides whether `CLEANUP_LIST_LIMIT` or `CLEANUP_SUMMARIES` go down (see
+"To measure next").
 
 **The sidecar goes last** because it is what makes the listing see an
 upload: when a run (or a `DELETE /api/uploads/:id`) stops half-way, what is
@@ -703,6 +744,14 @@ write sorting before its `.meta.json` than a run lists (outside
 reaches its sidecar, so none sees it as stale; each returns it unread and
 goes on after it instead of stalling (`e2e/tests/node/r2-adversarial-1g.spec.ts`,
 with 30,000 such keys). yeet itself never writes such keys.
+
+**A jump answered with a short or empty page** (see "Listing a page"):
+the run reads the sidecar of the upload whose `.downloads/` run it ended
+in (1 call of its budget), and so knows whether it is stale. Before round
+1J it handled the upload as current and deleted only its records, which
+was harmless: a later run lists it whole once few enough records are
+left (`e2e/tests/node/verify-1i.spec.ts`, with every jump empty: 12 runs
+before the fix, 11 after, to clean up 3 uploads of 600 records or parts).
 
 **Runs per bucket** (`e2e/tests/node/r2-capacity.spec.ts` and
 `r2-work-bounds.spec.ts`; 415 objects per list call, every tenth upload
@@ -735,20 +784,33 @@ their upload has been reached (`cronUntil()` in `e2e/lib/bucket.ts`).
 
 ### To measure next (on a real deploy)
 
-- CPU of `GET /api/uploads` per page: with 150 uploads that have a summary
-  (the 300-object limit), with 10 reads of sidecars without one, and with a
-  jump over legacy records (up to 600 objects); `yeet list` through a
-  bucket of several thousand uploads without a `503`.
-- CPU of a cron run: a slice of 200 objects that deletes about 10 uploads,
-  one with 10 summaries, and one with a `deleteUnder()` round; and that
-  the hourly trigger fires.
+The CPU figures for a page and a cron run above are inferences from the
+phase 1H numbers, which were taken with the designs before round 1I.
+Each of these must be measured before the bounds are trusted:
+
+- **CPU of `GET /api/uploads` per page** with 149 uploads that have a
+  summary (the 300-object limit; inferred 6–13 ms), with 10 reads of
+  sidecars without one, and with a jump over legacy records (up to 600
+  objects); and the fixed cost of a request (inferred 1–6 ms). Also
+  `yeet list` through a bucket of several thousand uploads without a
+  `503`.
+- **CPU per object listed by a cron run** (inferred 14.8–17.3 µs, so
+  8.9–10.4 ms for the 600 objects a run may examine): a slice of 200
+  objects that deletes about 10 uploads, and one with a `deleteUnder()`
+  round.
+- **CPU per summary written by the cron** (inferred at least 0.7–1.3 ms):
+  a run that writes 10 summaries among 200 objects (inferred about 10–16
+  ms). And that the hourly trigger fires.
 - Whether real R2 ever returns short or empty pages with `limit` set (the
   listing retries rather than skips then).
 - CPU of `POST /api/uploads/:id/complete` of an upload of unknown size with
   thousands of part records (the 46-call budget allows about 18,000 at
   415 per call).
-- If a page or a run is over 10 ms, lower `PAGE_LIMIT` or
-  `CLEANUP_LIST_LIMIT`; the tests assert against the constants.
+- If a page or a run is over 10 ms, lower `PAGE_LIMIT`,
+  `CLEANUP_LIST_LIMIT` or `CLEANUP_SUMMARIES`. That is a change of the
+  constant and of the numbers in this file: the tests compute what they
+  expect from the constants, and `verify-1i.spec.ts` checks that this
+  file states their values.
 
 ### Migrating a bucket of yeet < 0.2 (one-time)
 

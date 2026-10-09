@@ -1,4 +1,4 @@
-import { CLEANUP_BUDGET, runCleanup } from "../../../packages/worker/src/cleanup.js";
+import { CLEANUP_BUDGET, CLEANUP_LIST_LIMIT, runCleanup } from "../../../packages/worker/src/cleanup.js";
 import { LIST_BUDGET, summarize, Uploads, type UploadMeta } from "../../../packages/worker/src/uploads.js";
 import { expect, test } from "../../lib/index.js";
 import { StrictBucket, byteCompare, seededRandom } from "../../lib/strict-r2.js";
@@ -11,6 +11,10 @@ import { StrictBucket, byteCompare, seededRandom } from "../../lib/strict-r2.js"
 // r2-budget.spec.ts they pin down that no upload is skipped or deleted by
 // mistake and that no request exceeds its R2 call budget.
 
+// Run counts below were set for round 1I's CLEANUP_LIST_LIMIT of 200; a run
+// does work in proportion to the limit, so they scale with it (round 1J:
+// lowering the limit after a measurement must need no test change).
+const runsAt200 = (runs: number) => Math.ceil((runs * 200) / CLEANUP_LIST_LIMIT);
 const P = "uploads";
 const DAY = 86_400_000;
 const NOW = Date.UTC(2026, 9, 8, 3);
@@ -212,7 +216,8 @@ test.describe("adversarial cron", () => {
 
     let i = 0;
     let maxCalls = 0;
-    for (; i < 3000; i++) {
+    const maxRuns = runsAt200(3000);
+    for (; i < maxRuns; i++) {
       b.reset();
       const r = await runCleanup(b, P, NOW);
       maxCalls = Math.max(maxCalls, r.subrequests);
@@ -224,15 +229,15 @@ test.describe("adversarial cron", () => {
       const rec = keys.filter((k) => k.includes("/.downloads/")).length;
       const un = [...keep.keys()].filter((id) => !b.objects.get(`${P}/${id}/.meta.json`)!.meta.summary).length;
       if (i % 100 === 99) console.log(`run ${i + 1}: stale ${st} records ${rec} unsummarized ${un} keys ${keys.length}`);
-      if (i === 2999) {
+      if (i === maxRuns - 1) {
         const left = [...stale].filter((id) => b.sorted(`${P}/${id}/`).length > 0);
-        throw new Error(`not converged after 3,000 runs; stale uploads left: ${left.slice(0, 20).join(" ")}`);
+        throw new Error(`not converged after ${maxRuns} runs; stale uploads left: ${left.slice(0, 20).join(" ")}`);
       }
       if (st === 0 && rec === 0 && un === 0) break;
     }
     console.log("max calls per run", maxCalls);
     console.log("cron converged after runs:", i + 1);
-    expect(i).toBeLessThan(3000);
+    expect(i).toBeLessThan(maxRuns);
     for (const id of keep.keys()) {
       const s = b.objects.get(`${P}/${id}/.meta.json`)!;
       expect(JSON.parse(s.meta.summary!)).toEqual(summarize(JSON.parse(s.body)));
@@ -327,7 +332,7 @@ test.describe("adversarial cron", () => {
     seed(b, "a0003", { pending: NOW - DAY + 60_000, parts: 3 });
     // Round 1I: a run deletes at most CLEANUP_LIST_LIMIT (200) keys of an
     // upload it has to list on its own, so 2,500 parts take 13 runs.
-    await runs(b, 16);
+    await runs(b, runsAt200(16));
     // Round 1I: an abandoned upload whose deletion takes several runs has
     // its (already aborted) multipart upload aborted again in each, 1 call.
     expect([...new Set(b.aborted)].sort()).toEqual(["mp-a0001", "mp-a0002"]);

@@ -157,26 +157,55 @@ function expectBounds(work: { lists: number; listed: number; gets: number; total
 }
 
 test.describe("1I verifier: page walks of GET /api/uploads", () => {
-  // FINDING: the short-page guard protects a first upload with at most 2 keys
-  // listed, but an upload with a `.downloads/` run longer than the page,
-  // whose jump call R2 answers with an empty (truncated) page, is returned
-  // "unread" with no summary (its sidecar was never listed), dropped from
-  // the page, and the next page starts after it: skipped for this walk.
-  //
-  // This test pins the CURRENT behaviour so the suite stays green; when it is
-  // fixed, the expectation becomes ["a00000", "b00000"].
-  test("FINDING: an empty page on the jump skips the upload whose run it jumps", async () => {
+  // Was a FINDING of the 1I verifier, fixed in round 1J: an upload with a
+  // `.downloads/` run longer than the page, whose jump call R2 answers with
+  // an empty (truncated) page, was returned "unread" with no summary (its
+  // sidecar was never listed), dropped from the page, and the next page
+  // started after it: skipped for the whole walk. Now listAll() reads its
+  // sidecar (one get, within PAGE_READS) instead.
+  test("an empty page on the jump does not skip the upload whose run it jumps", async () => {
     const b = new ScriptedBucket({ ...REAL_R2_CAPS, maxCalls: Infinity });
     seed(b, "a00000", { records: 400 });
     seed(b, "b00000");
     // The jump of the first page (its second list call) comes back empty.
     let page = 0;
     b.script = (n) => (page === 0 && n === 1 ? 0 : undefined);
-    const { seen } = await walk(b, { between: () => page++ });
-    expect(seen.sort()).toEqual(["b00000"]);
+    const { seen, work } = await walk(b, { between: () => page++ });
+    expect(seen.sort()).toEqual(["a00000", "b00000"]);
+    expectBounds(work);
     // Without the empty page it is listed.
     b.script = undefined;
     expect((await walk(b)).seen.sort()).toEqual(["a00000", "b00000"]);
+  });
+
+  test("1J: every jump empty, on every page: no upload skipped, bounds kept, the walk ends", async () => {
+    const b = new ScriptedBucket({ ...REAL_R2_CAPS, maxCalls: Infinity });
+    const ids: string[] = [];
+    for (let i = 0; i < 60; i++) {
+      const id = `w${String(i).padStart(4, "0")}`;
+      ids.push(id);
+      // Every seventh has a `.downloads/` or `.parts/` run longer than a page.
+      seed(b, id, i % 7 === 0 ? (i % 2 ? { records: 700 } : { legacy: true, records: 400 }) : {}, i);
+    }
+    // R2 answers every jump (the second list call of a page) with an empty page.
+    b.script = (n) => (n === 1 ? 0 : undefined);
+    const { seen, work, done } = await walk(b);
+    expect(done).toBe(true);
+    expect(seen.sort()).toEqual(ids);
+    expectBounds(work);
+  });
+
+  test("1J: junk keys between the run and the sidecar still get a page past the upload, unread", async () => {
+    const b = new ScriptedBucket({ ...REAL_R2_CAPS, maxCalls: Infinity });
+    seed(b, "a00000", { records: 400 });
+    // 400 keys yeet does not write, between `.downloads/` and `.meta.json`.
+    for (let n = 0; n < 400; n++) b.seed(`${P}/a00000/.e/${n}`);
+    seed(b, "b00000");
+    b.maxCalls = 1 + PAGE_READS;
+    const page = await new Uploads(b, P).listPage();
+    expect(page.uploads).toEqual([]);
+    expect(page.next).toBe(`${P}/a000000`);
+    expect(b.calls.get ?? 0).toBe(0);
   });
 
   test("empty pages that are not on a jump: retried, nothing skipped, no duplicate", async () => {
@@ -318,10 +347,17 @@ test.describe("1I verifier: page walks of GET /api/uploads", () => {
 });
 
 test.describe("1I verifier: pinned constants and the guard's threshold", () => {
-  test("the documented bounds: 300 objects, 1 jump, 10 reads; 200 per cron list; hourly", async () => {
-    expect([PAGE_LIMIT, PAGE_JUMPS, PAGE_READS, CLEANUP_LIST_LIMIT, CLEANUP_SUMMARIES]).toEqual([
-      300, 1, 10, 200, 10,
-    ]);
+  // Since round 1J this checks that api.md states the constants' values
+  // rather than pinning the values themselves: PAGE_LIMIT and
+  // CLEANUP_LIST_LIMIT may be lowered after the next measurement on a real
+  // deploy, with a change of the constant (and of the docs) only.
+  test("the documented bounds match the constants; hourly", async () => {
+    const doc = await readFile(new URL("../../../docs/design/api.md", import.meta.url), "utf-8");
+    expect(doc).toContain(`\`limit: ${PAGE_LIMIT}\` (\`PAGE_LIMIT\`)`);
+    expect(doc).toContain(`\`limit: ${CLEANUP_LIST_LIMIT}\` (\`CLEANUP_LIST_LIMIT\``);
+    expect(doc).toContain(`**At most ${PAGE_READS} reads**`);
+    expect(doc).toContain(`at most **${CLEANUP_SUMMARIES} per`);
+    expect(PAGE_JUMPS).toBe(1); // "at most one more list call" in the docs
     const wrangler = await readFile(
       new URL("../../../packages/worker/wrangler.jsonc", import.meta.url),
       "utf-8",
@@ -523,6 +559,38 @@ test.describe("1I verifier: cron runs", () => {
     }
   });
 
+  // The cron's side of the 1I finding: harmless there (the verifier's
+  // reading, confirmed here and before the 1J fix alike). A sidecar sorts
+  // before `.parts/`, so only a `.downloads/` run can hide it; the run then
+  // deletes records of the upload, current or not, and lists it whole once
+  // few enough are left.
+  test("1J: every jump empty: expired and current uploads with legacy records, live keys untouched, converges", async () => {
+    const b = new ScriptedBucket({ ...REAL_R2_CAPS, maxCalls: Infinity });
+    seed(b, "e0", { expired: true, records: 600 });
+    seed(b, "p0", { pendingSince: NOW - 2 * DAY, parts: 600 });
+    seed(b, "q0", { records: 600 }); // current, with legacy records
+    b.live.add("q0");
+    // R2 answers every jump (a run's second list call) with an empty page.
+    b.script = (n) => (n === 1 ? 0 : undefined);
+    let runs = 0;
+    const left = () =>
+      b.sorted(`${P}/e0/`).length +
+      b.sorted(`${P}/p0/`).length +
+      b.sorted(`${P}/q0/.downloads/`).length;
+    while (left() > 0 && runs < 50) {
+      runs++;
+      b.reset();
+      b.maxCalls = CLEANUP_BUDGET;
+      await runCleanup(b, P, NOW);
+      expect(b.calls.list ?? 0).toBeLessThanOrEqual(3);
+    }
+    console.log(`every jump empty: ${runs} runs, ${left()} keys left`);
+    expect(left()).toBe(0);
+    expect(b.violations).toEqual([]);
+    expect(b.objects.has(`${P}/q0/.meta.json`)).toBe(true);
+    expect(b.objects.has(`${P}/q0/f.bin`)).toBe(true);
+  });
+
   test("a stale pending upload with many part records is aborted once per run and still finishes", async () => {
     const b = new ScriptedBucket({ ...REAL_R2_CAPS, maxCalls: Infinity });
     seed(b, "p0", { pendingSince: NOW - 2 * DAY, parts: 2000 });
@@ -553,7 +621,10 @@ test.describe("1I verifier: yeet list against a stand-in server", () => {
     url: `http://127.0.0.1/v${n}/g${n}.bin`,
   });
 
-  type Reply = { status: number; body: unknown } | "reset" | "garbage";
+  type Reply =
+    | { status: number; body: unknown; headers?: Record<string, string> }
+    | "reset"
+    | "garbage";
   async function withServer(
     handler: (cursor: string | null, attempt: number) => Reply,
     run: (
@@ -571,7 +642,7 @@ test.describe("1I verifier: yeet list against a stand-in server", () => {
         res.writeHead(200, { "Content-Type": "text/html" });
         return void res.end("<html>not json</html>");
       }
-      res.writeHead(reply.status, { "Content-Type": "application/json" });
+      res.writeHead(reply.status, { "Content-Type": "application/json", ...reply.headers });
       res.end(JSON.stringify(reply.body));
     });
     await new Promise<void>((resolve) => fake.listen(0, "127.0.0.1", resolve));
@@ -628,7 +699,9 @@ test.describe("1I verifier: yeet list against a stand-in server", () => {
     );
   });
 
-  test("a later page that is not JSON: an error, exit 1", async () => {
+  // Before round 1J: "does not understand" on stderr, exit 1 and nothing on
+  // stdout, the pages already fetched thrown away.
+  test("a later page that is not JSON: partial output with a note, exit 1", async () => {
     await withServer(
       (cursor) => (cursor === null ? page(0, "two") : "garbage"),
       async (env, log) => {
@@ -636,7 +709,77 @@ test.describe("1I verifier: yeet list against a stand-in server", () => {
         console.log(
           `not JSON on page 2: exit ${r.code}, requests ${log.length}, stdout ${JSON.stringify(r.stdout.slice(0, 80))}, stderr ${JSON.stringify(r.stderr.slice(0, 120))}`,
         );
-        expect(r.code).toBe(1);
+        expectExitCode(r, 1);
+        expect(log).toHaveLength(2);
+        expect(r.stdout).toContain("g0.bin");
+        expect(r.stdout).toContain("2 files");
+        expect(r.stdout).toContain("only part of your uploads is shown");
+        expect(r.stdout).toContain("does not understand");
+      },
+    );
+  });
+
+  test("a first page that is not JSON is still an error", async () => {
+    await withServer(
+      () => "garbage",
+      async (env) => {
+        const r = await cli(["list"], { env });
+        expectExitCode(r, 1);
+        expect(r.stdout).toBe("");
+        expect(r.stderr).toContain("does not understand");
+      },
+    );
+  });
+
+  // Before round 1J the CLI retried a 429 after 1, 2 and 4 s whatever its
+  // Retry-After, adding about 7 s before the same error.
+  test("a 429 with a long Retry-After on page 2: no retry, partial output saying when", async () => {
+    await withServer(
+      (cursor) =>
+        cursor === null
+          ? page(0, "two")
+          : {
+              status: 429,
+              body: { error: "Too many attempts, retry in 900 s" },
+              headers: { "Retry-After": "900" },
+            },
+      async (env, log) => {
+        const started = Date.now();
+        const r = await cli(["list"], { env });
+        const took = Date.now() - started;
+        console.log(`429 with Retry-After 900: ${log.length} requests, ${took} ms`);
+        expectExitCode(r, 1);
+        expect(log).toHaveLength(2);
+        expect(took).toBeLessThan(5000);
+        expect(r.stdout).toContain("2 files");
+        expect(r.stdout).toContain("only part of your uploads is shown");
+        expect(r.stdout).toContain("Try again in 900 seconds");
+      },
+    );
+  });
+
+  test("a 429 with a short Retry-After on page 2: retried after that long", async () => {
+    test.setTimeout(30_000);
+    await withServer(
+      (cursor, attempt) =>
+        cursor === null
+          ? page(0, "two")
+          : attempt === 1
+            ? {
+                status: 429,
+                body: { error: "Too many attempts, retry in 3 s" },
+                headers: { "Retry-After": "3" },
+              }
+            : page(1, null),
+      async (env, log) => {
+        const r = await cli(["list"], { env });
+        expectExitCode(r, 0);
+        expect(log.map((l) => l.cursor)).toEqual([null, "two", "two"]);
+        const gap = log[2]!.at - log[1]!.at;
+        console.log(`429 with Retry-After 3: retried after ${gap} ms`);
+        expect(gap).toBeGreaterThanOrEqual(3000 - 50);
+        expect(gap).toBeLessThan(4000);
+        expect(r.stdout).toContain("4 files");
       },
     );
   });

@@ -273,7 +273,7 @@ const unsummarizedLeft = (b: StrictBucket) =>
 
 test.describe("work of one cron run (real R2 page sizes)", () => {
   for (const n of [1000, 5000]) {
-    test(`${n.toLocaleString("en")} uploads, every tenth expired: bounded runs, a full pass in about n / 99`, async () => {
+    test(`${n.toLocaleString("en")} uploads, every tenth expired: bounded runs, a full pass in about n / ${CLEANUP_LIST_LIMIT / 2 - 1}`, async () => {
       test.setTimeout(120_000);
       const { b } = bucketOf(n, (i) => ({ expired: i % 10 === 9 }));
       let cursor: string | null | undefined;

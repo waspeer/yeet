@@ -218,18 +218,30 @@ class ApiError extends Error {
     readonly status: number,
     /** The message without advice to run `yeet login`, for `yeet login` itself. */
     readonly forLogin = message,
+    /** Seconds the server asked to wait before trying again (Retry-After), if it said. */
+    readonly retryAfter?: number,
   ) {
     super(message);
   }
 }
 
 /**
+ * Seconds to wait from a Retry-After header (delta-seconds or an HTTP date),
+ * or undefined if there is none or it is unusable.
+ */
+function retryAfterSeconds(res: Response): number | undefined {
+  const value = res.headers.get("Retry-After")?.trim();
+  if (!value) return undefined;
+  if (/^\d+$/.test(value)) return Number(value);
+  const at = Date.parse(value);
+  return Number.isNaN(at) ? undefined : Math.max(0, Math.ceil((at - Date.now()) / 1000));
+}
+
+/**
  * The server refuses every token from this address for a while after too many
  * wrong ones (429). Seconds to wait come from Retry-After, or the error text.
  */
-function tooManyAttempts(res: Response, error: string | undefined): string {
-  const seconds =
-    Number(res.headers.get("Retry-After")) || Number(error?.match(/(\d+)\s*s\b/)?.[1]) || 0;
+function tooManyAttempts(seconds: number): string {
   const wait = seconds > 0 ? `in ${seconds} second${seconds === 1 ? "" : "s"}` : "later";
   return `Too many wrong upload tokens were tried from this address. Try again ${wait}.`;
 }
@@ -270,27 +282,46 @@ async function api<T>(
 
   if (!res.ok) {
     const message = (data as { error?: string } | undefined)?.error;
+    const retryAfter = retryAfterSeconds(res);
     // `yeet login` words these two without the advice to run itself (see login()).
     if (res.status === 401) {
       throw new ApiError("The server rejected the upload token. Run `yeet login` again.", 401);
     }
     if (res.status === 429) {
-      const tooMany = tooManyAttempts(res, message);
+      const seconds = retryAfter || Number(message?.match(/(\d+)\s*s\b/)?.[1]) || 0;
+      const tooMany = tooManyAttempts(seconds);
       throw new ApiError(
         `${tooMany} If your token is wrong, run \`yeet login\` again after that.`,
         429,
         tooMany,
+        seconds || undefined,
       );
     }
     if (res.status === 404 && message === undefined) {
       throw new ApiError(`${config.url} does not look like a yeet server (404 on ${path})`, 404);
     }
-    throw new ApiError(message ?? `Server returned ${res.status}`, res.status);
+    throw new ApiError(
+      message ?? `Server returned ${res.status}`,
+      res.status,
+      undefined,
+      retryAfter,
+    );
   }
   return data as T;
 }
 
-/** Retry transient failures (network errors and 5xx) with backoff. */
+/**
+ * The longest Retry-After withRetries() waits for. A server that asks for
+ * longer (e.g. 429 after too many wrong tokens, for up to a minute or more)
+ * gets no retry: the error says when to try again instead.
+ */
+const MAX_RETRY_AFTER_S = 10;
+
+/**
+ * Retry transient failures (network errors, 5xx and 429) with backoff (1, 2
+ * and 4 s), or after the server's Retry-After if it sent one, unless that is
+ * longer than MAX_RETRY_AFTER_S.
+ */
 async function withRetries<T>(attempt: () => Promise<T>, tries = 4): Promise<T> {
   for (let i = 1; ; i++) {
     try {
@@ -299,7 +330,9 @@ async function withRetries<T>(attempt: () => Promise<T>, tries = 4): Promise<T> 
       const status = err instanceof ApiError ? err.status : 0;
       const transient = status === 0 || status >= 500 || status === 429;
       if (!transient || i >= tries) throw err;
-      await sleep(1000 * 2 ** (i - 1));
+      const retryAfter = err instanceof ApiError ? err.retryAfter : undefined;
+      if (retryAfter !== undefined && retryAfter > MAX_RETRY_AFTER_S) throw err;
+      await sleep(retryAfter !== undefined ? retryAfter * 1000 : 1000 * 2 ** (i - 1));
     }
   }
 }
@@ -432,13 +465,17 @@ const MAX_LIST_PAGES = 1000;
  * request does a small, bounded amount of work on the server). A page that
  * fails with a network error, 5xx or 429 is retried with backoff
  * (withRetries()). If the first page fails, that is the error; if a later
- * one does, or the page cap is reached, what was fetched so far comes back
+ * one does (or is not a page at all), or the page cap is reached, what was fetched so far comes back
  * with a note saying why the list is incomplete.
  */
 async function fetchAllUploads(
   config: Config,
 ): Promise<{ uploads: ListedUpload[]; incomplete?: string; partial?: string }> {
   const byId = new Map<string, ListedUpload>();
+  const fetchedSoFar = (reason: string) => ({
+    uploads: [...byId.values()],
+    incomplete: `Could not fetch every page (${reason}); run \`yeet list\` again for the rest.`,
+  });
   let cursor: string | null = null;
   for (let pages = 0; ; pages++) {
     if (pages >= MAX_LIST_PAGES) {
@@ -454,14 +491,14 @@ async function fetchAllUploads(
       page = await withRetries(() => api<UploadsPage>(config, "GET", path));
     } catch (err) {
       if (pages === 0) throw err;
-      const reason = err instanceof Error ? err.message : String(err);
-      return {
-        uploads: [...byId.values()],
-        incomplete: `Could not fetch every page (${reason}); run \`yeet list\` again for the rest.`,
-      };
+      return fetchedSoFar(err instanceof Error ? err.message : String(err));
     }
     if (!Array.isArray(page?.uploads)) {
-      throw new ApiError("The server sent a list of uploads yeet does not understand", 0);
+      if (pages === 0) {
+        throw new ApiError("The server sent a list of uploads yeet does not understand", 0);
+      }
+      // A later page: what was fetched so far, as for any other failure.
+      return fetchedSoFar("the server sent a page yeet does not understand");
     }
     for (const upload of page.uploads) byId.set(upload.id, upload);
     if (typeof page.cursor === "string" && page.cursor !== "") {

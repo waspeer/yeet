@@ -1,3 +1,4 @@
+import { PAGE_LIMIT } from "../../../packages/worker/src/uploads.js";
 import { randomBytes } from "node:crypto";
 import {
   api,
@@ -99,7 +100,7 @@ test("GET /api/uploads: one page per request, a cursor to continue, every upload
   }
   console.log(`${UPLOADS} uploads in pages of ${sizes.join(", ")}`);
   expect(sizes.length).toBeGreaterThan(1);
-  expect(Math.max(...sizes)).toBeLessThanOrEqual(149);
+  expect(Math.max(...sizes)).toBeLessThanOrEqual(Math.floor(PAGE_LIMIT / 2) - 1);
   expect(seen.map((u) => u.id).sort()).toEqual(ids);
   expect(new Set(seen.map((u) => u.id)).size).toBe(UPLOADS);
   // The sidecars without a summary are listed too (read on their page).
