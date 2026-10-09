@@ -483,20 +483,32 @@ test.describe("1J verifier: Retry-After on list pages", () => {
     expect(eleven.stdout).toContain("2 files");
   });
 
-  test("a 503 with a long Retry-After: no retry; does the note say when?", async () => {
-    const r = await listWithPage2({
-      status: 503,
-      body: { error: "Service unavailable" },
-      headers: { "Retry-After": "120" },
+  // Round 1K: the 1J verifier observed that the note gave the server's error
+  // but not when to try again (only a 429 said). Now any status with a
+  // Retry-After too long to wait for says when, rounded to a readable unit,
+  // and "later" above a day instead of the raw number.
+  for (const [value, when] of [
+    ["120", "Try again in 2 minutes."],
+    ["900", "Try again in 15 minutes."],
+    ["7200", "Try again in 2 hours."],
+    ["86401", "Try again later."],
+    ["100000000000000000000", "Try again later."],
+  ] as const) {
+    test(`a 503 with Retry-After ${value}: no retry, the note says "${when}"`, async () => {
+      const r = await listWithPage2({
+        status: 503,
+        body: { error: "Service unavailable" },
+        headers: { "Retry-After": value },
+      });
+      const note = r.stdout.split("\n").filter((l) => /Note/.test(l));
+      console.log(`503 RA ${value}: exit ${r.code}, requests ${r.requests}, note ${note}`);
+      expect(r.code).toBe(1);
+      expect(r.requests).toBe(2);
+      expect(r.stdout).toContain("2 files");
+      expect(note.join("\n")).toContain(`Service unavailable. ${when}`);
+      expect(r.stdout).not.toContain("00000");
     });
-    console.log(
-      `503 RA 120: exit ${r.code}, requests ${r.requests}, note ${JSON.stringify(r.stdout.split("\n").filter((l) => /Note/.test(l)))}`,
-    );
-    expect(r.code).toBe(1);
-    expect(r.requests).toBe(2);
-    // Observed: the note gives the server's error, not when to try again.
-    expect(r.stdout).not.toContain("120 seconds");
-  });
+  }
 
   test("an HTTP date ~3 s ahead is waited for; a past date retries at once", async () => {
     test.setTimeout(30_000);
@@ -589,7 +601,9 @@ test.describe("1J verifier: Retry-After on list pages", () => {
     );
     expect(r.code).toBe(1);
     expect(r.requests).toBe(2);
-    expect(r.stdout).toContain("Try again in");
+    // Round 1K: "later" above a day, not the raw number of seconds.
+    expect(r.stdout).toContain("Try again later.");
+    expect(r.stdout).not.toContain("99999");
   });
 
   test("a later page that is JSON but not a page (no uploads array): partial, exit 1", async () => {
@@ -651,6 +665,8 @@ test.describe("1J verifier: Retry-After on upload parts", () => {
     expect(r.log.filter((h) => h.path.endsWith("/parts/2"))).toHaveLength(1);
     expect(r.log.some((h) => h.method === "DELETE" && h.path === "/api/uploads/up1")).toBe(true);
     expect(r.log.some((h) => h.path.endsWith("/complete"))).toBe(false);
+    // Round 1K: the error says when to try again.
+    expect(r.stderr).toContain("slow down. Try again in 15 minutes.");
   });
 
   test("a part answered 429 with Retry-After 2 once: retried after ~2 s, upload completes", async () => {

@@ -257,8 +257,20 @@ function retryAfterSeconds(res: Response): number | undefined {
  * wrong ones (429). Seconds to wait come from Retry-After, or the error text.
  */
 function tooManyAttempts(seconds: number): string {
-  const wait = seconds > 0 ? `in ${seconds} second${seconds === 1 ? "" : "s"}` : "later";
-  return `Too many wrong upload tokens were tried from this address. Try again ${wait}.`;
+  return `Too many wrong upload tokens were tried from this address. Try again ${waitText(seconds)}.`;
+}
+
+/**
+ * When to try again, for a message: "in 45 seconds", "in 15 minutes", "in 3
+ * hours" (rounded up), or "later" for no wait known or one over a day (a
+ * server may send any Retry-After, 100000000000000000000 included).
+ */
+function waitText(seconds: number): string {
+  const unit = (n: number, name: string) => `in ${n} ${name}${n === 1 ? "" : "s"}`;
+  if (!(seconds > 0) || seconds > 86_400) return "later";
+  if (seconds < 120) return unit(seconds, "second");
+  if (seconds < 120 * 60) return unit(Math.ceil(seconds / 60), "minute");
+  return unit(Math.ceil(seconds / 3600), "hour");
 }
 
 /** Call the server API and parse the JSON response, with readable errors. */
@@ -346,7 +358,16 @@ async function withRetries<T>(attempt: () => Promise<T>, tries = 4): Promise<T> 
       const transient = status === 0 || status >= 500 || status === 429;
       if (!transient || i >= tries) throw err;
       const retryAfter = err instanceof ApiError ? err.retryAfter : undefined;
-      if (retryAfter !== undefined && retryAfter > MAX_RETRY_AFTER_S) throw err;
+      if (retryAfter !== undefined && retryAfter > MAX_RETRY_AFTER_S) {
+        // Say when to try again (a 429's message already does).
+        if (!(err instanceof ApiError) || status === 429) throw err;
+        throw new ApiError(
+          `${err.message.replace(/\.$/, "")}. Try again ${waitText(retryAfter)}.`,
+          status,
+          err.forLogin,
+          retryAfter,
+        );
+      }
       await sleep(retryAfter !== undefined ? retryAfter * 1000 : 1000 * 2 ** (i - 1));
     }
   }
