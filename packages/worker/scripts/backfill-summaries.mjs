@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // One-time migration of a bucket written by yeet < 0.2 (or rclone): gives
 // every upload sidecar without a summary its summary custom metadata in one
-// go. The Worker's daily cron does the same, but at most 21 per day; until a
-// sidecar has its summary, `yeet list` spends a read on it (and shows only
-// 39 of a bucket full of them). Logic and safety rules: src/backfill.ts.
+// go. The Worker's hourly cron does the same, but at most 10 per run; until a
+// sidecar has its summary, the listing spends a read on it (and shows only
+// 10 per page of a bucket full of them). Logic and safety rules: src/backfill.ts.
 //
 //   node scripts/backfill-summaries.mjs --remote --bucket yeet            # dry run
 //   node scripts/backfill-summaries.mjs --remote --bucket yeet --apply    # write
@@ -75,7 +75,7 @@ try {
     outfile: modulePath,
     logLevel: "error",
   });
-  const { backfillSummaries } = await import(pathToFileURL(modulePath).href);
+  const { backfillAdvice, backfillSummaries } = await import(pathToFileURL(modulePath).href);
 
   const configPath = join(tmp, "wrangler.json");
   await writeFile(
@@ -103,9 +103,8 @@ try {
   });
   const { ids: _, ...counts } = report;
   process.stdout.write(`${JSON.stringify({ apply: args.apply, ...counts })}\n`);
-  if (!args.apply && report.missing > 0) {
-    process.stderr.write(`Run again with --apply to write ${report.missing} summaries.\n`);
-  }
+  const advice = backfillAdvice(report, args.apply);
+  if (advice) process.stderr.write(`${advice}\n`);
 } finally {
   await proxy?.dispose();
   await rm(tmp, { recursive: true, force: true });

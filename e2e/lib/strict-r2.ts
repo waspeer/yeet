@@ -1,9 +1,11 @@
 // A second in-memory R2 bucket, written independently of fake-r2.ts by the
 // verifier of round 1F, and stricter: UTF-8 byte order everywhere (startAfter
 // and cursor comparisons included), opaque cursors, metadata lists capped at
-// 100 and optionally random shorter pages (even empty ones with
-// `truncated: true`), every call type counted and logged, throws past
-// `maxCalls`. Hooks let a test change the bucket during a run. The random
+// 100 (`metadataCap`; real R2 returned about 415 in the phase 1H
+// measurement, `REAL_R2_CAPS`) and optionally random shorter pages (even
+// empty ones with `truncated: true`), a list's `limit` honoured as a further
+// cap, every call type counted and logged, the objects lists return counted
+// (`listed`, `maxListed`), throws past `maxCalls`. Hooks let a test change the bucket during a run. The random
 // page lengths come from a seeded generator, so a failure reproduces.
 import { randomBytes } from "node:crypto";
 import type { Bucket } from "../../packages/worker/src/uploads.js";
@@ -32,7 +34,15 @@ export class StrictBucket implements Bucket {
   objects = new Map<string, Obj>();
   calls: Record<string, number> = {};
   log: string[] = [];
+  /** Objects returned by list calls since reset(): what the code examined. */
+  listed = 0;
+  /** The most objects one list call returned since reset(). */
+  maxListed = 0;
   maxCalls = 50;
+  /** Objects per list call with metadata (default 100, miniflare's cap). */
+  metadataCap = 100;
+  /** Objects per list call without metadata (default 1,000, R2's documented maximum). */
+  plainCap = 1000;
   private cursors = new Map<string, string>();
   private n = 0;
   /** Random page length 0..cap for metadata lists. */
@@ -42,9 +52,19 @@ export class StrictBucket implements Bucket {
   /** Called after get returns and before the conditional put lands. */
   beforePut?: (key: string) => void;
   private readonly random: () => number;
-  constructor(opts: { randomPages?: boolean; maxCalls?: number; seed?: number } = {}) {
+  constructor(
+    opts: {
+      randomPages?: boolean;
+      maxCalls?: number;
+      seed?: number;
+      metadataCap?: number;
+      plainCap?: number;
+    } = {},
+  ) {
     this.randomPages = !!opts.randomPages;
     if (opts.maxCalls !== undefined) this.maxCalls = opts.maxCalls;
+    if (opts.metadataCap !== undefined) this.metadataCap = opts.metadataCap;
+    if (opts.plainCap !== undefined) this.plainCap = opts.plainCap;
     this.random = seededRandom(opts.seed ?? 1);
   }
   get total() {
@@ -53,6 +73,8 @@ export class StrictBucket implements Bucket {
   reset() {
     this.calls = {};
     this.log = [];
+    this.listed = 0;
+    this.maxListed = 0;
   }
   private cache: string[] | null = null;
   seed(key: string, body = "", meta: Record<string, string> = {}) {
@@ -127,10 +149,20 @@ export class StrictBucket implements Bucket {
     this.seed(key, value, options.customMetadata ?? {});
     return {};
   }
-  async list(options: { prefix?: string; cursor?: string; startAfter?: string; include?: string[] }) {
+  async list(options: {
+    prefix?: string;
+    cursor?: string;
+    startAfter?: string;
+    include?: string[];
+    limit?: number;
+  }) {
     await this.call("list", JSON.stringify(options));
     this.onList?.();
-    const cap = options.include?.length ? 100 : 1000;
+    const { limit: asked } = options;
+    if (asked !== undefined && !(Number.isInteger(asked) && asked >= 1 && asked <= 1000)) {
+      throw new Error(`list limit must be 1 to 1,000, got ${asked}`);
+    }
+    const cap = Math.min(options.include?.length ? this.metadataCap : this.plainCap, asked ?? 1000);
     const limit = this.randomPages ? Math.floor(this.random() * (cap + 1)) : cap;
     let after = options.startAfter;
     if (options.cursor !== undefined) {
@@ -139,6 +171,8 @@ export class StrictBucket implements Bucket {
       if (after === undefined || cmp(c, after) > 0) after = c;
     }
     const { page, more } = this.range(options.prefix ?? "", after, limit);
+    this.listed += page.length;
+    this.maxListed = Math.max(this.maxListed, page.length);
     const truncated = more;
     let cursor: string | undefined;
     if (truncated) {
@@ -172,5 +206,12 @@ export class StrictBucket implements Bucket {
     };
   }
 }
+
+/**
+ * Objects per list call real R2 returned in the phase 1H measurement (a
+ * Workers Free deploy, `list()` with `limit: 1000`): about 415 with
+ * `include: ["customMetadata"]`, about 848 without.
+ */
+export const REAL_R2_CAPS = { metadataCap: 415, plainCap: 848 } as const;
 
 export { cmp as byteCompare };

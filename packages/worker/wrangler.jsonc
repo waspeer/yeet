@@ -13,8 +13,9 @@
   // object per client key). SQLite-backed, the only kind the free plan offers.
   "durable_objects": { "bindings": [{ "name": "RATE_LIMITER", "class_name": "RateLimiter" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["RateLimiter"] }],
-  // Daily cleanup of expired and abandoned uploads.
-  "triggers": { "crons": ["0 3 * * *"] },
+  // Hourly cleanup of expired and abandoned uploads: each run does a small,
+  // bounded slice of the bucket (see src/cleanup.ts).
+  "triggers": { "crons": ["0 * * * *"] },
   // Share links live on <name>.<account>.workers.dev unless a custom domain is
   // added; per-version preview URLs would serve every version on its own host.
   "workers_dev": true,

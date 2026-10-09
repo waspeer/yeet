@@ -59,9 +59,30 @@ test.describe("backfilling summaries (in memory)", () => {
     const report = await backfillSummaries(bucket, PREFIX, { apply: false });
     expect(report).toMatchObject({ sidecars: 300, missing: 150, written: 0, changed: 0 });
     expect(report.ids).toHaveLength(150);
+    // It reads each sidecar without a summary (to classify it), and writes nothing.
     expect(bucket.calls["put"] ?? 0).toBe(0);
-    expect(bucket.calls["get"] ?? 0).toBe(0);
+    expect(bucket.calls["get"] ?? 0).toBe(150);
     expect(snapshot(bucket)).toBe(before);
+  });
+
+  test("a dry run classifies like --apply: unreadable and too large are not counted as writable", async () => {
+    // Regression (round 1I): the dry run reported unreadable 0 and tooLarge 0
+    // and offered to write every missing summary, also those that --apply
+    // can never write.
+    const bucket = new FakeBucket({ maxCalls: Infinity });
+    bucket.seed(`${PREFIX}/ok/.meta.json`, JSON.stringify(metaOf(1)));
+    bucket.seed(`${PREFIX}/bad/.meta.json`, "not JSON");
+    bucket.seed(`${PREFIX}/odd/.meta.json`, JSON.stringify({ ...metaOf(2), downloads: 5 }));
+    bucket.seed(`${PREFIX}/big/.meta.json`, JSON.stringify(metaOf(3, { filename: "é".repeat(2000) })));
+    const before = snapshot(bucket);
+    const dry = await backfillSummaries(bucket, PREFIX, { apply: false });
+    expect(snapshot(bucket)).toBe(before);
+    const apply = await backfillSummaries(bucket, PREFIX, { apply: true });
+    const counts = (report: typeof dry) =>
+      Object.fromEntries(Object.entries(report).filter(([key]) => key !== "ids" && key !== "written"));
+    expect(counts(dry)).toEqual(counts(apply));
+    expect(dry).toMatchObject({ missing: 4, unreadable: 2, tooLarge: 1, writable: 1, written: 0 });
+    expect(apply).toMatchObject({ missing: 4, unreadable: 2, tooLarge: 1, writable: 1, written: 1 });
   });
 
   test("--apply: every sidecar gets its summary, nothing else changes; a second run does nothing", async () => {
@@ -176,6 +197,11 @@ test("the migration script on a local wrangler dev bucket: dry run, apply, idemp
       customMetadata: { summary: JSON.stringify(summarize(current)) },
       baseURL: srv.baseURL,
     });
+    // One that can never get a summary: not counted as one to write.
+    await putObject(`${prefix}/bad001/.meta.json`, "not JSON", {
+      contentType: "application/json",
+      baseURL: srv.baseURL,
+    });
   } finally {
     await srv.stop(); // the script must not share the bucket files with a running server
   }
@@ -185,16 +211,19 @@ test("the migration script on a local wrangler dev bucket: dry run, apply, idemp
 
   const dry = await runScript(target);
   expect(dry.code, dry.stderr).toBe(0);
-  expect(counts(dry)).toEqual({ apply: false, sidecars: 4, missing: 3, written: 0, changed: 0, unreadable: 0, tooLarge: 0 });
+  expect(counts(dry)).toEqual({ apply: false, sidecars: 5, missing: 4, writable: 3, written: 0, changed: 0, unreadable: 1, tooLarge: 0 });
+  expect(dry.stderr).toContain("Run again with --apply to write 3 summaries.");
+  expect(dry.stderr).toContain("1 sidecar cannot get a summary");
 
   // The dry run wrote nothing: --apply still finds all three.
   const apply = await runScript([...target, "--apply"]);
   expect(apply.code, apply.stderr).toBe(0);
-  expect(counts(apply)).toEqual({ apply: true, sidecars: 4, missing: 3, written: 3, changed: 0, unreadable: 0, tooLarge: 0 });
+  expect(counts(apply)).toEqual({ apply: true, sidecars: 5, missing: 4, writable: 3, written: 3, changed: 0, unreadable: 1, tooLarge: 0 });
 
   const again = await runScript([...target, "--apply"]);
   expect(again.code, again.stderr).toBe(0);
-  expect(counts(again)).toMatchObject({ missing: 0, written: 0 });
+  expect(counts(again)).toMatchObject({ missing: 1, unreadable: 1, writable: 0, written: 0 });
+  expect(again.stderr).not.toContain("Run again with --apply");
 
   // Refuses to run without an explicit target.
   const bare = await runScript(["--bucket", server.bucketName]);

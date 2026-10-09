@@ -143,10 +143,10 @@ test.describe("yeet upload, list and delete", () => {
     expect(after.stdout).not.toContain(url);
   });
 
-  // A bucket too large to list within the server's R2 call budget gives
-  // `truncated: true`. The test server's bucket never gets that large, so a
-  // stand-in server answers instead.
-  test("yeet list says so when the server could list only part of the bucket", async () => {
+  // A server from before paginated listing (round 1I) answers one page with
+  // `truncated: true` and no cursor when the bucket holds more. A stand-in
+  // server answers instead.
+  test("yeet list says so when an older server could list only part of the bucket", async () => {
     const upload = {
       id: "abc123",
       filename: "one.bin",
@@ -180,6 +180,120 @@ test.describe("yeet upload, list and delete", () => {
         await new Promise((resolve) => fake.close(resolve));
       }
     }
+  });
+
+  test("yeet list: every page, in order, retrying a failed page, a cap on pages", async () => {
+    test.setTimeout(120_000);
+    const uploadOf = (n: number) => ({
+      id: `id${String(n).padStart(4, "0")}`,
+      filename: `f${n}.bin`,
+      file_size: 10,
+      // Pages in ID order hold uploads of any age: the newest is on page 3.
+      uploaded_at: new Date(Date.UTC(2026, 0, 1) + ((n * 37) % 90) * 60_000).toISOString(),
+      expires_at: new Date(Date.now() + 86_400_000).toISOString(),
+      has_password: false,
+      download_count: 0,
+      recent_downloads: [],
+      url: `http://127.0.0.1/id${n}/f${n}.bin`,
+    });
+    const pages = [0, 1, 2].map((p) => Array.from({ length: 30 }, (_, i) => uploadOf(p * 30 + i)));
+    const cursors = ["c-one", "c-two"];
+
+    /** A stand-in server: `handler` answers each request (attempt counts per cursor). */
+    async function withServer(
+      handler: (cursor: string | null, attempt: number) => { status: number; body: unknown },
+      run: (env: Record<string, string>, requests: (string | null)[]) => Promise<void>,
+    ) {
+      const requests: (string | null)[] = [];
+      const fake = createServer((req, res) => {
+        const cursor = new URL(req.url!, "http://x").searchParams.get("cursor");
+        requests.push(cursor);
+        const { status, body } = handler(cursor, requests.filter((c) => c === cursor).length);
+        res.writeHead(status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(body));
+      });
+      await new Promise<void>((resolve) => fake.listen(0, "127.0.0.1", resolve));
+      try {
+        const { port } = fake.address() as AddressInfo;
+        await run(
+          { YEET_URL: `http://127.0.0.1:${port}`, YEET_TOKEN: "a-token-of-16-chars-or-more" },
+          requests,
+        );
+      } finally {
+        await new Promise((resolve) => fake.close(resolve));
+      }
+    }
+    const pageOf = (cursor: string | null) => {
+      const p = cursor === null ? 0 : cursors.indexOf(cursor) + 1;
+      const next = cursors[p] ?? null;
+      return { uploads: pages[p], cursor: next, ...(next ? { truncated: true } : {}) };
+    };
+    const names = (stdout: string) => [...stdout.matchAll(/^ {2}(f\d+\.bin) ·/gm)].map((m) => m[1]);
+    const newestFirst = pages
+      .flat()
+      .sort((a, b) => b.uploaded_at.localeCompare(a.uploaded_at))
+      .map((u) => u.filename);
+
+    // Every page, then all uploads newest first; page 2 fails once (503, as
+    // Cloudflare answers a request over its CPU limit) and is retried.
+    await withServer(
+      (cursor, attempt) =>
+        cursor === "c-one" && attempt === 1
+          ? { status: 503, body: { error: "exceeded" } }
+          : { status: 200, body: pageOf(cursor) },
+      async (env, requests) => {
+        const list = await cli(["list"], { env });
+        expectExitCode(list, 0);
+        expect(requests).toEqual([null, "c-one", "c-one", "c-two"]);
+        expect(names(list.stdout)).toEqual(newestFirst);
+        expect(list.stdout).toContain("90 files (90 active, 0 expired)");
+        expect(list.stdout).not.toContain("only part of your uploads");
+      },
+    );
+
+    // Page 3 keeps failing (429, then 503): after its retries, the uploads of
+    // pages 1 and 2 with a note, and exit code 1.
+    await withServer(
+      (cursor, attempt) =>
+        cursor === "c-two"
+          ? { status: attempt % 2 ? 429 : 503, body: { error: "busy" } }
+          : { status: 200, body: pageOf(cursor) },
+      async (env, requests) => {
+        const list = await cli(["list"], { env });
+        expectExitCode(list, 1);
+        expect(requests.filter((c) => c === "c-two")).toHaveLength(4);
+        expect(names(list.stdout)).toHaveLength(60);
+        expect(list.stdout).toContain("60 files");
+        expect(list.stdout).toContain("only part of your uploads is shown");
+        expect(list.stdout).toContain("Could not fetch every page");
+      },
+    );
+
+    // The first page failing is an error, as before.
+    await withServer(
+      () => ({ status: 500, body: { error: "Internal server error" } }),
+      async (env, requests) => {
+        const list = await cli(["list"], { env });
+        expectExitCode(list, 1);
+        expect(requests).toHaveLength(4);
+        expect(list.stderr).toContain("Internal server error");
+      },
+    );
+
+    // A server that never stops saying there is more: at most 1,000 pages.
+    await withServer(
+      (cursor) => ({
+        status: 200,
+        body: { uploads: cursor ? [] : [uploadOf(0)], cursor: "again", truncated: true },
+      }),
+      async (env, requests) => {
+        const list = await cli(["list"], { env });
+        expectExitCode(list, 1);
+        expect(requests).toHaveLength(1000);
+        expect(list.stdout).toContain("1 files");
+        expect(list.stdout).toContain("Stopped after 1000 pages");
+      },
+    );
   });
 
   test(

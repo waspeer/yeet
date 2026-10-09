@@ -58,6 +58,8 @@ export interface Bucket {
     cursor?: string;
     startAfter?: string;
     include?: ("httpMetadata" | "customMetadata")[];
+    /** At most this many objects (R2: 1 to 1,000, and it may return fewer). */
+    limit?: number;
   }): Promise<{
     objects: { key: string; customMetadata?: Record<string, string> }[];
     truncated: boolean;
@@ -74,18 +76,47 @@ export interface Bucket {
 export const RECORD_ATTEMPTS = 3;
 
 /**
- * R2 calls one listing may make, sidecar reads of old uploads included. The
- * free plan allows 50 subrequests per request; GET /api/uploads also makes a
- * rate-limit call. See listAll().
+ * listAll()'s default limit of R2 calls, sidecar reads of old uploads
+ * included, for callers that set none. GET /api/uploads (listPage()) and the
+ * cron set much tighter bounds of their own: what limits them is CPU, not
+ * R2 calls (see "Listing a page" in docs/design/api.md).
  */
 export const LIST_BUDGET = 40;
 
 /**
+ * Objects one page of GET /api/uploads lists: the `limit` of its list call
+ * (with custom metadata). About 150 finished uploads (2 objects each). Real
+ * R2 returns up to about 415 objects per such call (measured in phase 1H),
+ * so this is the bound, not R2. Chosen from the phase 1H measurement of
+ * 27 to 47 µs CPU per upload listed: 150 uploads ≈ 4 to 7 ms, which leaves
+ * room for the rest of the request within the Free plan's 10 ms. An
+ * estimate until measured on a real deploy.
+ */
+export const PAGE_LIMIT = 300;
+
+/**
+ * Sidecars without a summary (yeet < 0.2) one page reads, one get each. A
+ * page of nothing but such sidecars shows this many uploads.
+ */
+export const PAGE_READS = 10;
+
+/**
+ * Extra list calls one page may make, only to jump over the rest of a
+ * `.downloads/` or `.parts/` run its list call ended in (see listAll()). So
+ * a page makes at most 2 list calls and examines at most 2 × PAGE_LIMIT
+ * objects; without such runs (anything yeet 0.2 and later writes for a
+ * finished upload), 1 call and PAGE_LIMIT objects.
+ */
+export const PAGE_JUMPS = 1;
+
+/**
  * R2 calls `POST /api/uploads/:id/complete` of an upload of unknown size may
- * spend on its part records (readPartSizes() and their deletion): the Free
- * plan's 50 subrequests minus its 4 other ones (the Bearer rate-limit call,
- * the sidecar read, the multipart complete and the sidecar write). With 100
- * records per list call that is 4,100 parts.
+ * spend on its part records (readPartSizes() and their deletion): the 50
+ * subrequests the Free plan was assumed to allow, minus its 4 other ones
+ * (the Bearer rate-limit call, the sidecar read, the multipart complete and
+ * the sidecar write). With 100 records per list call that is 4,100 parts.
+ * The real limit is 1,000 R2 calls (phase 1H); this stays as a bound on the
+ * work, whose CPU is not measured (see docs/design/api.md).
  */
 export const PART_RECORDS_BUDGET = 50 - 4;
 
@@ -354,8 +385,8 @@ export class Uploads {
   /**
    * Write the metadata sidecar. A summary also goes into the object's custom
    * metadata, so a listing reads every upload's summary from its list pages
-   * instead of one read per upload — the free plan allows only 50 calls per
-   * request.
+   * instead of one read per upload, which would cost a round trip and CPU
+   * each.
    */
   async writeMeta(
     id: string,
@@ -458,11 +489,11 @@ export class Uploads {
    * Finished and pending uploads with their summaries, in key order, in at
    * most `budget` R2 calls (default LIST_BUDGET) whatever the bucket holds.
    *
-   * One list call returns up to 100 objects with their custom metadata
-   * (miniflare's cap; Cloudflare documents that a list including metadata
-   * may return fewer than asked). A finished upload is 2 objects (file and
-   * sidecar) whose summary comes from the sidecar's custom metadata, so a
-   * call covers about 50 uploads. A sidecar of yeet < 0.2 has no summary and
+   * One list call returns at most `limit` objects with their custom
+   * metadata, and R2 may return fewer (miniflare at most 100; real R2 about
+   * 415, measured in phase 1H, whatever the limit above that). A finished
+   * upload is 2 objects (file and sidecar) whose summary comes from the
+   * sidecar's custom metadata. A sidecar of yeet < 0.2 has no summary and
    * costs one read, counted in the budget. With `deferReads: n` such
    * sidecars are left unread (`meta` null, `unsummarized`) for the caller,
    * which reserves n calls of the budget for each; `maxListCalls` caps the
@@ -471,7 +502,9 @@ export class Uploads {
    * `.downloads/` (legacy) and `.parts/` keys can be many per upload. When a
    * page ends inside such a run, the next call starts after it
    * (`startAfter`), so it costs at most one call per upload; the upload is
-   * then marked incomplete (its keys are not all listed).
+   * then marked incomplete (its keys are not all listed). `jumpCalls`
+   * allows that many such calls beyond `maxListCalls` (still within the
+   * budget), so that a listing of one call still gets past such a run.
    *
    * Stops when the budget is spent, and then returns the uploads listed so
    * far (never a partly listed last one) with `truncated: true` and the
@@ -479,10 +512,19 @@ export class Uploads {
    * the first upload it leaves out, so a resumed listing skips none.
    */
   async listAll(
-    opts: { budget?: number; after?: string; deferReads?: number; maxListCalls?: number } = {},
+    opts: {
+      budget?: number;
+      after?: string;
+      deferReads?: number;
+      maxListCalls?: number;
+      jumpCalls?: number;
+      limit?: number;
+    } = {},
   ): Promise<Listing> {
     const budget = opts.budget ?? LIST_BUDGET;
     const maxListCalls = opts.maxListCalls ?? budget;
+    const jumpCalls = opts.jumpCalls ?? 0;
+    const limit = opts.limit !== undefined ? { limit: opts.limit } : {};
     // What a sidecar without a summary costs: a read, here or by the caller.
     const readCost = opts.deferReads ?? 1;
     const base = `${this.prefix}/`;
@@ -501,20 +543,32 @@ export class Uploads {
     let lastKey = start; // the last key listed
     const readsNeeded = (list: Group[]) =>
       readCost * list.filter((g) => g.sidecar && !g.meta).length;
+    let jumps = 0; // calls made under jumpCalls
+    let jumping = false; // the next call jumps over the rest of a run
+    let endedInGroup = false; // the last key listed belongs to the last group
 
     for (;;) {
       // Room for this call, and for the reads of the uploads listed so far.
-      if (calls + 1 > maxListCalls || calls + 1 + readsNeeded(groups) > budget) {
+      const jump = jumping && jumps < jumpCalls;
+      if ((!jump && calls - jumps + 1 > maxListCalls) || calls + 1 + readsNeeded(groups) > budget) {
         truncated = true;
         break;
       }
-      const page = await this.bucket.list({ prefix: base, ...next, include: ["customMetadata"] });
+      if (jump) jumps++;
+      const page = await this.bucket.list({
+        prefix: base,
+        ...next,
+        include: ["customMetadata"],
+        ...limit,
+      });
       calls++;
       for (const object of page.objects) {
         const previousKey = lastKey;
         lastKey = object.key;
         const [id, ...rest] = object.key.slice(base.length).split("/");
+        endedInGroup = false;
         if (!id || !isValidId(id) || rest.length === 0) continue;
+        endedInGroup = true;
         let group = groups.at(-1);
         if (group?.id !== id) {
           group = {
@@ -549,7 +603,8 @@ export class Uploads {
       const last = page.objects.at(-1)?.key ?? "";
       const [lastId, ...lastRest] = last.slice(base.length).split("/");
       const bulk = BULK_DIRS.find((dir) => lastRest.join("/").startsWith(dir));
-      if (bulk && lastId && isValidId(lastId)) {
+      jumping = !!bulk && !!lastId && isValidId(lastId);
+      if (jumping) {
         groups.at(-1)!.complete = false;
         next = { startAfter: `${base}${lastId}/${bulk}~` };
       } else {
@@ -558,9 +613,11 @@ export class Uploads {
     }
 
     // Keys of one upload are contiguous, so every upload but the last is
-    // listed completely; the last only if the listing reached the end.
-    if (truncated && groups.length > 0) groups.at(-1)!.complete = false;
-    const candidates = truncated ? groups.slice(0, -1) : groups;
+    // listed completely; the last only if the listing reached the end, or
+    // listed a key after it (one that belongs to no upload).
+    const lastPartial = truncated && endedInGroup;
+    if (lastPartial && groups.length > 0) groups.at(-1)!.complete = false;
+    const candidates = lastPartial ? groups.slice(0, -1) : groups;
     // The reads of old sidecars, as far as the budget goes.
     let reads = 0;
     const kept: Group[] = [];
@@ -581,7 +638,12 @@ export class Uploads {
     if (truncated) {
       const firstLeft = groups[kept.length];
       resumeAfter = firstLeft ? firstLeft.before : lastKey;
-      if (firstLeft && resumeAfter === start) {
+      // (Only if more than 2 of its keys were listed: a yeet upload has at
+      // most 2 outside its `.downloads/` and `.parts/` runs, the sidecar
+      // and the file. With 2 or fewer, R2 merely returned short pages, as
+      // it may (even empty ones); then nothing is returned and the next
+      // listing starts where this one did.)
+      if (firstLeft && resumeAfter === start && firstLeft.keys.length > 2) {
         // Nothing before it was listed: the budget does not stretch to this
         // one upload (more keys than it lists, not a yeet upload). Return it
         // unread, and incomplete if partly listed, so that the next listing
@@ -617,6 +679,49 @@ export class Uploads {
   }
 
   /**
+   * One page of GET /api/uploads: the finished uploads among the next
+   * objects after the key `after` (from the start of the bucket without
+   * one), newest first, and the key the next page starts after, or null at
+   * the end of the bucket.
+   *
+   * Bounded per request whatever the bucket holds (CPU, not R2 calls, is
+   * what limits a request on the Free plan): one list call of at most
+   * PAGE_LIMIT objects, at most PAGE_JUMPS more to jump over the rest of a
+   * `.downloads/` or `.parts/` run, and reads of sidecars without a summary,
+   * 1 + PAGE_READS R2 calls in all. listAll() keeps its guarantees per
+   * page: no partly listed upload (but the one a stalled listing must get
+   * past), the next page starts right before the first upload this one
+   * left out, and an unreadable or malformed sidecar is left out, never an
+   * error.
+   */
+  async listPage(
+    after?: string,
+  ): Promise<{ uploads: (UploadSummary & { id: string })[]; next: string | null }> {
+    const listing = await this.listAll({
+      // A jump takes the place of a read: at most 1 + PAGE_READS R2 calls.
+      budget: 1 + PAGE_READS,
+      maxListCalls: 1,
+      jumpCalls: PAGE_JUMPS,
+      limit: PAGE_LIMIT,
+      ...(after !== undefined ? { after } : {}),
+    });
+    const uploads = listing.uploads
+      // Finished uploads only; their summaries carry no pending_upload_id.
+      .flatMap(({ id, meta }) => (meta && !meta.pending_upload_id ? [{ id, ...meta }] : []))
+      .sort((a, b) => b.uploaded_at.localeCompare(a.uploaded_at));
+    // An empty page that R2 says is not the last (it may return fewer
+    // objects than asked, none included) gives no key to resume after:
+    // the next page starts where this one did.
+    const next = listing.truncated ? (listing.resumeAfter ?? after ?? this.listPrefix) : null;
+    return { uploads, next };
+  }
+
+  /** The prefix every key of the uploads starts with, `<prefix>/`. */
+  get listPrefix(): string {
+    return `${this.prefix}/`;
+  }
+
+  /**
    * Give a sidecar written without one (yeet < 0.2, rclone) its summary
    * custom metadata, so listings read it from their pages instead of one
    * read each. Conditional on the sidecar being unchanged since read, so it
@@ -645,17 +750,24 @@ export class Uploads {
 
   /**
    * Delete every object under `prefix` (an upload's directory, or a
-   * directory in it) in at most `maxCalls` R2 calls: a list (up to 1,000
-   * keys without metadata) and a delete per round, and the upload's sidecar
-   * in a call of its own once everything else is gone. Returns the calls
-   * made and whether nothing is left.
+   * directory in it) in at most `maxCalls` R2 calls and `maxLists` list
+   * calls: a list (up to `limit` keys without metadata, default 1,000) and
+   * a delete per round, and the upload's sidecar in a call of its own once
+   * everything else is gone.
+   * Returns the calls made and whether nothing is left.
    *
    * The sidecar goes last because it is what makes the listing (and so the
    * cron) see an upload: if the calls run out half-way, what is left is
    * still an upload that the next run finds and deletes, not keys without a
    * sidecar that nothing would ever clean up.
    */
-  async deleteUnder(prefix: string, maxCalls: number): Promise<{ calls: number; done: boolean }> {
+  async deleteUnder(
+    prefix: string,
+    maxCalls: number,
+    opts: { limit?: number; maxLists?: number } = {},
+  ): Promise<{ calls: number; done: boolean }> {
+    const maxLists = opts.maxLists ?? Infinity;
+    let lists = 0;
     if (!prefix.startsWith(`${this.prefix}/`) || !prefix.endsWith("/")) {
       throw new Error(`Unsafe prefix: ${JSON.stringify(prefix)}`);
     }
@@ -664,9 +776,14 @@ export class Uploads {
     const sidecars = new Set<string>();
     // Set after a page that held nothing but sidecars (see below).
     let startAfter: string | undefined;
-    while (calls + 2 <= maxCalls) {
-      const page = await this.bucket.list({ prefix, ...(startAfter ? { startAfter } : {}) });
+    while (calls + 2 <= maxCalls && lists < maxLists) {
+      const page = await this.bucket.list({
+        prefix,
+        ...(startAfter ? { startAfter } : {}),
+        ...(opts.limit !== undefined ? { limit: opts.limit } : {}),
+      });
       calls++;
+      lists++;
       startAfter = undefined;
       const keys = page.objects.map((object) => object.key);
       const others = keys.filter((key) => !this.isSidecarKey(key));

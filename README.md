@@ -112,10 +112,10 @@ must be managed by Cloudflare. Then run `yeet login https://dl.example.com`.
 
 ## How it works
 
-| Part                           | What it does                                                                                                                                                     |
-| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **CLI** (`packages/cli`)       | Sends the file to your Worker in parts and prints the share link. No dependencies.                                                                               |
-| **Worker** (`packages/worker`) | Stores files in R2, serves the download page, checks passwords, and streams the file with support for resuming. A daily job (03:00 UTC) deletes expired uploads. |
+| Part                           | What it does                                                                                                                                           |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **CLI** (`packages/cli`)       | Sends the file to your Worker in parts and prints the share link. No dependencies.                                                                     |
+| **Worker** (`packages/worker`) | Stores files in R2, serves the download page, checks passwords, and streams the file with support for resuming. An hourly job deletes expired uploads. |
 
 Files live in the bucket as `uploads/<id>/<filename>`, next to a small
 `uploads/<id>/.meta.json` with the name, size, expiry and password hash.
@@ -124,17 +124,25 @@ times). Downloads one after another are counted exactly; when many people
 download the same file at the same moment, a few may be missed, never
 counted twice.
 
-`yeet list` shows about 2,000 uploads at most: the Worker may make only 50
-storage calls per request on the free plan. With more, it says that only
-part of them is shown: the uploads whose IDs come first in the bucket
-(sorted newest first, as always). IDs are random, so these are not your
-newest uploads. The daily cleanup works through a bucket of any size, about
-1,200 uploads per day.
+On the free plan a Worker gets 10 ms of CPU per request, and listing costs
+CPU for every upload listed (measured: about 20 to 40 ms per 1,000). So
+the server lists your uploads in pages of about 150, one small request
+each, and `yeet list` fetches every page and shows them all, newest first.
+A page that fails (Cloudflare answers 503 when a Worker uses too much CPU)
+is retried a few times; if it keeps failing, `yeet list` shows what it has
+and says so. An older yeet CLI shows only the first page, with a note
+that only part of your uploads is shown.
 
-Uploads made with a yeet older than 0.2 cost `yeet list` a storage call
-each until the daily cleanup has updated them, 21 per day; a bucket of
-nothing but those shows 39 at first. To update them all at once, see
-"Migrating a bucket of yeet < 0.2" in [docs/design/api.md](docs/design/api.md).
+The cleanup runs every hour and goes through about 100 uploads per run,
+so a bucket of 5,000 uploads is gone through in about two days. Expired
+files can no longer be downloaded the moment they expire; the cleanup only
+frees their storage.
+
+Uploads made with a yeet older than 0.2 cost the listing a storage call
+each (pages of them hold 10) until the cleanup has updated them, 10 per
+run. To update them all at once, see "Migrating a bucket of yeet < 0.2" in
+[docs/design/api.md](docs/design/api.md). These figures are estimates
+until measured on a real deploy; see "Measurements (phase 1H)" there.
 
 ## Security notes
 
@@ -152,8 +160,9 @@ nothing but those shows 39 at first. To update them all at once, see
   sharing one address share one budget.
 - After a correct password, the browser gets a cookie for that file for up to
   24 hours, so it is not asked again.
-- Passwords are hashed with PBKDF2-SHA256 (20,000 iterations), which fits the
-  free plan's CPU budget. The hash is stored in your private bucket.
+- Passwords are hashed with PBKDF2-SHA256 (20,000 iterations): a check costs
+  8 ms CPU median, 13 ms at p90 (measured on the free plan). The hash is
+  stored in your private bucket.
 - After the password check, the browser gets a signed download link that works
   without the password until it expires (at most `DOWNLOAD_URL_TTL`).
 - Anyone with the share link can see the file name and size, even for

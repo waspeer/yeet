@@ -373,10 +373,16 @@ test.describe("1H verifier: malformed sidecars", () => {
     const l = await u.listAll();
     for (const x of l.uploads) if (x.id !== "zz") expect(x.meta, x.id).toBeNull();
     for (const id of Object.keys(bad)) expect(await u.recordDownload(id, iso(NOW)), id).toBe(false);
-    b.reset();
-    b.maxCalls = CLEANUP_BUDGET;
-    const r = await runCleanup(b, P, NOW);
-    expect(r.deleted).toBe(1);
+    // Round 1I: a run tries at most CLEANUP_SUMMARIES (10) sidecars without
+    // a summary, so the malformed ones before zz take two runs.
+    let deleted = 0;
+    for (let run = 0; run < 2; run++) {
+      b.reset();
+      b.maxCalls = CLEANUP_BUDGET;
+      deleted += (await runCleanup(b, P, NOW)).deleted;
+    }
+    expect(deleted).toBe(1);
+    expect(b.sorted(`${P}/zz/`)).toEqual([]);
     for (const id of Object.keys(bad)) expect(b.sorted(`${P}/${id}/`), id).toHaveLength(2);
   });
 });

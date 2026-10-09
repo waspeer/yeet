@@ -149,9 +149,28 @@ export interface ListedUpload {
   url: string;
 }
 
-/** Every finished upload, as `GET /api/uploads` returns it. */
-export async function listUploads(): Promise<ListedUpload[]> {
-  return (await apiJson<{ uploads: ListedUpload[] }>("/api/uploads")).uploads;
+/** One page of `GET /api/uploads`, as the server returns it. */
+export interface UploadsPage {
+  uploads: ListedUpload[];
+  cursor: string | null;
+  truncated?: true;
+}
+
+/**
+ * Every finished upload, as `GET /api/uploads` returns them: all pages,
+ * following `cursor` (at most `maxPages`, then it throws).
+ */
+export async function listUploads({ maxPages = 1000 } = {}): Promise<ListedUpload[]> {
+  const all: ListedUpload[] = [];
+  let cursor: string | null = null;
+  for (let page = 0; page < maxPages; page++) {
+    const query: string = cursor === null ? "" : `?cursor=${encodeURIComponent(cursor)}`;
+    const body: UploadsPage = await apiJson<UploadsPage>(`/api/uploads${query}`);
+    all.push(...body.uploads);
+    if (body.cursor === null) return all;
+    cursor = body.cursor;
+  }
+  throw new Error(`GET /api/uploads: still more after ${maxPages} pages`);
 }
 
 /**

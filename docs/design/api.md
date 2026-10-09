@@ -7,10 +7,22 @@ recorded here first. Behaviour not mentioned stays as in
 
 ## Hard constraints
 
-- **CPU:** every request stays within **10 ms CPU** on Workers Free with
-  `SENTRY_DSN` unset. This is measured on a real deploy, not with
-  `wrangler dev`, which does not enforce limits.
-- **Subrequests:** at most 50 per request, R2 calls included.
+- **CPU:** every request, and every cron run, stays within **10 ms CPU** on
+  Workers Free with `SENTRY_DSN` unset. This is measured on a real deploy,
+  not with `wrangler dev`, which does not enforce limits. **CPU is the
+  binding limit** (measured in phase 1H, see "Measurements" below): a
+  request's CPU grows with the objects it processes, roughly 20 to 40 ms
+  per 1,000 uploads listed, and Cloudflare answers `503` (`exceededCpu`)
+  once a Worker keeps exceeding it. So every request and cron run does a
+  **bounded amount of work per invocation**, whatever the bucket holds:
+  `GET /api/uploads` returns one page (see "Listing a page"), the cron
+  handles one slice of the bucket per run (see "Cleanup (cron)"). Those
+  bounds are asserted on the objects listed and the R2 calls made, as a
+  stand-in for CPU (`e2e/tests/node/r2-work-bounds.spec.ts`).
+- **R2 calls:** the limit is **1,000 R2 binding calls per invocation**
+  (measured; it was assumed to be 50 subrequests before). It no longer
+  shapes the design; the R2 call budgets that remain (45 for a cron run,
+  46 for the part records of a `complete`) are a second guard.
 - **Request bodies:** at most 100 MB.
 - **The `UPLOAD_TOKEN` never reaches the browser.** It must not appear in HTML,
   in JS, in browser storage, in cookies (only values derived from it via HMAC
@@ -114,8 +126,13 @@ stays the same as today; the CLI and the tests depend on it.
     - with 50,000 iterations, a password check costs 13 ms CPU median and
       20 ms at p90, against 2 ms without a password;
     - Sentry loading lazily and the download pass did not change that path.
-  - **Expected:** at roughly 0.2–0.4 ms per 1,000 iterations, 20,000 brings
-    p90 to about 10 ms. To be confirmed by the next measurement.
+  - **Measured at 20,000** (phase 1H, Workers Free, `wrangler tail`, 60
+    correct and 40 wrong passwords on `POST /:id/download`): a correct
+    password costs **8 ms CPU median, 13 ms at p90** (max 17), a wrong one
+    7 ms median, 9 ms at p90 (max 22); none was refused for CPU.
+    **Decision: keep 20,000 iterations.** The p90 is above 10 ms, but
+    Workers Free tolerated it without an error; lowering the count further
+    would make a stolen bucket's hashes cheaper to brute-force again.
   - **Trade-off:** a stolen bucket's hashes are 2.5× cheaper to brute-force.
     Online guessing stays capped at 5 wrong passwords per minute per IP per
     upload, parallel requests included: each attempt is counted before its
@@ -178,9 +195,10 @@ set. Without it, requests do not pay any Sentry CPU cost.
 Download links (`/_dl/:id`, Range support), the bucket layout and the
 custom-metadata summary, and `DELETE /api/uploads/:id` (beyond the auth
 changes above). `GET /api/uploads` and the cleanup keep their behaviour, but
-within a fixed number of R2 calls; for a bucket too large for that,
-`GET /api/uploads` adds `"truncated": true` (see "Listing within a fixed
-number of R2 calls" below).
+each request and run does a bounded amount of work: `GET /api/uploads`
+answers one page per request with a `cursor` for the next (see "Listing a
+page" below), and the cleanup runs hourly over one slice of the bucket at
+a time (see "Cleanup (cron)").
 
 ## Implementation notes
 
@@ -290,11 +308,14 @@ Evaluated on the Free plan:
 - **Both credentials:** if an `Authorization` header is present, even empty,
   it alone decides. A wrong or empty one gets 401 (and counts) even with a
   valid session cookie.
-  - `wrangler dev` removes an empty `Authorization` header before the Worker
-    sees it (an empty header of another name arrives), so locally such a
-    request falls back to the session cookie. Whether Cloudflare's edge
-    passes it on is not verified; if it does, the rule above applies. The
-    decision is unit-tested in `e2e/tests/node/parsing.spec.ts`.
+  - An empty `Authorization` header never reaches the Worker: `wrangler
+    dev` removes it (an empty header of another name arrives), and so does
+    Cloudflare's edge (measured in phase 1H with a probe Worker that
+    reports the headers it gets). Such a request is therefore treated like
+    one without the header (session cookie, not counted). The Worker's own
+    rule (an empty header present decides and counts) stays, in case a
+    future edge passes it on; it is unit-tested in
+    `e2e/tests/node/parsing.spec.ts`.
 - **Login:** an empty or wrong token counts.
 - **Cross-origin refusals** (403) happen before any check and do not count.
 
@@ -366,9 +387,14 @@ Numbers that are signed or used as keys must be spelled one way only:
     Bearer rate-limit call, the sidecar read, the multipart complete, the
     sidecar write), reads the records with one list call per page
     (`readPartSizes()`, with metadata) and deletes them afterwards, one
-    call per 1,000. That must fit in the Free plan's 50: at 100 records per
-    list call, 4 + ceil(n / 100) + ceil(n / 1,000) ≤ 50, so at most
-    **4,100 parts** (exactly 50 subrequests). With more records it stops
+    call per 1,000. That was made to fit the 50 subrequests the Free plan
+    was assumed to allow: at 100 records per list call, 4 + ceil(n / 100)
+    + ceil(n / 1,000) ≤ 50, so at most **4,100 parts** (exactly 50
+    subrequests). The real limit is 1,000 R2 calls (phase 1H); the budget
+    stays, as a bound on the work. *Estimate, to be measured:* real R2
+    returns about 415 records per call, so the 46 calls would read up to
+    about 18,000 records, whose CPU is likely over 10 ms; the CLI and the
+    upload page never take this path (see below). With more records it stops
     listing as soon as they cannot fit (`PART_RECORDS_BUDGET`, 46 calls)
     and answers `400 {"error": "Too many parts to complete an upload of
     unknown size in one request; start the upload again with its size"}`
@@ -440,159 +466,295 @@ written back. On a failure it reads again after a random wait (up to
   assuming 1,000 objects per list call. With metadata a list call returns at
   most 100 (miniflare caps it; Cloudflare says such lists may return fewer
   than asked), so a few thousand records pushed `GET /api/uploads` and the
-  cron past 50 subrequests. The cap of 1,000 records per upload was also not
+  cron past the 50 subrequests then assumed (and every object listed costs
+  CPU, the real limit). The cap of 1,000 records per upload was also not
   atomic, and overlapping folds could count records twice. A Durable Object
   per upload would count exactly, but costs a DO request per download from
   the daily quota the rate limits rely on.
 
-### Listing within a fixed number of R2 calls
+### Measurements (phase 1H)
 
-`listAll()` lists `<prefix>/` with custom metadata, one page after the
-other, and stops at a budget: **40 R2 calls** for `GET /api/uploads` (plus
-its one rate-limit call: 41 subrequests); the cron's is below. Sidecars of
-yeet < 0.2 carry no summary and cost one read each, counted in the budget.
-`.downloads/` and `.parts/` runs are jumped over: a page that ends inside
-one is followed by a call with `startAfter: <prefix>/<id>/<run>/~`, so each
-costs at most one extra call, however many objects it holds.
+Measured on a real Workers Free deploy (a test account, Sentry off), with
+`wrangler tail` for CPU time and a probe Worker on the same bucket for R2
+itself. They replace the assumptions the earlier rounds were built on
+(at most 50 subrequests per request, 100 objects per list call).
 
-When the budget runs out, the listing returns the uploads it has, in ID
-order (never a partly listed last one), with `truncated: true`, and
-`GET /api/uploads` passes the flag on. `yeet list` then prints a note that
-only part of the uploads is shown.
+- **`GET /api/uploads`, one request listing everything** (the design before
+  round 1I, a budget of 40 R2 calls; n = 10 requests per bucket):
+  - 2,150 uploads with a summary and 60 without (995 listed, truncated):
+    43–71 ms CPU, median 48.
+  - 2,211 uploads, all with a summary (all listed): 67–103 ms CPU, median
+    82.
+  - 9,211 uploads (8,199 listed, truncated): 225–320 ms CPU for the first
+    7; the next 3 were refused by Cloudflare with `503` and outcome
+    `exceededCpu`. After the cron deleted 915 of them (8,296 left, n = 3):
+    234–318 ms.
 
-- **Which uploads a truncated listing shows:** the first part of the bucket
-  in key order, so the uploads with the lowest IDs (sorted newest first, as
-  always). IDs are random, so that is an arbitrary selection, not the
-  newest uploads.
-- **Resuming** (the cron): the listing returns the key to continue after
-  (`resumeAfter`), right before the first upload it left out (one with no
-  room left for its sidecar read, or partly listed). If nothing before that
-  upload was listed (its keys alone fill the budget, so it is no yeet
-  upload), it is returned unread, and incomplete if partly listed, and the
-  listing resumes after it, so the next one always gets further.
-- **Stray records** (legacy `.downloads/` keys without an upload) are only
-  reported when every key of that upload ID was listed: a partly listed
-  upload may have its sidecar after the records.
+  So CPU grows with the uploads listed, roughly 27–47 µs per upload (20 to
+  40 ms per 1,000), far above 10 ms; Workers Free tolerates some excess
+  before it refuses requests.
+- **The cron** (`runCleanup()` called through the probe Worker, the design
+  before round 1I: up to 25 list calls and 45 R2 calls; n = 5 runs): 45 and
+  65 ms CPU for runs that gave 20 and 18 sidecars their summary, 141–179
+  ms for runs that deleted 4 to 507 uploads.
+- **R2:** a `list()` with `include: ["customMetadata"]` returned about 415
+  objects per call, without it about 848, never 1,000 even with
+  `limit: 1000`. The limit on R2 binding calls is **1,000 per invocation**,
+  not 50. `put()` with `onlyIf: { etagMatches }` returns null both for a
+  stale etag and for a key that does not exist. Custom metadata is limited
+  to 8,192 bytes.
+- **Password checks** at 20,000 PBKDF2 iterations: see "Download
+  passwords" above (median 8 ms, p90 13 ms, n = 60).
+- **Other routes** during the e2e flows on the deploy (515 requests, none
+  refused): medians of 0–4 ms, p90 at most 14 ms (`POST /:id/download`
+  with a password).
+- **An empty `Authorization` header** is removed by Cloudflare's edge
+  before the Worker sees it (see "What counts as a failure").
 
-**Capacity** (uploads one `GET /api/uploads` lists), assuming 100 objects
-per list call with metadata, as miniflare returns; measured on the
-in-memory bucket by `e2e/tests/node/r2-capacity.spec.ts`:
+The bounds below are chosen from these numbers and are **estimates until
+measured on a real deploy** (see "To measure next").
 
-- **Finished uploads with a summary** (2 objects each): 40 calls × 50 =
-  2,000, minus the last, partly listed one: **1,999**.
-- **Each sidecar without a summary** costs one call, so 50 fewer uploads. A
-  bucket of nothing but such sidecars shows **39** (one list call, then 39
-  reads). The cron adds the missing summaries, 21 per run (below); the
-  one-time script below adds them all at once.
-- **Sidecars that never get a summary cost that read for good**, in every
-  `GET /api/uploads` and (2 calls reserved, 1 spent) in every cron run
-  that lists them: neither the cron nor the script writes one for
-  - a sidecar that is not valid JSON, or valid JSON not shaped like a
-    sidecar (`parseUploadMeta()`: e.g. `{}`, `"downloads": 5`, a
-    `download_count` that is a string). Such an upload is treated as
-    unreadable everywhere: left out of `GET /api/uploads`, its downloads
-    not counted, never deleted by the cron. It never stops a listing or a
-    cron run. (The download page reads the sidecar on its own: it fails
-    on invalid JSON, and works as long as the fields it uses are usable.)
-  - a sidecar whose summary would take more than 2,048 bytes of custom
-    metadata (`MAX_SUMMARY_BYTES`; only with a filename or download times
-    far longer than yeet writes). It is listed, counted and cleaned up
-    normally, just read each time. R2 refuses custom metadata over its
-    own limit (`wrangler dev`: 8,192 bytes), which used to make the cron
-    throw on such a sidecar; `writeMeta()` now leaves the summary out.
+### Listing a page (GET /api/uploads)
 
-  The fix is by hand: repair the sidecar's JSON (it is the upload's
-  `<prefix>/<id>/.meta.json`, see `UploadMeta` in `uploads.ts`), after
-  which the next cron run or the script adds the summary, or delete the
-  upload (`yeet delete <id>`, `DELETE /api/uploads/:id`, or its objects in
-  the dashboard). The script's `unreadable` and `tooLarge` counts, with
-  `--verbose`, name them.
-- **Each upload whose `.parts/` or legacy `.downloads/` run ends a page**
-  costs one more call. Pending uploads of unknown size and legacy records
-  also take room in the pages they share.
-- **If real R2 returns more per call** (up to 1,000), capacity grows to
-  match; if it returns fewer, it shrinks. To be measured on a real deploy.
+`GET /api/uploads` answers **one page per request**:
 
-`e2e/tests/node/r2-budget.spec.ts` counts the calls on the Worker's own
-modules with an in-memory bucket that returns at most 100 objects per call
-and, like the Free plan, throws past 50. `r2-adversarial.spec.ts`,
-`r2-adversarial-1g.spec.ts` and `r2-orphans.spec.ts` add a stricter bucket (`e2e/lib/strict-r2.ts`: short
-and empty pages, junk keys, IDs that are prefixes of each other).
+```jsonc
+// GET /api/uploads, or GET /api/uploads?cursor=<cursor>
+{
+  "uploads": [ /* finished uploads of this page, newest first */ ],
+  "cursor": "dXBsb2Fkcy9hQjN4X1Ew", // where the next page starts; null on the last page
+  "truncated": true                 // only when cursor is not null: more pages exist
+}
+```
+
+- **Request:** without `cursor`, the first page; with the `cursor` of the
+  previous page, the next. Every page is newest first within itself; a
+  client that wants the whole list fetches every page and sorts.
+- **`cursor`:** opaque to clients. It is the base64url spelling (no
+  padding) of the key the next page starts after (listPage()'s `next`,
+  `encodeListCursor()` in `parse.ts`). Strictly parsed
+  (`parseListCursor()`): only base64url characters, the one canonical
+  spelling (no padding, no stray bits), valid UTF-8, at most 1,024 bytes
+  (an R2 key's maximum), and starting with `<UPLOADS_PREFIX>/`. Anything
+  else, an empty `?cursor=` and two `cursor` parameters included, is
+  `400 {"error": "Invalid cursor"}` (after authentication). The listing
+  only ever lists under `<prefix>/` whatever the key, so the check is
+  strictness, not the boundary. A cursor stays valid as long as the
+  prefix does; uploads made or deleted between pages may be missed or
+  not, but none is listed twice (pages go forward in key order).
+- **Compatibility:** `truncated: true` keeps its meaning, "more exists".
+  A client that ignores `cursor` (yeet 0.2's CLI) gets the first page and
+  prints its note that only part of the uploads is shown. A new CLI
+  against a server without pages (`truncated` without `cursor`) prints
+  that page with the same note.
+
+**Work per request** (`listPage()` in `uploads.ts`, on top of `listAll()`;
+asserted in `e2e/tests/node/r2-work-bounds.spec.ts` on a bucket returning
+415 objects per list call, as real R2 did):
+
+- **One list call** with custom metadata and `limit: 300` (`PAGE_LIMIT`):
+  at most 300 objects, about 150 finished uploads. 300 because the phase
+  1H numbers (27–47 µs per upload) put 150 uploads at about 4–7 ms of CPU,
+  leaving room for the rest of the request; real R2 returns more than 300
+  per call, so the `limit` is the bound.
+- **At most one more list call** (`PAGE_JUMPS`), only when the first ends
+  inside a `.downloads/` or `.parts/` run: it continues after the run
+  (`startAfter: <prefix>/<id>/<run>/~`), so an upload with thousands of
+  legacy records is still listed. At most 600 objects then.
+- **At most 10 reads** of sidecars without a summary (`PAGE_READS`; a
+  jump takes the place of one): **at most 11 R2 calls** per page, plus
+  the Bearer rate-limit call.
+
+A page holds the uploads `listAll()` listed completely, in key order, and
+**never a partly listed one**: the last upload of a page that ends inside
+it is left for the next page, which starts right before it. An upload
+followed by keys that belong to no upload is complete (a fix of round
+1I: before, it was always treated as possibly partly listed). If a page
+lists nothing but the start of one upload:
+
+- **with more than 2 of its keys listed** (more keys than a yeet upload has
+  outside its `.downloads/` and `.parts/` runs; more than a page lists,
+  not a yeet upload): it is returned unread, and the next page starts
+  after it, so pages never stall;
+- **with at most 2** (R2 returned a short page, as it may; even empty ones):
+  nothing is returned and the cursor stays where it was, so the next
+  request tries again rather than skipping an upload. Real R2 returned
+  full pages in phase 1H.
+
+Pending uploads, and sidecars that are unreadable or not shaped like one
+(see "Sidecars that never get a summary" below), are left out of the
+page, never an error.
+
+**Pages per bucket** (`e2e/tests/node/r2-capacity.spec.ts`,
+`r2-work-bounds.spec.ts`; 415 objects per list call):
+
+| bucket                                  | uploads per page | pages |
+| --------------------------------------- | ---------------- | ----- |
+| 5,000 uploads with a summary            | 149              | 34    |
+| 1,000 uploads, half without a summary   | about 20         | 50    |
+| 1,000 uploads, none with a summary      | 10               | 100   |
+| 5,000 uploads, none with a summary      | 10               | 500   |
+
+149 because 300 objects are 150 uploads and the last one of a page that
+goes on is left for the next. `wrangler dev` returns at most 100 objects
+per list call, so it shows 49 per page.
+
+**`yeet list`** fetches every page, one request after the other, and
+prints all uploads newest first. A page that fails with a network error,
+5xx (503 is what Cloudflare answers over the CPU limit) or 429 is retried
+with backoff (1, 2 and 4 s); if it still fails, `yeet list` prints what it
+has with a note and exits 1 (if the first page fails, that is the error).
+It fetches at most 1,000 pages, so a server that keeps answering with a
+cursor cannot keep it busy forever. Tested against a stand-in server in
+`e2e/tests/node/cli.spec.ts`, and end to end in `list-pages.spec.ts`.
+
+**Sidecars that never get a summary cost a read for good**, in every page
+that lists them and (2 calls reserved, 1 spent) in every cron run that
+lists them: neither the cron nor the script writes one for
+
+- a sidecar that is not valid JSON, or valid JSON not shaped like a
+  sidecar (`parseUploadMeta()`: e.g. `{}`, `"downloads": 5`, a
+  `download_count` that is a string). Such an upload is treated as
+  unreadable everywhere: left out of `GET /api/uploads`, its downloads
+  not counted, never deleted by the cron. It never stops a listing or a
+  cron run. (The download page reads the sidecar on its own: it fails on
+  invalid JSON, and works as long as the fields it uses are usable.)
+- a sidecar whose summary would take more than 2,048 bytes of custom
+  metadata (`MAX_SUMMARY_BYTES`; only with a filename or download times
+  far longer than yeet writes). It is listed, counted and cleaned up
+  normally, just read each time. R2 refuses custom metadata over its own
+  limit (8,192 bytes, measured on R2 and in `wrangler dev`), which used
+  to make the cron throw on such a sidecar; `writeMeta()` now leaves the
+  summary out.
+
+The fix is by hand: repair the sidecar's JSON (it is the upload's
+`<prefix>/<id>/.meta.json`, see `UploadMeta` in `uploads.ts`), after which
+the next cron run or the script adds the summary, or delete the upload
+(`yeet delete <id>`, `DELETE /api/uploads/:id`, or its objects in the
+dashboard). The script's `unreadable` and `tooLarge` counts, with
+`--verbose`, name them.
+
+`listAll()` itself still takes an R2 call budget (default 40,
+`LIST_BUDGET`) for callers that set none; `e2e/tests/node/r2-budget.spec.ts`,
+`r2-adversarial.spec.ts`, `r2-adversarial-1g.spec.ts` and
+`r2-orphans.spec.ts` test it on in-memory buckets of 100 objects per call
+(`e2e/lib/fake-r2.ts`, and the stricter `e2e/lib/strict-r2.ts`: short and
+empty pages, junk keys, IDs that are prefixes of each other).
 
 ### Cleanup (cron)
 
-The daily run (`packages/worker/src/cleanup.ts`) makes at most **45 R2
-calls**:
+The cleanup (`packages/worker/src/cleanup.ts`) runs **every hour**
+(`0 * * * *` in `wrangler.jsonc`), and each run does a small, bounded
+amount of work, whatever the bucket holds:
 
 1. **Reads its cursor**, `<prefix>/.cleanup-cursor` (1 call): the key to
    start after, or none for the beginning of the bucket.
-2. **Lists from there**, at most 25 list calls (about 1,249 uploads). It
-   leaves sidecars without a summary unread and reserves 2 calls for each
-   out of the 43 it may use together with steps 3 and 4, so it lists no
-   further than the run can handle: a page of 50 such sidecars stops the
-   listing after one call.
-3. **Gives sidecars without a summary theirs first**, before any other
-   work: a get and a conditional put (`onlyIf: { etagMatches }`), 2 calls
-   each, at most **21 per run** ((45 − cursor read − cursor write − one list
-   call) / 2). The get also tells the run whether the upload is stale.
-   Stale ones get their summary too, so that a later run deletes them from
-   the listing alone.
-4. **Handles the uploads in key order** while the rest of the budget lasts
-   (keeping one call for step 5):
+2. **Lists one slice from there:** one list call with custom metadata and
+   `limit: 200` (`CLEANUP_LIST_LIMIT`, about 100 uploads), and at most one
+   more to jump over a `.downloads/` or `.parts/` run it ends in
+   (`CLEANUP_JUMPS`). It leaves sidecars without a summary unread and
+   reserves 2 calls for each.
+3. **Gives sidecars without a summary theirs first**, at most **10 per
+   run** (`CLEANUP_SUMMARIES`): a get and a conditional put
+   (`onlyIf: { etagMatches }`) each. The get also tells the run whether
+   the upload is stale. Stale ones get their summary too, so that a later
+   run deletes them from the listing alone. Uploads from the first one
+   left without a summary wait for the next run.
+4. **Handles the uploads in key order:**
    - **Expired, and pending for over 24 hours:** their keys go into batch
-     deletes (1,000 keys per call), the sidecars in batches of their own
-     after all other keys; a pending one first gets its multipart upload
-     aborted (1 call).
-   - **Uploads whose keys the listing jumped over, and legacy records:**
-     listed and deleted under `<prefix>/<id>/` (or only `.downloads/` for a
-     current upload), 2 calls per 1,000 objects, plus 1 for the sidecar,
-     deleted on its own once everything else is gone.
+     deletes, the sidecars in a batch of their own after all other keys; a
+     pending one first gets its multipart upload aborted (1 call; again in
+     each run while its deletion takes several).
+   - **An upload whose keys the listing did not all see, and the legacy
+     records of a current upload:** listed and deleted under
+     `<prefix>/<id>/` (or only `.downloads/` for a current upload) with
+     `deleteUnder()`, **one such upload per run and one round**: a list of
+     at most 200 keys without metadata and a delete, plus 1 for the
+     sidecar, deleted on its own once everything else is gone. An upload
+     with more keys takes several runs; the run stops at it, and the next
+     starts there.
 5. **Saves the cursor** (1 call, only if it changed): after the last upload
    it finished. If it reached the end of the bucket, the next run starts at
    the beginning.
 
+**Work per run** (asserted in `e2e/tests/node/r2-work-bounds.spec.ts`, 415
+objects per list call): at most **3 list calls of at most 200 objects**
+(the slice, a jump, one `deleteUnder()` round), so at most 600 objects
+examined (usually one call of 200); at most 10 summaries written; and at
+most **45 R2 calls** (`CLEANUP_BUDGET`), a second guard from the time 50
+subrequests were assumed: a run's own work needs at most 31 (cursor read
+and write, 2 lists, 20 for summaries, 3 for `deleteUnder()`, 4 batch
+deletes), so the rest only limits multipart aborts. On the
+in-memory buckets of the tests, runs make 5 to 31. 200 rather than a page's 300
+because a run may list three times: the phase 1H cron runs cost about
+15 µs CPU per object listed (141–179 ms for up to 25 calls), so 600
+objects are about 9 ms. *Estimate, to be measured on a real deploy.*
+
 **The sidecar goes last** because it is what makes the listing see an
-upload: when a run's calls (or a `DELETE /api/uploads/:id`) stop half-way,
-what is left still has its sidecar, and the next run finds it stale and
-goes on. Keys left without a sidecar would never be cleaned up.
+upload: when a run (or a `DELETE /api/uploads/:id`) stops half-way, what is
+left still has its sidecar, and the next run finds it stale and goes on.
+Keys left without a sidecar would never be cleaned up.
 
 **Never cleaned up by the cron:** uploads whose sidecar it cannot read
-(not valid JSON or not shaped like one, see the listing above; such a
-sidecar never stops a run), and an upload directory with more keys that
-yeet does not write sorting before its `.meta.json` than a run lists
-(outside `.downloads/` and `.parts/`, which the listing jumps over; about
-2,500 at 100 per list call): no run reaches its sidecar, so none sees it
-as stale; each returns it unread and goes on after it instead of
-stalling (`e2e/tests/node/r2-adversarial-1g.spec.ts`, with 30,000 such
-keys). yeet itself never writes such keys.
+(not valid JSON or not shaped like one, see above; such a sidecar never
+stops a run), and an upload directory with more keys that yeet does not
+write sorting before its `.meta.json` than a run lists (outside
+`.downloads/` and `.parts/`; 200 at 200 objects per list call): no run
+reaches its sidecar, so none sees it as stale; each returns it unread and
+goes on after it instead of stalling (`e2e/tests/node/r2-adversarial-1g.spec.ts`,
+with 30,000 such keys). yeet itself never writes such keys.
 
-So the order is stable across runs and each run continues where the last
-one stopped: a bucket of N uploads is gone through in about N / 1,249 days,
-longer when a run has more to delete than its budget allows (it then stops
-at that upload and goes on from there the next day). Expired files are
-refused at request time regardless (the page, the form and `/_dl` check
+**Runs per bucket** (`e2e/tests/node/r2-capacity.spec.ts` and
+`r2-work-bounds.spec.ts`; 415 objects per list call, every tenth upload
+expired; a run is an hour):
+
+| bucket                                       | first run                    | runs to finish |
+| -------------------------------------------- | ---------------------------- | -------------- |
+| 1,000 uploads with a summary                 | 9 deleted, 5 calls           | 11             |
+| 5,000 uploads with a summary                 | 9 deleted, 5 calls           | 51             |
+| 1,000 uploads, none with a summary           | 10 summaries, 1 deleted      | 100            |
+| 5,000 uploads, none with a summary           | 10 summaries, 1 deleted, 25 calls | 500       |
+| the same, none expired                       | 10 summaries                 | 500            |
+
+So a bucket of N uploads with summaries is gone through in ceil(N / 99)
+hours (99 = the 100 uploads of 200 objects, minus the last, left for the
+next run); one without summaries in N / 10 hours. Deleting a run of
+legacy records or part records takes one run per about 200 keys (a stale
+upload with 30,000 such keys: 169 runs). Expired files are refused at
+request time regardless (the page, the form and `/_dl` check
 `expires_at`), so a later deletion costs only storage; `yeet list` shows
 them as expired until then.
 
-Measured on the in-memory bucket (`e2e/tests/node/r2-capacity.spec.ts`):
-5,000 uploads, every tenth expired, cron runs until nothing expired and no
-sidecar without a summary is left.
+Without summaries the deletions wait: a run gives 10 sidecars their
+summary and stops after the last of them. Hence the one-time script below
+for a bucket of yeet < 0.2 uploads.
 
-| bucket                     | first run                     | runs |
-| -------------------------- | ----------------------------- | ---- |
-| with summaries             | 124 deleted, 29 calls         | 5    |
-| sidecars without a summary | 21 summaries, 45 calls        | 350  |
-| the same, none expired     | 21 summaries, 45 calls        | 239  |
+**Local tests** (`wrangler dev`, the shared e2e bucket): one cron run no
+longer gets through the test bucket, so the e2e tests trigger runs until
+their upload has been reached (`cronUntil()` in `e2e/lib/bucket.ts`).
 
-Without summaries the deletions wait: step 3 takes the whole budget, and a
-run stops at the first stale upload it has no calls left to delete. Hence
-the one-time script below for a bucket of yeet < 0.2 uploads.
+### To measure next (on a real deploy)
+
+- CPU of `GET /api/uploads` per page: with 150 uploads that have a summary
+  (the 300-object limit), with 10 reads of sidecars without one, and with a
+  jump over legacy records (up to 600 objects); `yeet list` through a
+  bucket of several thousand uploads without a `503`.
+- CPU of a cron run: a slice of 200 objects that deletes about 10 uploads,
+  one with 10 summaries, and one with a `deleteUnder()` round; and that
+  the hourly trigger fires.
+- Whether real R2 ever returns short or empty pages with `limit` set (the
+  listing retries rather than skips then).
+- CPU of `POST /api/uploads/:id/complete` of an upload of unknown size with
+  thousands of part records (the 46-call budget allows about 18,000 at
+  415 per call).
+- If a page or a run is over 10 ms, lower `PAGE_LIMIT` or
+  `CLEANUP_LIST_LIMIT`; the tests assert against the constants.
 
 ### Migrating a bucket of yeet < 0.2 (one-time)
 
 `packages/worker/scripts/backfill-summaries.mjs` gives every sidecar
-without a summary its summary in one go, from your machine rather than
-within a Worker's 50 calls. It lives in `packages/worker` because it needs
+without a summary its summary in one go, from your machine, instead of
+the cron's 10 per hourly run. It lives in `packages/worker` because it needs
 direct access to the bucket (through wrangler, a dev dependency there) and
 the Worker's own `writeMeta()` and `summarize()`, so it writes exactly the
 summary the Worker would; the CLI only talks HTTP to the Worker and has no
@@ -624,7 +786,12 @@ node scripts/backfill-summaries.mjs --remote --bucket <bucket_name> --apply  # w
   the content type, so e.g. the `mtime` rclone stores in custom metadata
   is gone afterwards. yeet does not read it; the cron's summary step does
   the same. The JSON body is unchanged.
-- **Safe:** a dry run unless `--apply`. Idempotent: a second run finds
+- **Safe:** a dry run unless `--apply`. The dry run reads every sidecar
+  without a summary (gets only, no writes) and classifies it exactly as
+  `--apply` would, so its `writable`, `unreadable` and `tooLarge` counts
+  and its closing "Run again with --apply to write N summaries" are what
+  `--apply` will find (before round 1I it counted every missing summary as
+  writable and reported `unreadable` and `tooLarge` as 0). Idempotent: a second run finds
   nothing to do. Each write is conditional on the etag it read, so a
   download counted (or an upload deleted) in between is never overwritten;
   it is reported as `changed`, and the Worker wrote that sidecar's summary
@@ -632,22 +799,25 @@ node scripts/backfill-summaries.mjs --remote --bucket <bucket_name> --apply  # w
   (`{}`, `[]`, `"downloads": 5`, …) are left alone (`unreadable`), and so
   are ones whose summary would exceed 2,048 bytes (`tooLarge`); see
   "Sidecars that never get a summary" above.
-- **Cost:** one list call per page of objects, plus a get and a put per
-  sidecar written. These are API calls from your machine, not Worker
+- **Cost:** one list call per page of objects, plus a get per sidecar
+  without a summary (dry run too) and a put per sidecar written. These are
+  API calls from your machine, not Worker
   subrequests.
 - **Output:** one JSON line, e.g.
-  `{"apply":true,"sidecars":120,"missing":118,"written":118,"changed":0,"unreadable":0,"tooLarge":0}`;
-  `--verbose` names each key on stderr.
+  `{"apply":true,"sidecars":120,"missing":118,"writable":117,"written":117,"changed":0,"unreadable":1,"tooLarge":0}`;
+  `--verbose` names each key on stderr. On stderr it also says how many
+  summaries `--apply` would write (dry run) and how many sidecars can never
+  get one.
 - **Tested** on the in-memory bucket and, end to end, on a `wrangler dev`
-  bucket (`e2e/tests/node/backfill.spec.ts`). Not yet run against real R2:
-  start with a dry run.
+  bucket (`e2e/tests/node/backfill.spec.ts`), and run on a real R2 bucket
+  in the phase 1H measurement. Start with a dry run.
 
 ### Legacy download records (1D/1E)
 
 The pre-release versions 1D and 1E wrote one empty object per download,
 `<prefix>/<id>/.downloads/<at>_<random>`. They are no longer written or
 counted: the listing jumps over them, the cron deletes them (as above,
-2 calls per 1,000), and `DELETE /api/uploads/:id` removes them with their
+about 200 per hourly run), and `DELETE /api/uploads/:id` removes them with their
 upload. They are not added to the count first: that would take a
 conditional sidecar update per batch, and a failed delete after it would
 count them twice. They only exist in pre-release test buckets, whose counts

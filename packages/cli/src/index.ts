@@ -411,21 +411,92 @@ interface ListedUpload {
   url: string;
 }
 
+/** One page of `GET /api/uploads`. */
+interface UploadsPage {
+  uploads: ListedUpload[];
+  /** Where the next page starts (`?cursor=`); null or absent on the last page. */
+  cursor?: string | null;
+  /** More pages exist. Without a cursor: a server from before paginated listing, which lists one page only. */
+  truncated?: boolean;
+}
+
+/**
+ * The most pages `yeet list` fetches. A page holds about 150 uploads (at
+ * least 10), so this is far beyond any real bucket; it stops a server that
+ * keeps answering with more pages from keeping the CLI busy forever.
+ */
+const MAX_LIST_PAGES = 1000;
+
+/**
+ * Every upload, fetched page by page, one request after the other (each
+ * request does a small, bounded amount of work on the server). A page that
+ * fails with a network error, 5xx or 429 is retried with backoff
+ * (withRetries()). If the first page fails, that is the error; if a later
+ * one does, or the page cap is reached, what was fetched so far comes back
+ * with a note saying why the list is incomplete.
+ */
+async function fetchAllUploads(
+  config: Config,
+): Promise<{ uploads: ListedUpload[]; incomplete?: string; partial?: string }> {
+  const byId = new Map<string, ListedUpload>();
+  let cursor: string | null = null;
+  for (let pages = 0; ; pages++) {
+    if (pages >= MAX_LIST_PAGES) {
+      return {
+        uploads: [...byId.values()],
+        incomplete: `Stopped after ${MAX_LIST_PAGES} pages; the server kept saying there is more.`,
+      };
+    }
+    const path: string =
+      cursor === null ? "/uploads" : `/uploads?cursor=${encodeURIComponent(cursor)}`;
+    let page: UploadsPage;
+    try {
+      page = await withRetries(() => api<UploadsPage>(config, "GET", path));
+    } catch (err) {
+      if (pages === 0) throw err;
+      const reason = err instanceof Error ? err.message : String(err);
+      return {
+        uploads: [...byId.values()],
+        incomplete: `Could not fetch every page (${reason}); run \`yeet list\` again for the rest.`,
+      };
+    }
+    if (!Array.isArray(page?.uploads)) {
+      throw new ApiError("The server sent a list of uploads yeet does not understand", 0);
+    }
+    for (const upload of page.uploads) byId.set(upload.id, upload);
+    if (typeof page.cursor === "string" && page.cursor !== "") {
+      cursor = page.cursor;
+      continue;
+    }
+    // A server from before paginated listing: one page, and `truncated` if there is more.
+    return page.truncated
+      ? {
+          uploads: [...byId.values()],
+          partial:
+            "Note: the bucket holds more than the server can list in one request; " +
+            "only part of your uploads is shown. Update the server to list them all.",
+        }
+      : { uploads: [...byId.values()] };
+  }
+}
+
 async function listFiles(showDownloads: boolean): Promise<void> {
   const config = loadConfig();
-  const { uploads, truncated } = await api<{ uploads: ListedUpload[]; truncated?: boolean }>(
-    config,
-    "GET",
-    "/uploads",
-  );
-  // The server lists at most a fixed number of R2 pages per request.
-  const truncatedNote =
-    "Note: the bucket holds more than the server can list in one request; " +
-    "only part of your uploads is shown.";
+  const { uploads, incomplete, partial } = await fetchAllUploads(config);
+  uploads.sort((a, b) => b.uploaded_at.localeCompare(a.uploaded_at));
+  const notes = () => {
+    if (partial) process.stdout.write(yellow(partial) + "\n");
+    if (incomplete) {
+      process.stdout.write(
+        yellow(`Note: only part of your uploads is shown. ${incomplete}`) + "\n",
+      );
+      process.exitCode = 1;
+    }
+  };
 
   if (uploads.length === 0) {
     process.stdout.write("No files found.\n");
-    if (truncated) process.stdout.write(yellow(truncatedNote) + "\n");
+    notes();
     return;
   }
 
@@ -466,7 +537,7 @@ async function listFiles(showDownloads: boolean): Promise<void> {
   process.stdout.write(
     dim(`${uploads.length} files (${active} active, ${expired} expired)`) + "\n",
   );
-  if (truncated) process.stdout.write(yellow(truncatedNote) + "\n");
+  notes();
 }
 
 async function deleteUploads(ids: string[]): Promise<void> {

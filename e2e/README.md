@@ -165,31 +165,41 @@ Rules of thumb:
   bucket is shared by all tests of a run (and empty at its start).
 - Use the `tmp` fixture for files; it is removed after the test, and the run's
   temp root after the run. Delete large files as soon as you have their hash.
-- The Worker's cleanup only runs when a test calls `triggerCron()`, and it deletes
-  every expired upload. Wrap any test that triggers the cron, or needs an expired
-  upload to stay in the bucket for a while, in `exclusive("cron", async () => …)`
-  (see `tests/node/cron.spec.ts`), and give uploads in other tests expiries of
+- The Worker's cleanup only runs when a test triggers it (`cronUntil()` or
+  `triggerCron()`), and it deletes every expired upload it reaches. Wrap any
+  test that triggers the cron, or needs an expired upload to stay in the
+  bucket for a while, in `exclusive("cron", async () => …)` (see
+  `tests/node/cron.spec.ts`), and give uploads in other tests expiries of
   minutes or more. The cleanup also deletes legacy `.downloads/` records and
   adds the summary custom metadata to sidecars without one, so a test that
-  seeds or inspects either holds the same lock. (In the test bucket one cron
-  run gets through everything as long as it holds at most 20 sidecars
-  without a summary: a run gives at most 21 their summary, but 21 take its
-  whole budget, so anything else, deletions included, waits for the next
-  run. The same happens with more uploads than its R2 call budget lists.
-  Measured in `tests/node/r2-adversarial-1g.spec.ts`. Sidecars the cron
-  cannot read, or whose summary is too large, never get one, so leave none
-  behind; `docs/design/api.md` has the details.)
-- Code that has to stay within the Free plan's 50 subrequests (the listing,
-  the cron, the download count) is unit-tested on the Worker's modules with
-  the in-memory bucket of `lib/fake-r2.ts`, which counts R2 calls, returns at
-  most 100 objects per list call with metadata and throws past 50 calls
-  (`tests/node/r2-budget.spec.ts`); `wrangler dev` enforces neither.
+  seeds or inspects either holds the same lock. A cron run handles one
+  bounded slice of the bucket (about 100 uploads, at most 10 summaries, at
+  most about 200 keys of one upload it lists on its own), and the test
+  bucket is shared by every test of the run, so one run rarely gets
+  through it: wait for an effect with `cronUntil(check)`, which triggers
+  runs until `check` holds, rather than one `triggerCron()` and
+  `eventually()`. Sidecars the cron cannot read, or whose summary is too
+  large, never get one, so leave none behind; `docs/design/api.md` has the
+  details.
+- Likewise `GET /api/uploads` answers one page (about 50 uploads under
+  `wrangler dev`, which returns at most 100 objects per list call);
+  `listUploads()` follows the cursors and returns all of them.
+- CPU is what limits a request and a cron run on the Free plan (measured,
+  see "Measurements (phase 1H)" in `docs/design/api.md`), and `wrangler dev`
+  enforces no limit. As a stand-in, the work of one `GET /api/uploads` page
+  and one cron run (objects listed, list calls, reads, R2 calls) is asserted
+  on the Worker's modules with in-memory buckets
+  (`tests/node/r2-work-bounds.spec.ts`, with the 415 objects per list call
+  real R2 returned: `REAL_R2_CAPS` in `lib/strict-r2.ts`). `lib/fake-r2.ts`
+  counts R2 calls, returns at most 100 objects per list call with metadata
+  and throws past 50 calls (`tests/node/r2-budget.spec.ts`).
   `lib/strict-r2.ts` is a second, stricter one, written independently by a
   verifier: random short and empty pages from a seeded generator, opaque
-  cursors, hooks to change the bucket during a run
+  cursors, a configurable number of objects per list call, a count of the
+  objects lists return, hooks to change the bucket during a run
   (`tests/node/r2-adversarial.spec.ts`, `r2-adversarial-1g.spec.ts`,
-  `r2-orphans.spec.ts`, `r2-capacity.spec.ts`, whose figures are quoted in
-  `docs/design/api.md`).
+  `r2-orphans.spec.ts`, `r2-work-bounds.spec.ts`, `r2-capacity.spec.ts`,
+  whose figures are quoted in `docs/design/api.md`).
 - Opening the page of an expired upload deletes it, so do not visit an upload
   whose removal by the cron you want to observe.
 - Tag slow tests with `{ tag: "@slow" }` so `verify:fast` can skip them.
@@ -246,7 +256,9 @@ All exported from `lib/index.ts`.
   (`undefined`) headers.
 - `apiJson(path, init?)`: parsed JSON, throws on non-2xx; sets the JSON content
   type for string bodies.
-- `listUploads()`, `deleteUpload(id)`, `idFromUrl(shareUrl)`.
+- `listUploads({ maxPages? })`: every finished upload, following the pages of
+  `GET /api/uploads` (type `UploadsPage` for one page); `deleteUpload(id)`,
+  `idFromUrl(shareUrl)`.
 - `uploadViaApi({ filename, data, expiresInSeconds?, password? })` → `{ id, url }`:
   uploads like the CLI does but with expiry in seconds (the CLI's minimum is 1 minute).
 - `startUpload({ filename, size, expiresInSeconds? })` → id of an upload left
@@ -280,8 +292,11 @@ These talk to wrangler's Local Explorer API
   (`withSummary: false`, like an old sidecar). `summarize(meta)` mirrors
   `summarize()` in `packages/worker/src/uploads.ts`; keep the copies in sync.
 - `randomId()` → a 6-character upload ID.
-- `triggerCron(cron = "0 3 * * *")`: calls `/__scheduled`. The cleanup runs in
-  `waitUntil()`, so poll for its effect with `eventually()`.
+- `triggerCron(cron = "0 * * * *")`: calls `/__scheduled`, which starts one run.
+  The cleanup runs in `waitUntil()`, so poll for its effect.
+- `cronUntil(check, { message?, maxRuns = 40, perRunMs = 1500 })` → the runs it
+  took: triggers a run, polls `check` for up to `perRunMs`, and triggers the
+  next until `check` holds (one run handles one slice of the shared bucket).
 
 ### Fixtures — `fixtures.ts`
 
@@ -348,6 +363,6 @@ returns wrangler's output so far (e.g. to count `PUT …/parts/N` requests).
   `npx wrangler r2 object put "yeet/<key>" --file <f> --local --persist-to <server.persistDir>`
   from `packages/worker` instead.
 - The cron is triggered through wrangler's `/__scheduled` test route; the real
-  Cron Trigger schedule (`0 3 * * *`) is not exercised.
+  Cron Trigger schedule (`0 * * * *`, hourly) is not exercised.
 - Recent npm (12 here) blocks dependency install scripts by default (esbuild, workerd); the harness works without
   them because their platform binaries come from optional dependencies.

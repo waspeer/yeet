@@ -235,7 +235,7 @@ test.describe("upload API", () => {
   test("size unknown: more part records than one request can list and delete is a 400 before completing", async () => {
     // 4,101 records take 42 list calls (100 per call with metadata) and 5
     // deletes: more than the 46 subrequests complete has for them. Seeded
-    // directly; wrangler dev itself does not enforce the Free plan's 50.
+    // directly; wrangler dev itself enforces no limit.
     const id = await create({ filename: "many-parts.bin" });
     const one = await putPartJson(id, 1, randomBytes(10));
     const keys = Array.from(
