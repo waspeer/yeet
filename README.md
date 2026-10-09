@@ -150,7 +150,7 @@ measurements (see "Measurements (phase 1J)" there).
 
 The CLI and the upload page always tell the server a file's size up
 front. A client of the API that does not can complete an upload of at most
-300 parts (about 15.7 GB).
+150 parts (about 7.9 GB).
 
 ## Security notes
 

@@ -304,6 +304,40 @@ test.describe("upload API", () => {
     }
   });
 
+  test("size known: more parts than the size has is a 400 before R2's complete", async () => {
+    // Round 1L: a parts array is bounded by the declared size (every part
+    // was checked against it on PUT), and by R2's 10,000 before parsing.
+    const count = 3;
+    const id = await create({ filename: "sized-count.bin", size: (count - 1) * PART_SIZE + 1 });
+    const madeUp = (n: number) =>
+      Array.from({ length: n }, (_, i) => ({ part_number: i + 1, etag: "made-up" }));
+    const tooMany = await complete(id, { parts: madeUp(count + 1) });
+    expect(tooMany.status).toBe(400);
+    expect(await tooMany.json()).toEqual({
+      error:
+        `Invalid parts: an upload of ${(count - 1) * PART_SIZE + 1} bytes has ${count} parts ` +
+        `(part_size ${PART_SIZE} bytes), not ${count + 1}`,
+    });
+    // As many as the size has: on to R2 (which refuses the made-up etags).
+    const exact = await complete(id, { parts: madeUp(count) });
+    expect(exact.status).toBe(400);
+    expect((await exact.json()).error).toMatch(/^Could not complete the upload/);
+    // An empty file is one part.
+    const empty = await create({ filename: "sized-empty.bin", size: 0 });
+    const two = await complete(empty, { parts: madeUp(2) });
+    expect(await two.json()).toEqual({
+      error: `Invalid parts: an upload of 0 bytes has 1 part (part_size ${PART_SIZE} bytes), not 2`,
+    });
+    // Over R2's 10,000: refused before the upload is even looked up.
+    const huge = await complete(id, { parts: madeUp(10_001) });
+    expect(huge.status).toBe(400);
+    expect(await huge.json()).toEqual({ error: "Invalid parts: at most 10000" });
+    for (const upload of [id, empty]) {
+      expect((await readUploadMeta(upload))?.pending_upload_id).toBeTruthy();
+      expect((await api(`/api/uploads/${upload}`, { method: "DELETE" })).status).toBe(200);
+    }
+  });
+
   test("an invalid parts array is a 400 before anything is completed", async () => {
     const id = await create({ filename: "parts.bin" });
     const part = await putPartJson(id, 1, randomBytes(10));

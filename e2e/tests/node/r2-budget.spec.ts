@@ -553,8 +553,11 @@ test.describe("R2 calls of completing an upload of unknown size", () => {
     // Round 1K: the limit is MAX_UNSIZED_PARTS records (CPU: 4,000 records
     // took 82 to 138 ms on Workers Free in phase 1J), no longer the 4,100
     // that fitted the 46 R2 calls of PART_RECORDS_BUDGET.
+    // (Round 1L: MAX_UNSIZED_PARTS 300 → 150; the cases follow the constant.)
+    const cases = [1, 100, 101, MAX_UNSIZED_PARTS - 1, MAX_UNSIZED_PARTS];
+    const tooMany = [MAX_UNSIZED_PARTS + 1, 4100, 4101, 10_000];
     const results: Record<number, unknown> = {};
-    for (const parts of [1, 100, 101, 299, 300, 301, 4100, 4101, 10_000]) {
+    for (const parts of [...cases, ...tooMany]) {
       const bucket = new FakeBucket();
       seedUpload(bucket, idOf(0), { pendingSince: NOW, parts });
       // Every record is a part in the request (the CLI's parts array).
@@ -572,17 +575,16 @@ test.describe("R2 calls of completing an upload of unknown size", () => {
     // Completed: 4 + ceil(parts / 100) list calls + ceil(parts / 1000) deletes.
     // Refused: a parts array over the limit before any listing (2: the
     // rate-limit call and the sidecar read).
-    expect(results).toEqual({
-      1: { outcome: "completed", subrequests: 6, listed: 1 },
-      100: { outcome: "completed", subrequests: 6, listed: 100 },
-      101: { outcome: "completed", subrequests: 7, listed: 101 },
-      299: { outcome: "completed", subrequests: 8, listed: 299 },
-      300: { outcome: "completed", subrequests: 8, listed: 300 },
-      301: { outcome: "refused", subrequests: 2 },
-      4100: { outcome: "refused", subrequests: 2 },
-      4101: { outcome: "refused", subrequests: 2 },
-      10_000: { outcome: "refused", subrequests: 2 },
-    });
+    const expected: Record<number, unknown> = {};
+    for (const parts of cases) {
+      expected[parts] = {
+        outcome: "completed",
+        subrequests: 4 + Math.ceil(parts / 100) + Math.ceil(parts / 1000),
+        listed: parts,
+      };
+    }
+    for (const parts of tooMany) expected[parts] = { outcome: "refused", subrequests: 2 };
+    expect(results).toEqual(expected);
   });
 
   test(`more than ${MAX_UNSIZED_PARTS} records, fewer parts sent: refused after listing at most ${MAX_UNSIZED_PARTS + 1}`, async () => {
@@ -606,19 +608,22 @@ test.describe("R2 calls of completing an upload of unknown size", () => {
   });
 
   test("fewer records per list call: the R2 call budget still refuses, before completing", async () => {
-    // A second guard: at 6 records per call, 300 records take 50 list calls,
-    // more than PART_RECORDS_BUDGET (46); at 7, 43 calls and a delete fit.
-    const six = new FakeBucket({ pageSize: 6 });
-    seedUpload(six, idOf(0), { pendingSince: NOW, parts: MAX_UNSIZED_PARTS });
-    const refused = await complete(six, idOf(0), MAX_UNSIZED_PARTS);
+    // A second guard: the fewest records per call at which MAX_UNSIZED_PARTS
+    // records take at most PART_RECORDS_BUDGET - 1 list calls and a delete
+    // (4 at 150, as api.md says; 7 at round 1K's 300). One fewer is refused.
+    const fewest = Math.ceil(MAX_UNSIZED_PARTS / (PART_RECORDS_BUDGET - 1));
+    expect(fewest).toBe(4);
+    const short = new FakeBucket({ pageSize: fewest - 1 });
+    seedUpload(short, idOf(0), { pendingSince: NOW, parts: MAX_UNSIZED_PARTS });
+    const refused = await complete(short, idOf(0), MAX_UNSIZED_PARTS);
     expect(refused.outcome).toBe("refused");
     expect(refused.subrequests).toBeLessThanOrEqual(2 + PART_RECORDS_BUDGET);
-    expect(six.keys(`${PREFIX}/${idOf(0)}/.parts/`)).toHaveLength(MAX_UNSIZED_PARTS);
-    const seven = new FakeBucket({ pageSize: 7 });
-    seedUpload(seven, idOf(0), { pendingSince: NOW, parts: MAX_UNSIZED_PARTS });
-    expect(await complete(seven, idOf(0), MAX_UNSIZED_PARTS)).toEqual({
+    expect(short.keys(`${PREFIX}/${idOf(0)}/.parts/`)).toHaveLength(MAX_UNSIZED_PARTS);
+    const enough = new FakeBucket({ pageSize: fewest });
+    seedUpload(enough, idOf(0), { pendingSince: NOW, parts: MAX_UNSIZED_PARTS });
+    expect(await complete(enough, idOf(0), MAX_UNSIZED_PARTS)).toEqual({
       outcome: "completed",
-      subrequests: 4 + Math.ceil(MAX_UNSIZED_PARTS / 7) + 1,
+      subrequests: 4 + Math.ceil(MAX_UNSIZED_PARTS / fewest) + 1,
       listed: MAX_UNSIZED_PARTS,
     });
   });

@@ -364,9 +364,16 @@ api.put("/uploads/:id/parts/:number", async (c) => {
   return c.json({ part_number: part.partNumber, etag: part.etag });
 });
 
-/** The `parts` of a complete request, sorted, or an error message. */
+/** R2's limit on the parts of a multipart upload; part numbers are 1 to this. */
+const MAX_PARTS = 10_000;
+
+/**
+ * The `parts` of a complete request, sorted, or an error message. Arrays
+ * longer than R2 allows are refused before any entry is looked at.
+ */
 function parseParts(value: unknown): { partNumber: number; etag: string }[] | string {
   if (!Array.isArray(value) || value.length === 0) return "Missing parts";
+  if (value.length > MAX_PARTS) return `Invalid parts: at most ${MAX_PARTS}`;
   const parts: { partNumber: number; etag: string }[] = [];
   for (const part of value as unknown[]) {
     const { part_number: partNumber, etag } = (part ?? {}) as Record<string, unknown>;
@@ -404,6 +411,22 @@ api.post("/uploads/:id/complete", async (c) => {
   const uploads = c.get("uploads");
   const meta = await uploads.readMeta(id);
   if (!meta?.pending_upload_id) return c.json({ error: "No upload in progress" }, 404);
+
+  // Size known at create: every part was checked on PUT, so the upload has
+  // exactly this many; a longer list can never complete.
+  if (meta.file_size !== undefined) {
+    const count = Math.max(1, Math.ceil(meta.file_size / PART_SIZE));
+    if (parts.length > count) {
+      return c.json(
+        {
+          error:
+            `Invalid parts: an upload of ${meta.file_size} bytes has ${count} ` +
+            `part${count === 1 ? "" : "s"} (part_size ${PART_SIZE} bytes), not ${parts.length}`,
+        },
+        400,
+      );
+    }
+  }
 
   // Size unknown at create: check the layout R2 requires from the recorded
   // part sizes, so the client gets a clear error instead of R2's.

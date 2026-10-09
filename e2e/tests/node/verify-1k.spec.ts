@@ -1,5 +1,5 @@
 // Independent verifier of round 1K: the MAX_UNSIZED_PARTS boundaries of
-// `complete` (array length and record count, 300/301), and the CLI's
+// `complete` (array length and record count, at the limit and one past it), and the CLI's
 // Retry-After parsing and "Try again" wording at their edges.
 
 import { createServer } from "node:http";
@@ -62,7 +62,9 @@ test.describe("1K verifier: complete of unknown size at the limit", () => {
     await seedRecords(id, 1, MAX_UNSIZED_PARTS, 10);
     const res = await complete(id, { parts: madeUp(MAX_UNSIZED_PARTS) });
     const body = (await res.json()) as { error: string };
-    console.log(`300/300: ${res.status} ${body.error.slice(0, 60)}`);
+    console.log(
+      `${MAX_UNSIZED_PARTS}/${MAX_UNSIZED_PARTS}: ${res.status} ${body.error.slice(0, 60)}`,
+    );
     expect(res.status).toBe(400);
     // Reached multipart.complete (made-up etags), not the limit's refusal.
     expect(body.error).toMatch(/^Could not complete the upload/);
@@ -115,7 +117,7 @@ test.describe("1K verifier: complete of unknown size at the limit", () => {
       expect(r, `${n}`).toBeNull();
       expect(b.calls["list"] ?? 0).toBeLessThanOrEqual(46);
     }
-    // And on full pages, 300 is read whole in one call, 301 refused after 301 listed.
+    // And on full pages, the limit is read whole in one call, one more refused after that many listed.
     for (const [n, ok] of [
       [MAX_UNSIZED_PARTS, true],
       [MAX_UNSIZED_PARTS + 1, false],

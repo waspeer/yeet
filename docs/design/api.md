@@ -390,32 +390,39 @@ Numbers that are signed or used as keys must be spelled one way only:
       `400 {"error": "Part <n> is <s> bytes but is followed by more parts: …"}`.
   - **The records:** deleted once the upload completes, and with the upload
     otherwise (delete, cleanup).
-  - **Limit: at most 300 part records** (`MAX_UNSIZED_PARTS`, since
-    round 1K). CPU binds, not R2 calls: the `complete` of an upload of
-    unknown size with 4,000 part records took 82, 125 and 138 ms CPU on
-    Workers Free (phase 1J, n = 3), far over 10 ms. So `complete` answers
-    `400` with this error before anything changes (no multipart complete,
-    no write; the upload stays pending, its records stay):
+  - **Limit: at most 150 part records** (`MAX_UNSIZED_PARTS`; 300 in
+    round 1K, 150 since round 1L). CPU binds, not R2 calls: the `complete`
+    of an upload of unknown size with 4,000 part records took 82, 125 and
+    138 ms CPU on Workers Free (phase 1J, n = 3), and with 300 records p50
+    14, p90 17 ms (phase 1K, n = 8, all `200`), over 10 ms. So `complete`
+    answers `400` with this error before anything changes (no multipart
+    complete, no write; the upload stays pending, its records stay):
 
     ```json
     {
-      "error": "Too many parts to complete an upload of unknown size (at most 300); start the upload again and send its size (\"size\" in POST /api/uploads)"
+      "error": "Too many parts to complete an upload of unknown size (at most 150); start the upload again and send its size (\"size\" in POST /api/uploads)"
     }
     ```
 
     when
-    - the request lists more than 300 parts (checked before any listing), or
-    - the bucket holds more than 300 part records for the upload (records
+    - the request lists more than 150 parts (checked before any listing), or
+    - the bucket holds more than 150 part records for the upload (records
       of parts not in the request count too). The list calls carry a
-      `limit`, so at most 301 records are listed to find out.
+      `limit`, so at most 151 records are listed to find out (real R2
+      respects such a `limit`: 301 asked, 301 returned, phase 1K).
 
-    300 parts are up to about 15.7 GB at the 50 MiB part size. With the size
+    150 parts are up to about 7.9 GB at the 50 MiB part size. With the size
     known at create there is no such limit (R2's own 10,000 parts). The
     CLI and the upload page always send the size, 0 included, so they never
     take this path (asserted: `e2e/tests/node/unsized-complete.spec.ts` for
     the CLI, `tests/browser/upload.spec.ts` for the page); only a hand-made
-    client could. _Estimate, not measured:_ at 82–138 ms per 4,000 records
-    (20–35 µs each, if CPU grows linearly), 300 records cost about 6–10 ms.
+    client could. The refusal of 301 records cost p50 9, p90 11 ms (phase
+    1K, n = 8): it lists 301 records with metadata. _Estimate, not
+    measured:_ these imply about 20 µs per record listed (the refusal) to
+    33 µs per record listed and deleted (the complete, over a sized
+    `complete`'s p50 4 ms in the same session), so for 150 records about
+    7–9 ms p50 for a `complete` and about 6 ms for the refusal (151
+    listed); the p90 may stay near 10.
 
   - **Second guard, the R2 call budget:** `complete` makes 4 subrequests
     besides the records (the Bearer rate-limit call, the sidecar read, the
@@ -424,15 +431,27 @@ Numbers that are signed or used as keys must be spelled one way only:
     afterwards, one call per 1,000. It stops listing as soon as these
     cannot fit in 46 R2 calls (`PART_RECORDS_BUDGET`, from the 50
     subrequests once assumed; the real limit is 1,000 R2 calls, phase 1H)
-    and answers the same 400. With 300 records that only happens if R2
-    returns fewer than 7 records per list call (`r2-budget.spec.ts`).
+    and answers the same 400. With 150 records that only happens if R2
+    returns fewer than 4 records per list call (`r2-budget.spec.ts`).
     Before round 1K this budget was the limit: 4,100 parts at 100 records
-    per call, about 18,000 at real R2's 415. Before the budget check
+    per call; at real R2's 415 per call at most about 13,280 by the call
+    budget (32 list calls and 14 deletes), so in effect R2's own 10,000
+    part numbers (this said "about 18,000" until round 1L, which was
+    wrong). Before the budget check
     (round 1H), 4,101 to 4,700 parts failed _after_ the multipart complete.
   - **Not covered:** a size given at `complete` that does not match the
     stored object makes the request delete the upload too (a listing and
-    deletes of all its keys, up to 301 records now); the cron deletes
+    deletes of all its keys, up to 150 records now); the cron deletes
     whatever a failed request leaves after 24 hours.
+  - **Size known: at most as many parts as the size has** (round 1L). A
+    `complete` listing more parts than `max(1, ceil(size / part_size))` is
+    a `400` ("Invalid parts: an upload of 104857601 bytes has 3 parts
+    (part_size 52428800 bytes), not 4") after the sidecar read, before R2
+    is asked; those parts were refused on `PUT` anyway. Any `parts` array
+    longer than R2's 10,000 is a `400` ("Invalid parts: at most 10000")
+    before its entries are parsed or sorted. So the array a request sorts
+    is bounded by 10,000 entries and by the request body; that work (one
+    pass and one sort) is not measured.
   - **Why not check per part:** with the size unknown, a short part is only
     wrong once a higher one exists. That would cost a bucket listing on every
     `PUT`.
