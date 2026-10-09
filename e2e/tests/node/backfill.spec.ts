@@ -78,7 +78,8 @@ test.describe("backfilling summaries (in memory)", () => {
     const dry = await backfillSummaries(bucket, PREFIX, { apply: false });
     expect(snapshot(bucket)).toBe(before);
     const apply = await backfillSummaries(bucket, PREFIX, { apply: true });
-    const counts = ({ ids: _, written: __, ...rest }: typeof dry) => rest;
+    const counts = (report: typeof dry) =>
+      Object.fromEntries(Object.entries(report).filter(([key]) => key !== "ids" && key !== "written"));
     expect(counts(dry)).toEqual(counts(apply));
     expect(dry).toMatchObject({ missing: 4, unreadable: 2, tooLarge: 1, writable: 1, written: 0 });
     expect(apply).toMatchObject({ missing: 4, unreadable: 2, tooLarge: 1, writable: 1, written: 1 });
