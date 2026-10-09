@@ -707,8 +707,13 @@ export class Uploads {
           // Nothing before it was listed: the budget does not stretch to this
           // one upload (more keys than it lists, not a yeet upload). Return it
           // unread, and incomplete if partly listed, so that the next listing
-          // gets past it rather than stalling.
-          unread = firstLeft;
+          // gets past it rather than stalling. If its sidecar was listed
+          // without a summary and its read fits, it is read like any other
+          // (round 1L: a jump answered with only the sidecar left such an
+          // upload out of the page, and the next page started after it).
+          const read = firstLeft.sidecar && !firstLeft.meta ? readCost : 0;
+          if (read > 0 && calls + reads + read <= budget) reads += read;
+          else unread = firstLeft;
           kept.push(firstLeft);
           resumeAfter = this.keyAfter(firstLeft.id);
         }
