@@ -4,7 +4,8 @@
 //
 // - list() returns keys in byte order, at most 1,000 per call, and at most
 //   100 when `include` asks for metadata (miniflare's cap; Cloudflare says
-//   such lists may return fewer than asked, so `pageSize` can lower it);
+//   such lists may return fewer than asked, so `pageSize` can lower it), and
+//   never more than the call's `limit`;
 //   `cursor` and `startAfter` work as in R2 (the later of the two wins);
 // - put() with `onlyIf: { etagMatches }` writes only if the object exists
 //   with that etag (atomically) and returns null otherwise;
@@ -99,9 +100,13 @@ export class FakeBucket implements Bucket {
     cursor?: string;
     startAfter?: string;
     include?: ("httpMetadata" | "customMetadata")[];
+    limit?: number;
   }) {
     await this.call("list");
-    const limit = options.include?.length ? Math.min(100, this.opts.pageSize ?? 100) : 1000;
+    const limit = Math.min(
+      options.include?.length ? Math.min(100, this.opts.pageSize ?? 100) : 1000,
+      options.limit ?? 1000,
+    );
     let after = options.startAfter;
     if (options.cursor !== undefined) {
       const fromCursor = Buffer.from(options.cursor, "base64url").toString("utf-8");
