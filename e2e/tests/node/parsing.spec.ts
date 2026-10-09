@@ -12,9 +12,9 @@ import { expect, test } from "../../lib/index.js";
 
 test.describe("strict parsing", () => {
   // `wrangler dev` drops an empty Authorization header before the Worker sees
-  // it (an empty X-Anything arrives), so this cannot be shown end to end
-  // locally. On Cloudflare the Worker gets whatever the edge passes on, and an
-  // empty header present must count as a failed Bearer attempt, never fall
+  // it (an empty X-Anything arrives), and so does Cloudflare's edge (measured
+  // in phase 1H), so this cannot be shown end to end. Should an empty header
+  // ever arrive, it must count as a failed Bearer attempt, never fall
   // through to the session cookie.
   test("an Authorization header, even an empty one, is a Bearer attempt", () => {
     expect(isBearerAttempt("")).toBe(true);

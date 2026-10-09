@@ -60,7 +60,9 @@ export function parseListCursor(value: string, prefix: string): string | null {
 /**
  * Whether a request makes a Bearer attempt: it has an Authorization header,
  * even an empty one. Such a request is decided by that header alone, and a
- * wrong (or empty) one counts as a failed guess.
+ * wrong (or empty) one counts as a failed guess. (Cloudflare's edge, like
+ * `wrangler dev`, removes an empty Authorization header, measured in phase
+ * 1H; the rule for an empty one stays in case that changes.)
  */
 export function isBearerAttempt(header: string | null | undefined): header is string {
   return typeof header === "string";

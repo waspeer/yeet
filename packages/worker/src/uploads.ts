@@ -111,10 +111,12 @@ export const PAGE_JUMPS = 1;
 
 /**
  * R2 calls `POST /api/uploads/:id/complete` of an upload of unknown size may
- * spend on its part records (readPartSizes() and their deletion): the Free
- * plan's 50 subrequests minus its 4 other ones (the Bearer rate-limit call,
- * the sidecar read, the multipart complete and the sidecar write). With 100
- * records per list call that is 4,100 parts.
+ * spend on its part records (readPartSizes() and their deletion): the 50
+ * subrequests the Free plan was assumed to allow, minus its 4 other ones
+ * (the Bearer rate-limit call, the sidecar read, the multipart complete and
+ * the sidecar write). With 100 records per list call that is 4,100 parts.
+ * The real limit is 1,000 R2 calls (phase 1H); this stays as a bound on the
+ * work, whose CPU is not measured (see docs/design/api.md).
  */
 export const PART_RECORDS_BUDGET = 50 - 4;
 
@@ -383,8 +385,8 @@ export class Uploads {
   /**
    * Write the metadata sidecar. A summary also goes into the object's custom
    * metadata, so a listing reads every upload's summary from its list pages
-   * instead of one read per upload — the free plan allows only 50 calls per
-   * request.
+   * instead of one read per upload, which would cost a round trip and CPU
+   * each.
    */
   async writeMeta(
     id: string,
@@ -686,10 +688,11 @@ export class Uploads {
    * what limits a request on the Free plan): one list call of at most
    * PAGE_LIMIT objects, at most PAGE_JUMPS more to jump over the rest of a
    * `.downloads/` or `.parts/` run, and reads of sidecars without a summary,
-   * 1 + PAGE_READS R2 calls in all. listAll() keeps its guarantees per page: no partly
-   * listed upload (but the one a stalled listing must get past), the next
-   * page starts right before the first upload this one left out, and an
-   * unreadable or malformed sidecar is left out, never an error.
+   * 1 + PAGE_READS R2 calls in all. listAll() keeps its guarantees per
+   * page: no partly listed upload (but the one a stalled listing must get
+   * past), the next page starts right before the first upload this one
+   * left out, and an unreadable or malformed sidecar is left out, never an
+   * error.
    */
   async listPage(
     after?: string,

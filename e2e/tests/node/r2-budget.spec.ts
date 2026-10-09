@@ -18,11 +18,12 @@ import { expect, test } from "../../lib/index.js";
 // The R2 calls of the listing (GET /api/uploads), the cron and the download
 // counter, counted on the Worker's own modules with an in-memory bucket that
 // follows R2's paging rules (at most 100 objects per list call with
-// metadata) and, like the Free plan, throws past 50 calls. `wrangler dev`
+// metadata) and throws past 50 calls (the limit assumed before phase 1H
+// measured 1,000 R2 calls and CPU as the binding limit). `wrangler dev`
 // enforces neither, so this cannot be seen end to end.
 //
-// GET /api/uploads makes one rate-limit call (Bearer) plus listAll(): at most
-// 1 + LIST_BUDGET = 41 subrequests.
+// listAll() with its default budget: at most LIST_BUDGET = 40 R2 calls.
+// GET /api/uploads lists one page (listPage(), r2-work-bounds.spec.ts).
 
 const PREFIX = "uploads";
 const DAY = 86_400_000;
@@ -514,7 +515,7 @@ test.describe("R2 calls of completing an upload of unknown size", () => {
       await uploads.deleteKeys(records.keys);
       return { outcome: "completed", subrequests: 1 + bucket.total };
     } catch {
-      // What the Free plan does past 50 subrequests: the request fails.
+      // Past 50 subrequests (the limit assumed before phase 1H), fail the request.
       const after = bucket.calls["complete"] ? " after complete" : "";
       const written = bucket.calls["put"] ? ", sidecar written" : "";
       return { outcome: `failed${after}${written}`, subrequests: 51 };

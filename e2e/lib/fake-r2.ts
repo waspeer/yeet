@@ -11,7 +11,8 @@
 //   with that etag (atomically) and returns null otherwise;
 // - each get, head, put, list, delete and multipart abort or complete is one
 //   subrequest.
-//   Past `maxCalls` (default 50, the Free plan's limit per invocation) a call
+//   Past `maxCalls` (default 50, the limit per invocation assumed until phase
+//   1H measured 1,000 R2 calls on the Free plan) a call
 //   throws, as the Workers runtime does.
 
 import type { Bucket } from "../../packages/worker/src/uploads.js";

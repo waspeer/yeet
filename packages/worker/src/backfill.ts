@@ -1,6 +1,6 @@
 // One-time migration: give every sidecar without a summary (yeet < 0.2,
-// rclone) its summary custom metadata in one go, instead of the cron's 21 per
-// day. Not part of the Worker: run from a machine with
+// rclone) its summary custom metadata in one go, instead of the cron's 10 per
+// hourly run. Not part of the Worker: run from a machine with
 // `scripts/backfill-summaries.mjs`, which binds the bucket through wrangler
 // (see there). This module holds the logic, on the same Bucket interface as
 // the Worker, so it is tested on the in-memory buckets of e2e/.

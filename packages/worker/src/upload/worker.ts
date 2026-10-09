@@ -182,7 +182,7 @@ class Upload {
     this.timers.clear();
   }
 
-  /** Best effort; the daily cleanup removes uploads left pending for 24 h. */
+  /** Best effort; the hourly cleanup removes uploads left pending for 24 h. */
   private async deleteOnServer(): Promise<void> {
     if (!this.id) return;
     try {
