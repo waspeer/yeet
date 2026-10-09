@@ -13,6 +13,7 @@ import {
   Uploads,
   type UploadMeta,
 } from "../../../packages/worker/src/uploads.js";
+import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { cli, expect, expectExitCode, test } from "../../lib/index.js";
@@ -313,6 +314,29 @@ test.describe("1I verifier: page walks of GET /api/uploads", () => {
     expect(seen.length).toBe(new Set(seen).size);
     const throughout = [...all].filter((id) => !removed.has(id));
     expect(throughout.filter((id) => !seen.includes(id))).toEqual([]);
+  });
+});
+
+test.describe("1I verifier: pinned constants and the guard's threshold", () => {
+  test("the documented bounds: 300 objects, 1 jump, 10 reads; 200 per cron list; hourly", async () => {
+    expect([PAGE_LIMIT, PAGE_JUMPS, PAGE_READS, CLEANUP_LIST_LIMIT, CLEANUP_SUMMARIES]).toEqual([
+      300, 1, 10, 200, 10,
+    ]);
+    const wrangler = await readFile(
+      new URL("../../../packages/worker/wrangler.jsonc", import.meta.url),
+      "utf-8",
+    );
+    expect(wrangler).toMatch(/"crons":\s*\["0 \* \* \* \*"\]/);
+  });
+
+  test("a short page holding 3 keys of the first upload returns it and moves past it", async () => {
+    const b = new ScriptedBucket({ ...REAL_R2_CAPS, maxCalls: Infinity });
+    seed(b, "a0", { junkAfter: 400 }); // .meta.json, f.bin, zz/0 … zz/399
+    seed(b, "b0");
+    b.script = (n) => (n === 0 ? 3 : undefined);
+    const page = await new Uploads(b, P).listPage();
+    expect(page.uploads.map((u) => u.id)).toEqual(["a0"]);
+    expect(page.next).toBe(`${P}/a00`);
   });
 });
 
