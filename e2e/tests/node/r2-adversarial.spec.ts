@@ -256,20 +256,25 @@ test.describe("adversarial cron", () => {
     const keep = new Map<string, number>();
     const stale = new Set<string>();
     // Round 1I: legacy records and part records scaled down (from 1,100,
-    // 1,300, 2,100, 1,500): a run now deletes at most 200 keys of an upload
+    // 1,300, 2,100, 1,500): a run now deletes at most CLEANUP_LIST_LIMIT keys of an upload
     // it lists on its own (one deleteUnder() round), so the original counts
     // took about 5,000 runs. Still several pages and runs per upload.
     for (let i = 0; i < 2500; i++) {
       const id = `c${String(i).padStart(4, "0")}`;
       const m = i % 9;
-      if (m === 0) (seed(b, id, { expired: true, records: i % 4 === 0 ? 400 : 0 }), stale.add(id));
-      else if (m === 1)
-        (seed(b, id, { pending: NOW - 2 * DAY, parts: i % 2 ? 500 : 2 }), stale.add(id));
-      else if (m === 2) seed(b, id, { records: i % 5 === 0 ? 700 : 150 });
+      if (m === 0) {
+        seed(b, id, { expired: true, records: i % 4 === 0 ? 400 : 0 });
+        stale.add(id);
+      } else if (m === 1) {
+        seed(b, id, { pending: NOW - 2 * DAY, parts: i % 2 ? 500 : 2 });
+        stale.add(id);
+      } else if (m === 2) seed(b, id, { records: i % 5 === 0 ? 700 : 150 });
       else if (m === 3) seed(b, id, { legacy: true });
       else if (m === 4) seed(b, id, { pending: NOW - 1000, parts: 600 });
-      else if (m === 5) (seed(b, id, { legacy: true, expired: true }), stale.add(id));
-      else seed(b, id, { filename: ["\u{1F600}", "-x", "é", "~"][i % 4] });
+      else if (m === 5) {
+        seed(b, id, { legacy: true, expired: true });
+        stale.add(id);
+      } else seed(b, id, { filename: ["\u{1F600}", "-x", "é", "~"][i % 4] });
       if (!stale.has(id)) keep.set(id, 0);
     }
     for (let i = 0; i < 5; i++)
@@ -292,7 +297,7 @@ test.describe("adversarial cron", () => {
       maxCalls = Math.max(maxCalls, r.subrequests);
       expect(r.subrequests).toBeLessThanOrEqual(CLEANUP_BUDGET);
       if (i % 10 !== 9) continue;
-      for (const [id, ks] of keepKeys)
+      for (const ks of keepKeys.values())
         for (const k of ks)
           if (!b.objects.has(k)) throw new Error(`valid key deleted: ${k} run ${i}`);
       const keys = b.sorted(`${P}/`);
@@ -425,8 +430,8 @@ test.describe("adversarial cron", () => {
     seed(b, "a0001", { pending: NOW - 2 * DAY, parts: 3 });
     seed(b, "a0002", { pending: NOW - 2 * DAY, parts: 2500 });
     seed(b, "a0003", { pending: NOW - DAY + 60_000, parts: 3 });
-    // Round 1I: a run deletes at most CLEANUP_LIST_LIMIT (200) keys of an
-    // upload it has to list on its own, so 2,500 parts take 13 runs.
+    // Round 1I: a run deletes at most CLEANUP_LIST_LIMIT keys of an upload it
+    // has to list on its own, so 2,500 parts take 13 runs at 200, 25 at 100.
     await runs(b, runsAt200(16));
     // Round 1I: an abandoned upload whose deletion takes several runs has
     // its (already aborted) multipart upload aborted again in each, 1 call.

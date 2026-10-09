@@ -1,4 +1,8 @@
-import { CLEANUP_BUDGET, runCleanup } from "../../../packages/worker/src/cleanup.js";
+import {
+  CLEANUP_BUDGET,
+  CLEANUP_SUMMARIES,
+  runCleanup,
+} from "../../../packages/worker/src/cleanup.js";
 import {
   canStoreSummary,
   MAX_SUMMARY_BYTES,
@@ -331,8 +335,12 @@ test.describe("1H verifier: MAX_SUMMARY_BYTES", () => {
       `${P}/zz/.meta.json`,
       JSON.stringify({ ...base, filename: "f.bin", expires_at: iso(NOW - 1) }),
     );
+    // Each over-cap sidecar takes one of a run's CLEANUP_SUMMARIES attempts
+    // (round 1K: 3 a run, so 20 runs; it was 6 at 10 a run), then one more
+    // run reaches zz.
+    const maxRuns = Math.ceil(60 / CLEANUP_SUMMARIES) + 1;
     let runs = 0;
-    while (b.sorted(`${P}/zz/`).length > 0 && runs < 20) {
+    while (b.sorted(`${P}/zz/`).length > 0 && runs < maxRuns + 1) {
       b.reset();
       b.maxCalls = CLEANUP_BUDGET;
       const r = await runCleanup(b, P, NOW);
@@ -340,7 +348,7 @@ test.describe("1H verifier: MAX_SUMMARY_BYTES", () => {
       runs++;
     }
     console.log(`over-cap: expired upload reached after ${runs} runs`);
-    expect(runs).toBeLessThan(20);
+    expect(runs).toBeLessThanOrEqual(maxRuns);
     expect(b.sorted(`${P}/a`)).toHaveLength(120);
   });
 });
@@ -373,10 +381,11 @@ test.describe("1H verifier: malformed sidecars", () => {
     const l = await u.listAll();
     for (const x of l.uploads) if (x.id !== "zz") expect(x.meta, x.id).toBeNull();
     for (const id of Object.keys(bad)) expect(await u.recordDownload(id, iso(NOW)), id).toBe(false);
-    // Round 1I: a run tries at most CLEANUP_SUMMARIES (10) sidecars without
-    // a summary, so the malformed ones before zz take two runs.
+    // Round 1I: a run tries at most CLEANUP_SUMMARIES sidecars without a
+    // summary, so the malformed ones and zz take this many runs.
     let deleted = 0;
-    for (let run = 0; run < 2; run++) {
+    const runs = Math.ceil((Object.keys(bad).length + 1) / CLEANUP_SUMMARIES);
+    for (let run = 0; run < runs; run++) {
       b.reset();
       b.maxCalls = CLEANUP_BUDGET;
       deleted += (await runCleanup(b, P, NOW)).deleted;

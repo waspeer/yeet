@@ -173,8 +173,8 @@ Rules of thumb:
   minutes or more. The cleanup also deletes legacy `.downloads/` records and
   adds the summary custom metadata to sidecars without one, so a test that
   seeds or inspects either holds the same lock. A cron run handles one
-  bounded slice of the bucket (about 100 uploads, at most 10 summaries, at
-  most about 200 keys of one upload it lists on its own), and the test
+  bounded slice of the bucket (about 50 uploads, at most 3 summaries, at
+  most about 100 keys of one upload it lists on its own), and the test
   bucket is shared by every test of the run, so one run rarely gets
   through it: wait for an effect with `cronUntil(check)`, which triggers
   runs until `check` holds, rather than one `triggerCron()` and
@@ -185,7 +185,8 @@ Rules of thumb:
   `wrangler dev`, which returns at most 100 objects per list call);
   `listUploads()` follows the cursors and returns all of them.
 - CPU is what limits a request and a cron run on the Free plan (measured,
-  see "Measurements (phase 1H)" in `docs/design/api.md`), and `wrangler dev`
+  see "Measurements (phase 1H)" and "(phase 1J)" in `docs/design/api.md`),
+  and `wrangler dev`
   enforces no limit. As a stand-in, the work of one `GET /api/uploads` page
   and one cron run (objects listed, list calls, reads, R2 calls) is asserted
   on the Worker's modules with in-memory buckets
@@ -297,8 +298,9 @@ These talk to wrangler's Local Explorer API
 - `cronUntil(check, { message?, maxRuns = CRON_RUNS, perRunMs = 1500 })` → the
   runs it took: triggers a run, polls `check` for up to `perRunMs`, and triggers
   the next until `check` holds (one run handles one slice of the shared bucket).
-  `CRON_RUNS` is 40 at a `CLEANUP_LIST_LIMIT` of 200 and grows if the limit is
-  lowered; `CRON_TEST_TIMEOUT_MS` is a test timeout with room for that many.
+  `CRON_RUNS` is 80 at a `CLEANUP_LIST_LIMIT` of 100 (40 at round 1I's 200)
+  and grows if the limit is lowered; `CRON_TEST_TIMEOUT_MS` is a test timeout
+  with room for that many (150 s at 80 runs).
 
 ### Fixtures — `fixtures.ts`
 

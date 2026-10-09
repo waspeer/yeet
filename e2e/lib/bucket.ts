@@ -189,8 +189,9 @@ export const CRON_TEST_TIMEOUT_MS = Math.max(60_000, CRON_RUNS * 1500 + 30_000);
 /**
  * Run the cleanup until `check` holds: trigger a run, poll `check` for up to
  * `perRunMs`, and trigger the next if it does not hold yet, up to `maxRuns`
- * runs. Each run handles one bounded slice of the bucket (about 150
- * uploads), and the test bucket is shared by every test of the run, so an
+ * runs. Each run handles one bounded slice of the bucket (about
+ * CLEANUP_LIST_LIMIT / 2 uploads, fewer behind sidecars without a summary:
+ * CLEANUP_SUMMARIES of those a run), and the test bucket is shared by every test of the run, so an
  * upload may need a few runs to be reached; a run that has finished its
  * slice and saved its cursor makes the next one continue after it.
  */

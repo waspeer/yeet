@@ -490,8 +490,9 @@ interface UploadsPage {
 }
 
 /**
- * The most pages `yeet list` fetches. A page holds about 150 uploads (at
- * least 10), so this is far beyond any real bucket; it stops a server that
+ * The most pages `yeet list` fetches. A page holds about 75 uploads (at
+ * least 5), so 1,000 pages are about 74,000 uploads, or 5,000 sidecars of
+ * yeet < 0.2 without a summary; it stops a server that
  * keeps answering with more pages from keeping the CLI busy forever.
  */
 const MAX_LIST_PAGES = 1000;

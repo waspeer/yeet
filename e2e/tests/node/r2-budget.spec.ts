@@ -348,7 +348,7 @@ test.describe("R2 calls of the cron", () => {
     const bucket = new FakeBucket();
     const ids = Array.from({ length: 300 }, (_, i) => idOf(i));
     for (const id of ids) seedUpload(bucket, id, { legacySidecar: true });
-    // Round 1I: CLEANUP_SUMMARIES (10) a run, no longer as many as the
+    // Round 1I: CLEANUP_SUMMARIES (3 since 1K) a run, no longer as many as the
     // budget of 45 calls allows ((45 - 3) / 2 = 21 before).
     const perRun = CLEANUP_SUMMARIES;
     let done = 0;
@@ -377,7 +377,9 @@ test.describe("R2 calls of the cron", () => {
       ids.filter(
         (id) => !bucket.objects.get(`${PREFIX}/${id}/.meta.json`)!.customMetadata["summary"],
       );
-    for (let run = 0; run < 60 && unsummarized().length > 0; run++) {
+    // 60 runs at 10 summaries a run; scaled for fewer (round 1K: 3).
+    const maxRuns = 3 * Math.ceil(200 / CLEANUP_SUMMARIES);
+    for (let run = 0; run < maxRuns && unsummarized().length > 0; run++) {
       bucket.resetCalls();
       const report = await runCleanup(bucket, PREFIX, NOW);
       expect(report.subrequests).toBeLessThanOrEqual(CLEANUP_BUDGET);

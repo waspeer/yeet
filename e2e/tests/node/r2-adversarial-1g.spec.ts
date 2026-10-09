@@ -176,9 +176,12 @@ test.describe("1G verifier: cron on adversarial buckets", () => {
       seedUpload(b, `a${String(i).padStart(5, "0")}`, { unreadable: true });
     for (let i = 0; i < 300; i++)
       seedUpload(b, `b${String(i).padStart(5, "0")}`, { expired: true, legacy: i % 2 === 0 });
-    const { run, maxCalls } = await runUntil(b, 500, () => b.sorted(`${P}/b`).length === 0);
+    // Each unreadable sidecar takes one of a run's CLEANUP_SUMMARIES attempts
+    // (1,000 runs at 3 a run, 300 at 10), then the stale uploads.
+    const maxRuns = Math.ceil(3000 / CLEANUP_SUMMARIES) + runsAt200(200);
+    const { run, maxCalls } = await runUntil(b, maxRuns, () => b.sorted(`${P}/b`).length === 0);
     console.log(`unreadable run: ${run} runs, max ${maxCalls}`);
-    expect(run).toBeLessThan(500);
+    expect(run).toBeLessThan(maxRuns);
     expect(b.sorted(`${P}/a`).length).toBe(6000);
   });
 
@@ -243,7 +246,8 @@ test.describe("1G verifier: cron on adversarial buckets", () => {
       const next = withDownload(cur, new Date(NOW).toISOString());
       b.seed(key, JSON.stringify(next), { summary: JSON.stringify(summarize(next)) });
     };
-    await runCleanup(b, P, NOW);
+    // CLEANUP_SUMMARIES a run (round 1K: 3), so as many runs as that takes.
+    for (let run = 0; run < Math.ceil(10 / CLEANUP_SUMMARIES); run++) await runCleanup(b, P, NOW);
     for (let i = 0; i < 10; i++) {
       const o = b.objects.get(`${P}/r${i}/.meta.json`)!;
       expect(JSON.parse(o.body).download_count, `r${i}`).toBe(1);
@@ -252,7 +256,7 @@ test.describe("1G verifier: cron on adversarial buckets", () => {
   });
 
   test(`e2e/README claim: one run does everything with at most ${CLEANUP_SUMMARIES} unsummarized sidecars`, async () => {
-    // Round 1I: a run gives at most CLEANUP_SUMMARIES (10) sidecars their
+    // Round 1I: a run gives at most CLEANUP_SUMMARIES (3 since 1K) sidecars their
     // summary (it was 21, as many as the old budget of 45 calls allowed).
     const n = CLEANUP_SUMMARIES;
     const results: Record<number, { summarized: number; deleted: number; cursor: string | null }> =

@@ -125,25 +125,32 @@ download the same file at the same moment, a few may be missed, never
 counted twice.
 
 On the free plan a Worker gets 10 ms of CPU per request, and listing costs
-CPU for every upload listed (measured: about 20 to 40 ms per 1,000). So
-the server lists your uploads in pages of about 150, one small request
-each, and `yeet list` fetches every page and shows them all, newest first.
-A page that fails (Cloudflare answers 503 when a Worker uses too much CPU)
-is retried a few times; if it keeps failing, `yeet list` shows what it has
-and says so. An older yeet CLI shows only the first page, with a note
-that only part of your uploads is shown.
+CPU for every upload listed (measured: about 1.7 ms per request plus 40 µs
+per upload). So the server lists your uploads in pages of about 75, one
+small request each, and `yeet list` fetches every page and shows them all,
+newest first. A page that fails (Cloudflare answers 503 when a Worker uses
+too much CPU) is retried a few times; if it keeps failing, `yeet list`
+shows what it has and says so, and when to try again if the server said.
+An older yeet CLI shows only the first page, with a note that only part of
+your uploads is shown.
 
-The cleanup runs every hour and goes through about 100 uploads per run,
-so a bucket of 5,000 uploads is gone through in about two days. Expired
-files can no longer be downloaded the moment they expire; the cleanup only
-frees their storage.
+The cleanup runs every hour and goes through about 50 uploads per run, so
+a bucket of 5,000 uploads is gone through in about four days. Expired files
+can no longer be downloaded the moment they expire; the cleanup only frees
+their storage.
 
 Uploads made with a yeet older than 0.2 cost the listing a storage call
-each (pages of them hold 10) until the cleanup has updated them, 10 per
-run; with more than 10,000 of them, `yeet list` stops at its limit of
-1,000 pages and shows only part until they are. To update them all at once, see "Migrating a bucket of yeet < 0.2" in
-[docs/design/api.md](docs/design/api.md). These figures are estimates
-until measured on a real deploy; see "Measurements (phase 1H)" there.
+each (pages of them hold 5) until the cleanup has updated them, 3 per run;
+with more than 5,000 of them, `yeet list` stops at its limit of 1,000 pages
+and shows only part until they are. To update them all at once, see
+"Migrating a bucket of yeet < 0.2" in [docs/design/api.md](docs/design/api.md).
+The page and cleanup sizes were lowered after measuring the earlier, larger
+ones on the free plan; the CPU of the new sizes is estimated from those
+measurements (see "Measurements (phase 1J)" there).
+
+The CLI and the upload page always tell the server a file's size up
+front. A client of the API that does not can complete an upload of at most
+300 parts (about 15.7 GB).
 
 ## Security notes
 
@@ -162,8 +169,8 @@ until measured on a real deploy; see "Measurements (phase 1H)" there.
 - After a correct password, the browser gets a cookie for that file for up to
   24 hours, so it is not asked again.
 - Passwords are hashed with PBKDF2-SHA256 (20,000 iterations): a check costs
-  8 ms CPU median, 13 ms at p90 (measured on the free plan). The hash is
-  stored in your private bucket.
+  8 to 13 ms CPU median, 13 to 20 ms at p90 (measured on the free plan, in
+  two sessions). The hash is stored in your private bucket.
 - After the password check, the browser gets a signed download link that works
   without the password until it expires (at most `DOWNLOAD_URL_TTL`).
 - Anyone with the share link can see the file name and size, even for

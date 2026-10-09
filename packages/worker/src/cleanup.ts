@@ -19,7 +19,7 @@ import { isExpired, summarize, Uploads, type Bucket, type ListedUpload } from ".
  * R2 calls a cleanup run may make at most. Not the binding limit any more
  * (Workers allow 1,000 R2 calls per invocation; CPU binds long before), but
  * a second guard on top of the bounds below: a run's own work needs at most
- * 31 calls (the cursor's read and write, two lists, 2 × CLEANUP_SUMMARIES,
+ * 17 calls (the cursor's read and write, two lists, 2 × CLEANUP_SUMMARIES,
  * DELETE_UNDER_CALLS and up to 4 batch deletes) besides aborting abandoned
  * multipart uploads (1 call each), which this caps.
  */
@@ -30,15 +30,13 @@ export const CLEANUP_BUDGET = 45;
  * slice of the bucket (with metadata), the jump over a `.downloads/` or
  * `.parts/` run it may make (CLEANUP_JUMPS), and the one round of
  * deleteUnder() it may make (without metadata). So a run examines at most
- * 3 × 200 = 600 objects, usually 200: about 100 finished uploads. Lower than
- * a page of GET /api/uploads (PAGE_LIMIT) because a run may list three
- * times; inferred from the phase 1H cron runs (141 to 179 ms for 25 list
- * calls): about 14.8 to 17.3 µs CPU per object listed, so 600 objects ≈
- * 8.9 to 10.4 ms, and at least 0.7 to 1.3 ms per summary written. Not
- * measured: to be measured on a real deploy, and lowered here (or
- * CLEANUP_SUMMARIES) if need be; tests derive what they expect from it.
+ * 3 × 100 = 300 objects, usually 100: about 50 finished uploads. Measured
+ * in phase 1J on Workers Free at 200: p50 6 to 7 ms CPU for a plain run or
+ * one with deletes, 12 (p90 14) for a run with a deleteUnder() round (600
+ * objects); a fit of about 2.9 ms plus 15 µs per object listed. Lowered to
+ * 100 for headroom; tests derive what they expect from it.
  */
-export const CLEANUP_LIST_LIMIT = 200;
+export const CLEANUP_LIST_LIMIT = 100;
 
 /**
  * List calls a run may add to jump over the rest of a `.downloads/` or
@@ -49,10 +47,11 @@ export const CLEANUP_JUMPS = 1;
 
 /**
  * Sidecars without a summary a run gives theirs (a read and a conditional
- * write each). Hourly, that is 240 a day; a bucket of many more is migrated
- * faster with the one-time script (scripts/backfill-summaries.mjs).
+ * write each, about 1.26 ms CPU each in phase 1J: 10 took p50 19, p90 22 ms
+ * a run). Hourly, 3 a run is 72 a day; a bucket of many more is migrated
+ * with the one-time script (scripts/backfill-summaries.mjs).
  */
-export const CLEANUP_SUMMARIES = 10;
+export const CLEANUP_SUMMARIES = 3;
 
 /**
  * R2 calls of the one deleteUnder() a run may make, for an upload whose
