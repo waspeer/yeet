@@ -611,8 +611,14 @@ per list call, so it shows 49 per page.
 **`yeet list`** fetches every page, one request after the other, and
 prints all uploads newest first. A page that fails with a network error,
 5xx (503 is what Cloudflare answers over the CPU limit) or 429 is retried
-with backoff (1, 2 and 4 s); if it still fails, `yeet list` prints what it
-has with a note and exits 1 (if the first page fails, that is the error).
+with backoff (1, 2 and 4 s), or after the server's `Retry-After` if it
+sent one; one longer than 10 s is not waited for (since round 1J: a
+`429` after too many wrong tokens asks for up to a minute, which the
+backoff used to retry anyway). If it still fails, or answers with
+something that is not a page (a `200` that is not JSON, say), `yeet list`
+prints what it has with a note (saying when to try again, for a `429`)
+and exits 1; if the first page fails, that is the error. (Before round
+1J a later page that was not JSON was an error that printed nothing.)
 It fetches at most 1,000 pages, so a server that keeps answering with a
 cursor cannot keep it busy forever. Tested against a stand-in server in
 `e2e/tests/node/cli.spec.ts`, and end to end in `list-pages.spec.ts`.

@@ -614,7 +614,10 @@ test.describe("1I verifier: yeet list against a stand-in server", () => {
     url: `http://127.0.0.1/v${n}/g${n}.bin`,
   });
 
-  type Reply = { status: number; body: unknown } | "reset" | "garbage";
+  type Reply =
+    | { status: number; body: unknown; headers?: Record<string, string> }
+    | "reset"
+    | "garbage";
   async function withServer(
     handler: (cursor: string | null, attempt: number) => Reply,
     run: (
@@ -632,7 +635,7 @@ test.describe("1I verifier: yeet list against a stand-in server", () => {
         res.writeHead(200, { "Content-Type": "text/html" });
         return void res.end("<html>not json</html>");
       }
-      res.writeHead(reply.status, { "Content-Type": "application/json" });
+      res.writeHead(reply.status, { "Content-Type": "application/json", ...reply.headers });
       res.end(JSON.stringify(reply.body));
     });
     await new Promise<void>((resolve) => fake.listen(0, "127.0.0.1", resolve));
@@ -689,7 +692,9 @@ test.describe("1I verifier: yeet list against a stand-in server", () => {
     );
   });
 
-  test("a later page that is not JSON: an error, exit 1", async () => {
+  // Before round 1J: "does not understand" on stderr, exit 1 and nothing on
+  // stdout, the pages already fetched thrown away.
+  test("a later page that is not JSON: partial output with a note, exit 1", async () => {
     await withServer(
       (cursor) => (cursor === null ? page(0, "two") : "garbage"),
       async (env, log) => {
@@ -697,7 +702,77 @@ test.describe("1I verifier: yeet list against a stand-in server", () => {
         console.log(
           `not JSON on page 2: exit ${r.code}, requests ${log.length}, stdout ${JSON.stringify(r.stdout.slice(0, 80))}, stderr ${JSON.stringify(r.stderr.slice(0, 120))}`,
         );
-        expect(r.code).toBe(1);
+        expectExitCode(r, 1);
+        expect(log).toHaveLength(2);
+        expect(r.stdout).toContain("g0.bin");
+        expect(r.stdout).toContain("2 files");
+        expect(r.stdout).toContain("only part of your uploads is shown");
+        expect(r.stdout).toContain("does not understand");
+      },
+    );
+  });
+
+  test("a first page that is not JSON is still an error", async () => {
+    await withServer(
+      () => "garbage",
+      async (env) => {
+        const r = await cli(["list"], { env });
+        expectExitCode(r, 1);
+        expect(r.stdout).toBe("");
+        expect(r.stderr).toContain("does not understand");
+      },
+    );
+  });
+
+  // Before round 1J the CLI retried a 429 after 1, 2 and 4 s whatever its
+  // Retry-After, adding about 7 s before the same error.
+  test("a 429 with a long Retry-After on page 2: no retry, partial output saying when", async () => {
+    await withServer(
+      (cursor) =>
+        cursor === null
+          ? page(0, "two")
+          : {
+              status: 429,
+              body: { error: "Too many attempts, retry in 900 s" },
+              headers: { "Retry-After": "900" },
+            },
+      async (env, log) => {
+        const started = Date.now();
+        const r = await cli(["list"], { env });
+        const took = Date.now() - started;
+        console.log(`429 with Retry-After 900: ${log.length} requests, ${took} ms`);
+        expectExitCode(r, 1);
+        expect(log).toHaveLength(2);
+        expect(took).toBeLessThan(5000);
+        expect(r.stdout).toContain("2 files");
+        expect(r.stdout).toContain("only part of your uploads is shown");
+        expect(r.stdout).toContain("Try again in 900 seconds");
+      },
+    );
+  });
+
+  test("a 429 with a short Retry-After on page 2: retried after that long", async () => {
+    test.setTimeout(30_000);
+    await withServer(
+      (cursor, attempt) =>
+        cursor === null
+          ? page(0, "two")
+          : attempt === 1
+            ? {
+                status: 429,
+                body: { error: "Too many attempts, retry in 3 s" },
+                headers: { "Retry-After": "3" },
+              }
+            : page(1, null),
+      async (env, log) => {
+        const r = await cli(["list"], { env });
+        expectExitCode(r, 0);
+        expect(log.map((l) => l.cursor)).toEqual([null, "two", "two"]);
+        const gap = log[2]!.at - log[1]!.at;
+        console.log(`429 with Retry-After 3: retried after ${gap} ms`);
+        expect(gap).toBeGreaterThanOrEqual(3000 - 50);
+        expect(gap).toBeLessThan(4000);
+        expect(r.stdout).toContain("4 files");
       },
     );
   });
