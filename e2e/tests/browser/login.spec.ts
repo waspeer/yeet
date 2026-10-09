@@ -86,9 +86,23 @@ test.describe("upload page login", () => {
         body: JSON.stringify({ parts: [await part.json()] }),
       });
       statuses.complete = complete.status;
-      const list = await fetch("/api/uploads");
-      statuses.list = list.status;
-      const listed = (await list.json()).uploads.find((u: { id: string }) => u.id === id);
+      // Every page of the listing (round 1I: one page per request; the
+      // shared test bucket may hold the new upload on any of them).
+      let listed: { file_size: number } | undefined;
+      let cursor: string | null = null;
+      for (let page = 0; page < 100 && !listed; page++) {
+        const list = await fetch(
+          cursor === null ? "/api/uploads" : `/api/uploads?cursor=${encodeURIComponent(cursor)}`,
+        );
+        statuses.list = Math.max(statuses.list ?? 0, list.status);
+        const body = (await list.json()) as {
+          uploads: { id: string; file_size: number }[];
+          cursor: string | null;
+        };
+        listed = body.uploads.find((u) => u.id === id);
+        if (body.cursor === null) break;
+        cursor = body.cursor;
+      }
       const removed = await fetch(`/api/uploads/${id}`, { method: "DELETE" });
       statuses.delete = removed.status;
       return { statuses, size: listed?.file_size };

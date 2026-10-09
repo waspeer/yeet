@@ -216,10 +216,10 @@ test.describe("hourly cleanup (cron)", () => {
       ]);
 
       // The listing still answers, without the malformed one.
+      // (Every page of it: listUploads() fails on any status but 2xx.)
       const res = await api("/api/uploads");
       expect(res.status, await res.clone().text()).toBe(200);
-      const { uploads } = (await res.json()) as { uploads: { id: string }[] };
-      expect(uploads.map((u) => u.id)).not.toContain(bad);
+      expect((await listUploads()).map((u) => u.id)).not.toContain(bad);
 
       // An upload that is not expired with an oversized sidecar is listed
       // (its sidecar read) and keeps no summary after a cron run.
