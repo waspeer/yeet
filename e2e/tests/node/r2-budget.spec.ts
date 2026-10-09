@@ -25,6 +25,10 @@ import { expect, test } from "../../lib/index.js";
 // listAll() with its default budget: at most LIST_BUDGET = 40 R2 calls.
 // GET /api/uploads lists one page (listPage(), r2-work-bounds.spec.ts).
 
+// Run counts below were set for round 1I's CLEANUP_LIST_LIMIT of 200; a run
+// does work in proportion to the limit, so they scale with it (round 1J:
+// lowering the limit after a measurement must need no test change).
+const runsAt200 = (runs: number) => Math.ceil((runs * 200) / CLEANUP_LIST_LIMIT);
 const PREFIX = "uploads";
 const DAY = 86_400_000;
 const NOW = Date.UTC(2026, 9, 8, 3);
@@ -303,7 +307,7 @@ test.describe("R2 calls of the cron", () => {
     console.log(`large bucket: clean after ${runs} runs`);
     // Round 1I: 133 runs (13 before): a run lists 200 objects (100 on this
     // bucket) and deletes at most 200 legacy records, not up to 45 calls' worth.
-    expect(runs).toBeLessThanOrEqual(140);
+    expect(runs).toBeLessThanOrEqual(runsAt200(140));
     // Nothing current was deleted, and every sidecar now has its summary.
     for (const id of keep) {
       const sidecar = bucket.objects.get(`${PREFIX}/${id}/.meta.json`);

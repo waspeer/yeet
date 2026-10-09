@@ -347,10 +347,17 @@ test.describe("1I verifier: page walks of GET /api/uploads", () => {
 });
 
 test.describe("1I verifier: pinned constants and the guard's threshold", () => {
-  test("the documented bounds: 300 objects, 1 jump, 10 reads; 200 per cron list; hourly", async () => {
-    expect([PAGE_LIMIT, PAGE_JUMPS, PAGE_READS, CLEANUP_LIST_LIMIT, CLEANUP_SUMMARIES]).toEqual([
-      300, 1, 10, 200, 10,
-    ]);
+  // Since round 1J this checks that api.md states the constants' values
+  // rather than pinning the values themselves: PAGE_LIMIT and
+  // CLEANUP_LIST_LIMIT may be lowered after the next measurement on a real
+  // deploy, with a change of the constant (and of the docs) only.
+  test("the documented bounds match the constants; hourly", async () => {
+    const doc = await readFile(new URL("../../../docs/design/api.md", import.meta.url), "utf-8");
+    expect(doc).toContain(`\`limit: ${PAGE_LIMIT}\` (\`PAGE_LIMIT\`)`);
+    expect(doc).toContain(`\`limit: ${CLEANUP_LIST_LIMIT}\` (\`CLEANUP_LIST_LIMIT\``);
+    expect(doc).toContain(`**At most ${PAGE_READS} reads**`);
+    expect(doc).toContain(`at most **${CLEANUP_SUMMARIES} per`);
+    expect(PAGE_JUMPS).toBe(1); // "at most one more list call" in the docs
     const wrangler = await readFile(
       new URL("../../../packages/worker/wrangler.jsonc", import.meta.url),
       "utf-8",

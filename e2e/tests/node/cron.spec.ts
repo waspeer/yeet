@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import {
+  CRON_TEST_TIMEOUT_MS,
   api,
   deleteUpload,
   downloadBytes,
@@ -89,6 +90,7 @@ test.describe("expiry at request time (no cron)", () => {
 });
 
 test.describe("hourly cleanup (cron)", () => {
+  test.describe.configure({ timeout: CRON_TEST_TIMEOUT_MS });
   test("removes an upload once it has expired", () =>
     exclusive("cron", async () => {
       const { id, url } = await uploadViaApi({

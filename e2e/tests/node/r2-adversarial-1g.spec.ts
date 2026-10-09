@@ -1,4 +1,4 @@
-import { CLEANUP_BUDGET, CLEANUP_SUMMARIES, runCleanup } from "../../../packages/worker/src/cleanup.js";
+import { CLEANUP_BUDGET, CLEANUP_LIST_LIMIT, CLEANUP_SUMMARIES, runCleanup } from "../../../packages/worker/src/cleanup.js";
 import { backfillSummaries } from "../../../packages/worker/src/backfill.js";
 import {
   LIST_BUDGET,
@@ -18,6 +18,10 @@ import { StrictBucket, seededRandom } from "../../lib/strict-r2.js";
 // as documented in docs/design/api.md. Round 1H added the malformed and
 // oversized sidecar cases.
 
+// Run counts below were set for round 1I's CLEANUP_LIST_LIMIT of 200; a run
+// does work in proportion to the limit, so they scale with it (round 1J:
+// lowering the limit after a measurement must need no test change).
+const runsAt200 = (runs: number) => Math.ceil((runs * 200) / CLEANUP_LIST_LIMIT);
 const P = "uploads";
 const DAY = 86_400_000;
 const NOW = Date.UTC(2026, 9, 8, 3);
@@ -173,10 +177,10 @@ test.describe("1G verifier: cron on adversarial buckets", () => {
     for (let i = 0; i < 30; i++) { seedUpload(b, `a${i}`, { legacy: true }); b.live.add(`a${i}`); }
     seedUpload(b, "big", { expired: true, junkAfter: 30000, records: 3000 });
     for (let i = 0; i < 30; i++) { seedUpload(b, `c${i}`, { legacy: true }); b.live.add(`c${i}`); }
-    const { run } = await runUntil(b, 250, () => b.sorted(`${P}/big/`).length === 0);
+    const { run } = await runUntil(b, runsAt200(250), () => b.sorted(`${P}/big/`).length === 0);
     console.log(`big stale upload gone after ${run} runs`);
     expect(b.violations).toEqual([]);
-    expect(run).toBeLessThan(250);
+    expect(run).toBeLessThan(runsAt200(250));
   });
 
   test("one stale upload whose 30,000 non-bulk keys sort BEFORE its sidecar (not a yeet upload)", async () => {

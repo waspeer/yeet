@@ -1,9 +1,11 @@
 import {
   CLEANUP_BUDGET,
+  CLEANUP_LIST_LIMIT,
   CLEANUP_SUMMARIES,
   runCleanup,
 } from "../../../packages/worker/src/cleanup.js";
 import {
+  PAGE_LIMIT,
   PAGE_READS,
   summarize,
   Uploads,
@@ -25,6 +27,11 @@ const P = "uploads";
 const NOW = Date.UTC(2026, 9, 8, 3);
 const DAY = 86_400_000;
 const N = 5000;
+// Uploads (2 objects each) a page and a run list, minus the last one, left
+// for the next: 149 and 99 at the limits of round 1I. From the constants, so
+// that lowering them (see "To measure next" in api.md) needs no test change.
+const PER_PAGE = Math.floor(PAGE_LIMIT / 2) - 1;
+const PER_RUN = Math.floor(CLEANUP_LIST_LIMIT / 2) - 1;
 
 function seed(b: StrictBucket, id: string, legacy: boolean, expired: boolean) {
   const meta: UploadMeta = {
@@ -83,14 +90,20 @@ async function runsToFinish(b: StrictBucket) {
 }
 
 test.describe("capacity, 5,000 uploads", () => {
-  test("with summaries: 34 pages of 149 uploads; the cron is done in 51 runs", async () => {
+  test(`with summaries: pages of ${PER_PAGE} uploads; the cron is done in ceil(N / ${PER_RUN}) runs`, async () => {
     const b = bucketOf(false);
-    expect(await pages(b)).toEqual({ count: 34, first: 149 });
+    // Pages of PER_PAGE until the rest fits one page (PER_PAGE + 1 uploads):
+    // 34 pages at the limits of round 1I.
+    expect(await pages(b)).toEqual({
+      count: Math.ceil((N - (PER_PAGE + 1)) / PER_PAGE) + 1,
+      first: PER_PAGE,
+    });
     const { runs, first } = await runsToFinish(b);
     console.log(`with summaries: first run ${JSON.stringify(first)}; runs to finish ${runs}`);
-    // 200 objects a run: 99 uploads, the last one left for the next run.
-    expect(first).toMatchObject({ deleted: 9, summarized: 0 });
-    expect(runs).toBe(Math.ceil(N / 99));
+    // CLEANUP_LIST_LIMIT objects a run: PER_RUN uploads, the last one left
+    // for the next run; every tenth of them expired (9 of 99).
+    expect(first).toMatchObject({ deleted: Math.floor(PER_RUN / 10), summarized: 0 });
+    expect(runs).toBe(Math.ceil(N / PER_RUN));
   });
 
   test(`old sidecars: ${PAGE_READS} uploads a page; the cron adds ${CLEANUP_SUMMARIES} summaries a run`, async () => {

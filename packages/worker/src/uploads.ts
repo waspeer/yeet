@@ -87,10 +87,12 @@ export const LIST_BUDGET = 40;
  * Objects one page of GET /api/uploads lists: the `limit` of its list call
  * (with custom metadata). About 150 finished uploads (2 objects each). Real
  * R2 returns up to about 415 objects per such call (measured in phase 1H),
- * so this is the bound, not R2. Chosen from the phase 1H measurement of
- * 27 to 47 µs CPU per upload listed: 150 uploads ≈ 4 to 7 ms, which leaves
- * room for the rest of the request within the Free plan's 10 ms. An
- * estimate until measured on a real deploy.
+ * so this is the bound, not R2. Chosen from the phase 1H summary of 27 to
+ * 47 µs CPU per upload listed (150 uploads ≈ 4 to 7 ms); recomputed with a
+ * fixed cost per request (27 to 71 µs per upload plus 1 to 6 ms), a page is
+ * about 6 to 13 ms, possibly over the Free plan's 10 ms. An inference, not
+ * a measurement: to be measured on a real deploy, and lowered here if need
+ * be (tests derive what they expect from it).
  */
 export const PAGE_LIMIT = 300;
 

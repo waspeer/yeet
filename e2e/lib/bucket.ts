@@ -3,6 +3,7 @@
 // This bypasses the Worker entirely, so tests can seed objects the Worker
 // never wrote (legacy uploads) and check what really is in storage.
 
+import { CLEANUP_LIST_LIMIT } from "../../packages/worker/src/cleanup.js";
 import { server } from "./env.js";
 
 export interface BucketObject {
@@ -175,6 +176,17 @@ export async function triggerCron(cron = "0 * * * *"): Promise<void> {
 }
 
 /**
+ * Cron runs cronUntil() triggers at most by default: 40 at round 1I's
+ * CLEANUP_LIST_LIMIT of 200, more if the limit is lowered (a run then gets
+ * through less of the shared test bucket), so that lowering it needs no
+ * test change.
+ */
+export const CRON_RUNS = Math.ceil((40 * 200) / CLEANUP_LIST_LIMIT);
+
+/** A test timeout with room for cronUntil()'s default runs. */
+export const CRON_TEST_TIMEOUT_MS = Math.max(60_000, CRON_RUNS * 1500 + 30_000);
+
+/**
  * Run the cleanup until `check` holds: trigger a run, poll `check` for up to
  * `perRunMs`, and trigger the next if it does not hold yet, up to `maxRuns`
  * runs. Each run handles one bounded slice of the bucket (about 150
@@ -184,7 +196,7 @@ export async function triggerCron(cron = "0 * * * *"): Promise<void> {
  */
 export async function cronUntil(
   check: () => Promise<unknown>,
-  { message = "condition", maxRuns = 40, perRunMs = 1500 } = {},
+  { message = "condition", maxRuns = CRON_RUNS, perRunMs = 1500 } = {},
 ): Promise<number> {
   for (let run = 1; run <= maxRuns; run++) {
     await triggerCron();

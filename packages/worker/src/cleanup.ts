@@ -32,9 +32,11 @@ export const CLEANUP_BUDGET = 45;
  * deleteUnder() it may make (without metadata). So a run examines at most
  * 3 × 200 = 600 objects, usually 200: about 100 finished uploads. Lower than
  * a page of GET /api/uploads (PAGE_LIMIT) because a run may list three
- * times; the phase 1H cron runs cost about 15 µs CPU per object listed
- * (141 to 179 ms for 25 list calls), so 600 objects ≈ 9 ms. An estimate
- * until measured on a real deploy.
+ * times; inferred from the phase 1H cron runs (141 to 179 ms for 25 list
+ * calls): about 14.8 to 17.3 µs CPU per object listed, so 600 objects ≈
+ * 8.9 to 10.4 ms, and at least 0.7 to 1.3 ms per summary written. Not
+ * measured: to be measured on a real deploy, and lowered here (or
+ * CLEANUP_SUMMARIES) if need be; tests derive what they expect from it.
  */
 export const CLEANUP_LIST_LIMIT = 200;
 
