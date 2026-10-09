@@ -1,6 +1,8 @@
 import {
+  encodeListCursor,
   isBearerAttempt,
   parseExpiry,
+  parseListCursor,
   rateLimitClient,
 } from "../../../packages/worker/src/parse.js";
 import { expect, test } from "../../lib/index.js";
@@ -61,6 +63,49 @@ test.describe("strict parsing", () => {
       undefined,
     ]) {
       expect(parseExpiry(value), JSON.stringify(value)).toBeNull();
+    }
+  });
+
+  test("a listing cursor: round trip, and only the server's own spelling of a key under the prefix", () => {
+    const prefix = "uploads/";
+    for (const key of [
+      "uploads/",
+      "uploads/aB3x_Q0",
+      "uploads/aB3x_Q/.downloads/2026-06-01T00:00:00.000Z_0a1b2c3d",
+      "uploads/a/é \u{1F600}~",
+      `uploads/${"x".repeat(1024 - "uploads/".length)}`,
+    ]) {
+      const cursor = encodeListCursor(key);
+      expect(cursor, key).toMatch(/^[A-Za-z0-9_-]+$/);
+      expect(parseListCursor(cursor, prefix), key).toBe(key);
+    }
+    const b64 = (text: string) => Buffer.from(text, "utf-8").toString("base64url");
+    // 10 bytes: the last character carries 4 unused bits; setting one gives
+    // a second spelling of the same bytes.
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const canonical = b64("uploads/ab");
+    const nonCanonical = canonical.slice(0, -1) + alphabet[alphabet.indexOf(canonical.at(-1)!) | 1];
+    expect(Buffer.from(nonCanonical, "base64url").toString()).toBe("uploads/ab");
+    expect(parseListCursor(canonical, prefix)).toBe("uploads/ab");
+    for (const [name, value] of [
+      ["empty", ""],
+      ["not base64url", "dXBsb2Fkcy9h+A"],
+      ["padding", `${b64("uploads/ab")}==`],
+      ["standard base64 alphabet", "dXBsb2Fkcy9hYj8/"],
+      ["length 4n + 1", `${b64("uploads/abcd")}A`], // 16 + 1 characters
+      ["non-canonical trailing bits", nonCanonical],
+      ["outside the prefix", b64("other/a")],
+      ["the prefix without its slash", b64("uploads")],
+      ["a sibling prefix", b64("uploadsX/a")],
+      ["dot-segments", b64("../uploads/a")],
+      [
+        "invalid UTF-8",
+        Buffer.from([...Buffer.from("uploads/"), 0xff, 0xfe]).toString("base64url"),
+      ],
+      ["longer than an R2 key", b64(`uploads/${"x".repeat(1024)}`)],
+      ["whitespace", ` ${b64("uploads/a")}`],
+    ] as const) {
+      expect(parseListCursor(value, prefix), name).toBeNull();
     }
   });
 });

@@ -26,7 +26,13 @@ import {
   RULES,
   type RateLimitResult,
 } from "./rate-limit.js";
-import { isBearerAttempt, parseExpiry, rateLimitClient } from "./parse.js";
+import {
+  encodeListCursor,
+  isBearerAttempt,
+  parseExpiry,
+  parseListCursor,
+  rateLimitClient,
+} from "./parse.js";
 import { formatRange, parseRange } from "./range.js";
 import { withOptionalSentry } from "./sentry.js";
 import {
@@ -213,22 +219,32 @@ api.use("*", async (c, next) => {
 // GET /api/me — lets `yeet login` check the URL and token
 api.get("/me", (c) => c.json({ ok: true }));
 
-// GET /api/uploads — every finished upload, newest first. `truncated: true`
-// if the listing reached its limit of R2 calls first (see listAll()): then
-// only the uploads of the first part of the bucket (in ID order) are there.
+// GET /api/uploads[?cursor=…] — one page of finished uploads, newest first
+// within the page (see listPage(): a bounded amount of work per request).
+// `cursor` is where the next page starts: pass it back as `?cursor=`; null
+// on the last page, which alone has no `truncated: true`. A client that
+// ignores both (yeet 0.2's CLI) gets the first page and its note that only
+// part of the uploads is shown.
 api.get("/uploads", async (c) => {
   const origin = new URL(c.req.url).origin;
-  const listing = await c.get("uploads").listAll();
-  const result = listing.uploads
-    // Finished uploads only; their summaries carry no pending_upload_id.
-    .flatMap(({ id, meta }) =>
-      meta && !meta.pending_upload_id
-        ? [{ id, ...meta, url: shareUrl(origin, id, meta.filename) }]
-        : [],
-    )
-    .sort((a, b) => b.uploaded_at.localeCompare(a.uploaded_at));
-
-  return c.json({ uploads: result, ...(listing.truncated ? { truncated: true } : {}) });
+  const uploads = c.get("uploads");
+  const cursors = c.req.queries("cursor") ?? [];
+  let after: string | undefined;
+  if (cursors.length > 0) {
+    const parsed = cursors.length === 1 ? parseListCursor(cursors[0]!, uploads.listPrefix) : null;
+    if (parsed === null) return c.json({ error: "Invalid cursor" }, 400);
+    after = parsed;
+  }
+  const page = await uploads.listPage(after);
+  const result = page.uploads.map((upload) => ({
+    ...upload,
+    url: shareUrl(origin, upload.id, upload.filename),
+  }));
+  return c.json({
+    uploads: result,
+    cursor: page.next === null ? null : encodeListCursor(page.next),
+    ...(page.next !== null ? { truncated: true } : {}),
+  });
 });
 
 function isSize(value: unknown): value is number {

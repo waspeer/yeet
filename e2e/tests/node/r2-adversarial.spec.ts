@@ -57,6 +57,7 @@ async function chain(b: StrictBucket, budget = LIST_BUDGET, maxRounds = 500) {
   const perCall: number[] = [];
   let after: string | undefined;
   let rounds = 0;
+  let stalls = 0;
   for (;;) {
     b.reset();
     b.maxCalls = 50;
@@ -70,8 +71,17 @@ async function chain(b: StrictBucket, budget = LIST_BUDGET, maxRounds = 500) {
     }
     seen.push(...r.uploads.map((u) => u.id));
     if (!r.truncated) break;
-    expect(r.resumeAfter, "resumeAfter must advance").not.toBe(after);
-    if (after !== undefined) expect(byteCompare(r.resumeAfter!, after)).toBeGreaterThan(0);
+    if (r.resumeAfter === after) {
+      // Round 1I: an upload cut off by short pages after at most 2 of its
+      // keys is not skipped; the listing returns nothing and the next one
+      // retries from the same place (R2 may return short pages, even
+      // empty ones). Random page lengths get past it within a few tries.
+      expect(r.uploads, "a listing that does not advance returns nothing").toEqual([]);
+      expect(++stalls, "resumeAfter must advance eventually").toBeLessThan(50);
+    } else {
+      stalls = 0;
+      if (after !== undefined) expect(byteCompare(r.resumeAfter!, after)).toBeGreaterThan(0);
+    }
     after = r.resumeAfter;
     if (++rounds > maxRounds) throw new Error("no termination");
   }
@@ -179,19 +189,23 @@ test.describe("adversarial cron", () => {
     const b = new StrictBucket({ randomPages: true });
     const keep = new Map<string, number>();
     const stale = new Set<string>();
+    // Round 1I: legacy records and part records scaled down (from 1,100,
+    // 1,300, 2,100, 1,500): a run now deletes at most 200 keys of an upload
+    // it lists on its own (one deleteUnder() round), so the original counts
+    // took about 5,000 runs. Still several pages and runs per upload.
     for (let i = 0; i < 2500; i++) {
       const id = `c${String(i).padStart(4, "0")}`;
       const m = i % 9;
-      if (m === 0) (seed(b, id, { expired: true, records: i % 4 === 0 ? 1100 : 0 }), stale.add(id));
-      else if (m === 1) (seed(b, id, { pending: NOW - 2 * DAY, parts: i % 2 ? 1300 : 2 }), stale.add(id));
-      else if (m === 2) seed(b, id, { records: i % 5 === 0 ? 2100 : 150 });
+      if (m === 0) (seed(b, id, { expired: true, records: i % 4 === 0 ? 400 : 0 }), stale.add(id));
+      else if (m === 1) (seed(b, id, { pending: NOW - 2 * DAY, parts: i % 2 ? 500 : 2 }), stale.add(id));
+      else if (m === 2) seed(b, id, { records: i % 5 === 0 ? 700 : 150 });
       else if (m === 3) seed(b, id, { legacy: true });
-      else if (m === 4) seed(b, id, { pending: NOW - 1000, parts: 1500 });
+      else if (m === 4) seed(b, id, { pending: NOW - 1000, parts: 600 });
       else if (m === 5) seed(b, id, { legacy: true, expired: true }), stale.add(id);
       else seed(b, id, { filename: ["\u{1F600}", "-x", "é", "~"][i % 4] });
       if (!stale.has(id)) keep.set(id, 0);
     }
-    for (let i = 0; i < 5; i++) for (let r = 0; r < 1500; r++) b.seed(`${P}/zstray${i}/.downloads/2026-06-01T00:00:00.${r}Z_0`);
+    for (let i = 0; i < 5; i++) for (let r = 0; r < 600; r++) b.seed(`${P}/zstray${i}/.downloads/2026-06-01T00:00:00.${r}Z_0`);
     for (let i = 0; i < 3000; i++) b.seed(`${P}/k${i}.junk`);
     const keepKeys = new Map<string, string[]>();
     for (const id of keep.keys()) keepKeys.set(id, b.sorted(`${P}/${id}/`).filter((k) => !k.includes("/.downloads/")));
@@ -210,9 +224,9 @@ test.describe("adversarial cron", () => {
       const rec = keys.filter((k) => k.includes("/.downloads/")).length;
       const un = [...keep.keys()].filter((id) => !b.objects.get(`${P}/${id}/.meta.json`)!.meta.summary).length;
       if (i % 100 === 99) console.log(`run ${i + 1}: stale ${st} records ${rec} unsummarized ${un} keys ${keys.length}`);
-      if (i === 599) {
+      if (i === 2999) {
         const left = [...stale].filter((id) => b.sorted(`${P}/${id}/`).length > 0);
-        throw new Error(`not converged after 600 runs; stale uploads left: ${left.slice(0, 20).join(" ")}`);
+        throw new Error(`not converged after 3,000 runs; stale uploads left: ${left.slice(0, 20).join(" ")}`);
       }
       if (st === 0 && rec === 0 && un === 0) break;
     }
@@ -225,11 +239,21 @@ test.describe("adversarial cron", () => {
     }
     // multipart aborted for every abandoned
     // wrap: on a now-clean bucket, cursors advance and reach null
-    const cursors = await runs(b, 30);
+    // Round 1I: a run covers about 25 uploads on these random pages of up
+    // to 100 objects, and at most one run of part records: hundreds of runs.
+    const cursors = await runs(b, 1000);
     const firstNull = cursors.indexOf(null);
     expect(firstNull).toBeGreaterThanOrEqual(0);
     const cycle = cursors.slice(0, firstNull);
-    for (let j = 1; j < cycle.length; j++) expect(byteCompare(cycle[j]!, cycle[j - 1]!)).toBeGreaterThan(0);
+    // Never backwards. Round 1I: a run cut short by a short page (at most 2
+    // keys of the next upload listed) keeps the cursor and the next retries.
+    let same = 0;
+    for (let j = 1; j < cycle.length; j++) {
+      const order = byteCompare(cycle[j]!, cycle[j - 1]!);
+      expect(order).toBeGreaterThanOrEqual(0);
+      same = order === 0 ? same + 1 : 0;
+      expect(same, "the cursor advances within a few runs").toBeLessThan(20);
+    }
     console.log("clean cycle length", firstNull + 1);
   });
 
@@ -275,7 +299,8 @@ test.describe("adversarial cron", () => {
       seed(b2, id, { pending: NOW - 1000 });
       created.push(id);
     };
-    await runs(b2, 60);
+    // Round 1I: about 25 uploads a run on random pages of up to 100 objects.
+    await runs(b2, 250);
     for (const id of created) expect(b2.objects.has(`${P}/${id}/.meta.json`), id).toBe(true);
     expect(b2.sorted(`${P}/`).filter((k) => k.endsWith(".meta.json")).every((k) => !JSON.parse(b2.objects.get(k)!.body).expires_at.startsWith("2026-10-08T02"))).toBe(true);
   });
@@ -300,8 +325,12 @@ test.describe("adversarial cron", () => {
     seed(b, "a0001", { pending: NOW - 2 * DAY, parts: 3 });
     seed(b, "a0002", { pending: NOW - 2 * DAY, parts: 2500 });
     seed(b, "a0003", { pending: NOW - DAY + 60_000, parts: 3 });
-    await runs(b, 4);
-    expect(b.aborted.sort()).toEqual(["mp-a0001", "mp-a0002"]);
+    // Round 1I: a run deletes at most CLEANUP_LIST_LIMIT (200) keys of an
+    // upload it has to list on its own, so 2,500 parts take 13 runs.
+    await runs(b, 16);
+    // Round 1I: an abandoned upload whose deletion takes several runs has
+    // its (already aborted) multipart upload aborted again in each, 1 call.
+    expect([...new Set(b.aborted)].sort()).toEqual(["mp-a0001", "mp-a0002"]);
     expect(b.sorted(`${P}/a0001/`)).toEqual([]);
     expect(b.sorted(`${P}/a0002/`)).toEqual([]);
     expect(b.sorted(`${P}/a0003/`).length).toBe(4);

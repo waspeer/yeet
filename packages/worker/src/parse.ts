@@ -10,6 +10,53 @@ export function parseExpiry(value: string | undefined): number | null {
   return value && /^[1-9]\d{0,11}$/.test(value) ? Number(value) : null;
 }
 
+/** R2 keys are at most 1,024 bytes; so is the key a listing cursor holds. */
+const MAX_KEY_BYTES = 1024;
+
+function toBase64url(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/**
+ * The opaque `cursor` of GET /api/uploads for the key the next page starts
+ * after: base64url (no padding) of its UTF-8 bytes. parseListCursor()
+ * reads it back.
+ */
+export function encodeListCursor(key: string): string {
+  return toBase64url(new TextEncoder().encode(key));
+}
+
+/**
+ * The key a `cursor` of GET /api/uploads holds, or null if it is not one
+ * the server could have made for `prefix` (`<UPLOADS_PREFIX>/`): only
+ * base64url characters, the one canonical spelling (re-encoding gives the
+ * same text, so no padding and no stray bits), valid UTF-8, at most 1,024
+ * bytes, and starting with `prefix`. The listing only ever lists under
+ * `prefix` whatever the key, so this is strictness, not the boundary.
+ */
+export function parseListCursor(value: string, prefix: string): string | null {
+  if (!/^[A-Za-z0-9_-]+$/.test(value) || value.length > Math.ceil((MAX_KEY_BYTES * 4) / 3)) {
+    return null;
+  }
+  let bytes: Uint8Array;
+  try {
+    const binary = atob(value.replace(/-/g, "+").replace(/_/g, "/"));
+    bytes = Uint8Array.from(binary, (ch) => ch.charCodeAt(0));
+  } catch {
+    return null; // e.g. a length of 4n + 1
+  }
+  if (bytes.length > MAX_KEY_BYTES || toBase64url(bytes) !== value) return null;
+  let key: string;
+  try {
+    key = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch {
+    return null;
+  }
+  return key.startsWith(prefix) ? key : null;
+}
+
 /**
  * Whether a request makes a Bearer attempt: it has an Authorization header,
  * even an empty one. Such a request is decided by that header alone, and a
