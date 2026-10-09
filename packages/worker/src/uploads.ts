@@ -499,6 +499,7 @@ export class Uploads {
     let next: { cursor?: string; startAfter?: string } =
       start !== undefined ? { startAfter: start } : {};
     let lastKey = start; // the last key listed
+    let endedInGroup = false; // the last key listed belongs to the last group
     const readsNeeded = (list: Group[]) =>
       readCost * list.filter((g) => g.sidecar && !g.meta).length;
 
@@ -514,7 +515,9 @@ export class Uploads {
         const previousKey = lastKey;
         lastKey = object.key;
         const [id, ...rest] = object.key.slice(base.length).split("/");
+        endedInGroup = false;
         if (!id || !isValidId(id) || rest.length === 0) continue;
+        endedInGroup = true;
         let group = groups.at(-1);
         if (group?.id !== id) {
           group = {
@@ -558,9 +561,11 @@ export class Uploads {
     }
 
     // Keys of one upload are contiguous, so every upload but the last is
-    // listed completely; the last only if the listing reached the end.
-    if (truncated && groups.length > 0) groups.at(-1)!.complete = false;
-    const candidates = truncated ? groups.slice(0, -1) : groups;
+    // listed completely; the last only if the listing reached the end, or
+    // listed a key after it (one that belongs to no upload).
+    const lastPartial = truncated && endedInGroup;
+    if (lastPartial && groups.length > 0) groups.at(-1)!.complete = false;
+    const candidates = lastPartial ? groups.slice(0, -1) : groups;
     // The reads of old sidecars, as far as the budget goes.
     let reads = 0;
     const kept: Group[] = [];
