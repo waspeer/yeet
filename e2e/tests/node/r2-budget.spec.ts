@@ -395,9 +395,10 @@ test.describe("R2 calls of the cron", () => {
     bucket.seed(`${PREFIX}/.cleanup-cursor`, "not JSON"); // unreadable: start at the beginning
     const report = await runCleanup(bucket, PREFIX, NOW);
     expect(report).toMatchObject({ deleted: 1, recordsCleared: 1, cursor: null });
-    // Cursor read, one list page, a batch delete of the files and one of the
-    // sidecars, list + delete of the records.
-    expect(report.subrequests).toBe(6);
+    // Cursor read, one list page, a batch delete of the files and records
+    // and one of the sidecars. (Round 1L: the records the listing saw go
+    // into the batch; before, a list and a delete of their own, 6 calls.)
+    expect(report.subrequests).toBe(4);
     expect(bucket.keys()).toEqual([
       `${PREFIX}/.cleanup-cursor`,
       `${PREFIX}/${idOf(1)}/.meta.json`,

@@ -247,13 +247,13 @@ async function cronRuns(b: StrictBucket, done: () => boolean, maxRuns: number) {
 
 function expectRunBounds(work: RunWork[]) {
   for (const [i, w] of work.entries()) {
-    // The slice, a jump, and one deleteUnder() round.
-    expect(w.lists, `run ${i + 1}: list calls`).toBeLessThanOrEqual(1 + CLEANUP_JUMPS + 1);
+    // The slice and a jump (round 1L: no deleteUnder() round any more).
+    expect(w.lists, `run ${i + 1}: list calls`).toBeLessThanOrEqual(1 + CLEANUP_JUMPS);
     expect(w.maxListed, `run ${i + 1}: objects per list call`).toBeLessThanOrEqual(
       CLEANUP_LIST_LIMIT,
     );
     expect(w.listed, `run ${i + 1}: objects examined`).toBeLessThanOrEqual(
-      2 * CLEANUP_LIST_LIMIT + CLEANUP_JUMPS * JUMP_LIMIT,
+      CLEANUP_LIST_LIMIT + CLEANUP_JUMPS * JUMP_LIMIT,
     );
     expect(w.summaries, `run ${i + 1}: summaries written`).toBeLessThanOrEqual(CLEANUP_SUMMARIES);
     expect(w.total, `run ${i + 1}: R2 calls`).toBeLessThanOrEqual(CLEANUP_BUDGET);

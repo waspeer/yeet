@@ -26,22 +26,21 @@ import {
  * R2 calls a cleanup run may make at most. Not the binding limit any more
  * (Workers allow 1,000 R2 calls per invocation; CPU binds long before), but
  * a second guard on top of the bounds below: a run's own work needs at most
- * 17 calls (the cursor's read and write, two lists, 2 × CLEANUP_SUMMARIES,
- * DELETE_UNDER_CALLS and up to 4 batch deletes) besides aborting abandoned
- * multipart uploads (1 call each), which this caps.
+ * 13 calls (the cursor's read and write, two lists, a sidecar read after a
+ * short jump, 2 × CLEANUP_SUMMARIES and 2 batch deletes) besides aborting
+ * abandoned multipart uploads (1 call each), which this caps.
  */
 export const CLEANUP_BUDGET = 45;
 
 /**
- * Objects one list call of a run returns at most (its `limit`): the run's
- * slice of the bucket (with metadata), the jump over a `.downloads/` or
- * `.parts/` run it may make (CLEANUP_JUMPS), and the one round of
- * deleteUnder() it may make (without metadata). So a run examines at most
- * 3 × 100 = 300 objects, usually 100: about 50 finished uploads. Measured
+ * Objects the list call of a run's slice returns at most (its `limit`, with
+ * metadata); the jump over a `.downloads/` or `.parts/` run it may make
+ * (CLEANUP_JUMPS) lists at most JUMP_LIMIT more. So a run examines at most
+ * 100 + 50 = 150 objects, usually 100: about 50 finished uploads. Measured
  * in phase 1J on Workers Free at 200: p50 6 to 7 ms CPU for a plain run or
- * one with deletes, 12 (p90 14) for a run with a deleteUnder() round (600
- * objects); a fit of about 2.9 ms plus 15 µs per object listed. Lowered to
- * 100 for headroom; tests derive what they expect from it.
+ * one with deletes; a fit of about 2.9 ms plus 15 µs per object listed.
+ * Lowered to 100 in round 1K; phase 1K measured a plain run of 100 at p50 5,
+ * p90 9 ms (n = 20). Tests derive what they expect from it.
  */
 export const CLEANUP_LIST_LIMIT = 100;
 
@@ -55,19 +54,11 @@ export const CLEANUP_JUMPS = 1;
 /**
  * Sidecars without a summary a run gives theirs (a read and a conditional
  * write each, about 1.26 ms CPU each in phase 1J: 10 took p50 19, p90 22 ms
- * a run). Hourly, 3 a run is 72 a day; a bucket of many more is migrated
- * with the one-time script (scripts/backfill-summaries.mjs).
+ * a run; 3 took p50 6, p90 7 in phase 1K). Hourly, 3 a run is 72 a day; a
+ * bucket of many more is migrated with the one-time script
+ * (scripts/backfill-summaries.mjs).
  */
 export const CLEANUP_SUMMARIES = 3;
-
-/**
- * R2 calls of the one deleteUnder() a run may make, for an upload whose
- * keys its listing did not all see, or the legacy records of a current
- * upload: one round (a list of at most CLEANUP_LIST_LIMIT keys and a delete)
- * and the sidecar's own delete. Such an upload with more keys takes several
- * runs.
- */
-const DELETE_UNDER_CALLS = 3;
 
 /**
  * R2 calls of giving one sidecar its summary: a read and a conditional
@@ -90,6 +81,11 @@ export interface CleanupReport {
   subrequests: number;
   /** Where the next run starts (after this key), or null for the beginning. */
   cursor: string | null;
+}
+
+/** Whether a stale upload has a multipart upload to abort. */
+function isAbortable(pendingUploadId: string | undefined): boolean {
+  return !!pendingUploadId;
 }
 
 function isStale({ meta, stray }: ListedUpload, now: number): boolean {
@@ -115,8 +111,8 @@ export async function runCleanup(
   const start = typeof parsed?.after === "string" ? parsed.after : null;
 
   // One list call, and one more to jump over a `.downloads/` or `.parts/`
-  // run (an upload whose keys it did not all see is handled with
-  // deleteUnder() below). Everything but the cursor's read and write; the
+  // run (an upload whose keys it did not all see loses the ones it saw,
+  // below). Everything but the cursor's read and write; the
   // summaries are written below, in the calls the listing reserves for them.
   const listing = await uploads.listAll({
     budget: CLEANUP_BUDGET - 2,
@@ -140,6 +136,7 @@ export async function runCleanup(
     Math.ceil((keys - sidecars) / 1000) + Math.ceil(sidecars / 1000);
   const flushCost = () => deleteCalls(pending.length, pendingSidecars);
   const flush = async () => {
+    if (pending.length === 0) return;
     const keys = pending;
     spent += flushCost();
     pending = [];
@@ -152,7 +149,6 @@ export async function runCleanup(
   let summarized = 0;
   let lastDone: string | undefined;
   let stopped = false;
-  let deletedUnder = false;
 
   // First the summaries, up to CLEANUP_SUMMARIES: until a sidecar has one,
   // every listing costs a read for it. Stale ones get theirs too, so that
@@ -173,59 +169,46 @@ export async function runCleanup(
     if (result.written) summarized++;
   }
 
-  // Then, in key order, the deletions.
+  // Then, in key order, the deletions: of the keys the listing saw, in
+  // batches with the sidecars last. An upload whose keys it did not all see
+  // (a `.downloads/` or `.parts/` run it jumped over) loses the keys seen
+  // but keeps its sidecar, and the run stops there: the next run starts
+  // with it and sees the next keys of the run, so it takes one run per
+  // about CLEANUP_LIST_LIMIT such keys. (Until round 1L the run listed them
+  // again with a deleteUnder() round of its own: a third list call.)
   for (const upload of listing.uploads.slice(0, known)) {
     const stale = isStale(upload, now);
     if (!stale && !upload.legacyRecords) {
       lastDone = upload.id;
       continue;
     }
-    const abort = stale && upload.meta?.pending_upload_id ? 1 : 0;
-    const dir = `${prefix.replace(/^\/+|\/+$/g, "")}/${upload.id}/`;
-
-    if (stale && upload.complete) {
-      // Every key is known: delete them in batches with the others.
-      const sidecars = upload.keys.filter((key) => uploads.isSidecarKey(key)).length;
-      const cost = deleteCalls(pending.length + upload.keys.length, pendingSidecars + sidecars);
-      if (spent + cost + abort > budget) {
-        stopped = true;
-        break;
-      }
-      if (abort) {
-        await uploads.abortPending(
-          upload.id,
-          upload.meta!.filename,
-          upload.meta!.pending_upload_id!,
-        );
-        spent++;
-      }
-      pending.push(...upload.keys);
-      pendingSidecars += sidecars;
-      deleted++;
+    // Stale: all of it, the sidecar only once every key is gone. Current:
+    // its legacy records only.
+    const keys = upload.keys.filter((key) =>
+      stale
+        ? upload.complete || !uploads.isSidecarKey(key)
+        : key.startsWith(`${uploads.listPrefix}${upload.id}/.downloads/`),
+    );
+    if (keys.length === 0) {
+      // Nothing seen to delete (not expected: an upload is incomplete
+      // because the listing saw part of a run): go on rather than stall.
       lastDone = upload.id;
       continue;
     }
-
-    // Keys the listing did not see, or legacy records of a current upload:
-    // list and delete them (the whole upload if stale, else its records),
-    // one such upload per run.
-    if (deletedUnder || spent + flushCost() + abort + 2 > budget) {
+    const abort = stale && isAbortable(upload.meta?.pending_upload_id) ? 1 : 0;
+    const sidecars = keys.filter((key) => uploads.isSidecarKey(key)).length;
+    const cost = deleteCalls(pending.length + keys.length, pendingSidecars + sidecars);
+    if (spent + cost + abort > budget) {
       stopped = true;
       break;
     }
-    deletedUnder = true;
-    await flush();
     if (abort) {
       await uploads.abortPending(upload.id, upload.meta!.filename, upload.meta!.pending_upload_id!);
       spent++;
     }
-    const result = await uploads.deleteUnder(
-      stale ? dir : `${dir}.downloads/`,
-      Math.min(budget - spent, DELETE_UNDER_CALLS),
-      { limit: CLEANUP_LIST_LIMIT, maxLists: 1 },
-    );
-    spent += result.calls;
-    if (!result.done) {
+    pending.push(...keys);
+    pendingSidecars += sidecars;
+    if (!upload.complete) {
       stopped = true; // the rest next run, starting with this upload
       break;
     }
