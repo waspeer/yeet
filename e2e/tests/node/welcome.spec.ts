@@ -65,7 +65,8 @@ test.describe("GET / (welcome page)", () => {
       expect(res.status).toBe(200);
       const body = await res.text();
       expect(body).toContain(`<input type="text" id="address" value="${origin}" readonly`);
-      expect(body).toContain(`<code>npx @waspeer/yeet login ${origin}</code>`);
+      expect(body).not.toContain("npx");
+      expect(body).not.toContain("yeet login");
     }
     expect(bucket.calls).toEqual({});
   });

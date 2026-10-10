@@ -92,8 +92,9 @@ stays the same as today; the CLI and the tests depend on it.
 - `GET /` (round 2D): the welcome page, built with `layout()` like the
   others: what yeet is in one sentence, this yeet's address (the
   request's origin, in a read-only field with **Copy address**), an
-  **Upload files** link to `/upload`, and a line with the command-line
-  tool's first command (`npx @waspeer/yeet login <address>`).
+  **Upload files** link to `/upload`. No line about the command-line
+  tool yet: one with its first command (`yeet setup <address>`) is planned
+  for phase 3, when `yeet setup` exists.
   - **Public and the same for everyone:** no session or token check (it
     also works with `UPLOAD_TOKEN` unset), no R2 call, no rate limiter:
     the cheapest route (`e2e/tests/node/welcome.spec.ts` asserts zero R2
