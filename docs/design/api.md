@@ -538,8 +538,14 @@ request could list and delete about 10,000 objects.
   counted, `PUT` of a part and `complete` answer `404` ("No upload in
   progress", `isUploading()`), and the cron, which deletes expired
   uploads, finishes the job (about 100 keys a run, never aborting the
-  marker as a multipart upload) if no further request does.
-- **`404 {"error": "Not found"}`:** nothing was listed.
+  marker as a multipart upload) if no further request does. Also when
+  the list call returned no keys but a truncated page (R2 may return fewer
+  objects than asked, even none): a truncated page means keys are left,
+  so the marker is written all the same (until fix 1L.1 it was not, and
+  the upload stayed listed and downloadable after a `202`). Without a
+  sidecar to rewrite, the marker is written fresh (`filename: "deleted"`),
+  which gives any keys left one for the cron to clean up.
+- **`404 {"error": "Not found"}`:** nothing was listed, and the page was not truncated.
 
 **Clients:**
 
