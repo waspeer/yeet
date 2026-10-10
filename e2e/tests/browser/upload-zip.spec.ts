@@ -672,6 +672,65 @@ test.describe("upload page: the browser loses access to the files of a zip", () 
     ]);
     await expectGone(oldId);
   });
+
+  // Round 2D (leftover (b) of 2C+2): zip.ts writes DOS dates in the
+  // browser's time zone, so after a zone change the zip made again would
+  // not match the parts already uploaded. The page's zone is changed by
+  // replacing getTimezoneOffset() there (no engine lets a test change the
+  // zone of a running page); the decision to start over is what is tested.
+  test("a stored zip chosen again after the time zone changed starts over", async ({
+    page,
+    tmp,
+  }) => {
+    const root = join(tmp, "Travelled");
+    await mkdir(root);
+    const a = await randomFile(root, 20 * KiB, "a.mp3");
+    await logIn(page);
+    const held: Route[] = [];
+    await page.route("**/api/uploads/*/parts/*", (route) => {
+      if (isPart(route.request(), 1) && held.length === 0) held.push(route);
+      else return route.fallback();
+    });
+    const created = createdId(page);
+    await page.locator("#folder-input").setInputFiles(root);
+    const oldId = await created;
+    await eventually(() => held.length > 0, { message: "part 1 in flight" });
+    await rename(a.path, `${a.path}.away`);
+    try {
+      await held[0]!.abort("connectionreset");
+      await expect(page.locator("#error-message")).toHaveText(
+        /Choose the same folder again to continue where it stopped\.$/,
+      );
+    } finally {
+      await page.unrouteAll({ behavior: "ignoreErrors" });
+      await rename(`${a.path}.away`, a.path);
+    }
+    // An hour further east, from now on.
+    await page.evaluate(() => {
+      const offset = Date.prototype.getTimezoneOffset;
+      Date.prototype.getTimezoneOffset = function () {
+        return offset.call(this) - 60;
+      };
+    });
+    const notes: string[] = [];
+    await page.exposeFunction("__note", (text: string) => void notes.push(text));
+    await page.evaluate(() => {
+      const note = document.getElementById("up-note")!;
+      new MutationObserver(() => {
+        (window as unknown as { __note: (t: string) => void }).__note(note.textContent ?? "");
+      }).observe(note, { childList: true, characterData: true, subtree: true });
+    });
+    const creates = countCreates(page);
+    const chooser = page.waitForEvent("filechooser");
+    await page.getByRole("button", { name: "Choose the folder again" }).click();
+    await (await chooser).setFiles(root);
+    const url = await shareLink(page);
+    expect(url).not.toContain(`/${oldId}/`);
+    expect(creates).toHaveLength(1);
+    expect(notes).toContain("The time zone changed since the upload started, so it starts over.");
+    await checkZip(url, tmp, [{ path: "Travelled/a.mp3", source: a.path }]);
+    await expectGone(oldId);
+  });
 });
 
 // Round 2C+2, leftover (b) of the 2C+ verifier: a `complete` whose answer

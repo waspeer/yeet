@@ -1462,7 +1462,14 @@ a normalized header. Following RFC 9110 §14:
     they were first chosen, and the same empty folders) continues it: the
     zip is made again from the start, the parts the server has are cut
     but not sent, and the first unacknowledged part goes out next ("…
-    Choose the same folder again to continue where it stopped.");
+    Choose the same folder again to continue where it stopped.").
+    Not if the browser's time zone changed since the upload started
+    (round 2D): `zip.ts` writes the entries' DOS dates in the zone of
+    the moment, so the zip made again would differ from the parts
+    already uploaded. The page compares `zoneOffsets()` (the offset at
+    each entry's date) with the one taken at the start and, if it
+    differs, starts over ("The time zone changed since the upload
+    started, so it starts over.") and deletes the old upload;
   - **a compressed zip** cannot continue part-way, so the page says that
     choosing the files again starts the upload over ("… the upload starts
     over from the beginning, because a compressed zip can't continue

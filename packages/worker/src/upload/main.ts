@@ -11,6 +11,7 @@ import {
   planSelection,
   sameZip,
   SelectionError,
+  zoneOffsets,
   type Picked,
   type Plan,
   type ZipPlan,
@@ -128,10 +129,14 @@ interface Resumable {
   plan: Plan;
   /** One file: its name, size and date as they were when it was chosen. */
   identity: { name: string; size: number; lastModified: number };
+  /** A zip: the time zone offsets of its entries' dates when it started (zoneOffsets()). */
+  zone: string;
   options: { expiresIn: number; password: string };
   expiresAt: Date;
 }
 let resumable: Resumable | null = null;
+/** zoneOffsets() of the current zip, taken when it started. */
+let zone = "";
 /**
  * Name, size and date of the current file, taken when it was chosen: once
  * the file is gone, WebKit's File.lastModified no longer gives the date
@@ -410,7 +415,21 @@ function canContinue(next: Plan, previous: Resumable): boolean {
       next.file.lastModified === previous.identity.lastModified
     );
   }
-  return next.kind === "zip" && old.kind === "zip" && old.size !== undefined && sameZip(next, old);
+  return (
+    next.kind === "zip" &&
+    old.kind === "zip" &&
+    old.size !== undefined &&
+    sameZip(next, old) &&
+    !zoneChanged(previous)
+  );
+}
+
+/**
+ * Whether the time zone changed since a zip started: made again, its
+ * entries' dates would differ from the parts already uploaded (round 2D).
+ */
+function zoneChanged(previous: Resumable): boolean {
+  return previous.plan.kind === "zip" && zoneOffsets(previous.plan) !== previous.zone;
 }
 
 /**
@@ -431,6 +450,7 @@ function start(chosenPlan: Plan, opts = chosenOptions()): void {
   if (state === "uploading") return;
   let next = chosenPlan;
   let resume: Resume | undefined;
+  let note = "";
   if (resumable) {
     const previous = resumable;
     resumable = null;
@@ -453,6 +473,15 @@ function start(chosenPlan: Plan, opts = chosenOptions()): void {
         };
       }
     } else {
+      if (
+        next.kind === "zip" &&
+        previous.plan.kind === "zip" &&
+        previous.plan.size !== undefined &&
+        sameZip(next, previous.plan) &&
+        zoneChanged(previous)
+      ) {
+        note = "The time zone changed since the upload started, so it starts over.";
+      }
       deleteOnServer(previous.id);
     }
   }
@@ -466,6 +495,8 @@ function start(chosenPlan: Plan, opts = chosenOptions()): void {
     next.kind === "file"
       ? { name: next.file.name, size: next.file.size, lastModified: next.file.lastModified }
       : { name: next.name, size: next.totalSize, lastModified: 0 };
+  // When resuming, `next` is the zip as planned, so this is its zone again.
+  zone = next.kind === "zip" ? zoneOffsets(next) : "";
   options = opts;
   uploadId = null;
   completing = false;
@@ -473,7 +504,7 @@ function start(chosenPlan: Plan, opts = chosenOptions()): void {
   samples = [{ at: performance.now(), sent: 0 }];
   idleNote.textContent = "";
   idleError.hidden = true;
-  upNote.textContent = resume ? "Continuing where it stopped…" : "";
+  upNote.textContent = resume ? "Continuing where it stopped…" : note;
   el("up-name").textContent = nameOf(next);
   upFiles.hidden = next.kind === "file";
   upFiles.textContent =
@@ -559,6 +590,7 @@ function onMessage(message: FromWorker): void {
           parts: new Map(parts),
           plan,
           identity,
+          zone,
           options,
           expiresAt,
         };
