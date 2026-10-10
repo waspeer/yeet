@@ -413,6 +413,11 @@ api.post("/uploads/:id/complete", async (c) => {
   const uploads = c.get("uploads");
   const read = await uploads.readMetaVersion(id);
   const meta = read?.meta;
+  // Already finished: a client sending complete again because the answer
+  // to its first one was lost (the upload page retries) gets that answer.
+  if (read && !meta?.pending_upload_id && typeof meta?.filename === "string") {
+    return c.json({ id, url: shareUrl(new URL(c.req.url).origin, id, meta.filename) });
+  }
   // (An upload whose deletion is under way is none, see Uploads.delete().)
   if (!read || !isUploading(meta)) return c.json({ error: "No upload in progress" }, 404);
 

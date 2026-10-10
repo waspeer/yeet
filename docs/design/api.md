@@ -474,6 +474,12 @@ Numbers that are signed or used as keys must be spelled one way only:
   `e2e/tests/node/complete-race.spec.ts` (step by step on the in-memory
   bucket, with at most and more than `DELETE_LIMIT` objects, and both
   requests at once on `wrangler dev`) and `verify-1l-units.spec.ts`.
+- **`complete` of a finished upload** (round 2C): `200` with the same
+  `{ id, url }` as the first, without touching anything (no R2 call
+  beyond the sidecar read). The upload page retries a `complete` whose
+  answer was lost (a network error, a `5xx`); before, the retry got
+  `404 "No upload in progress"` for an upload that had worked. A deleted
+  upload, or one being deleted, still gets the `404`.
 - **Errors R2 raises at `complete`** (e.g. a wrong etag): `400` with
   "Could not complete the upload; check that every part was uploaded and its
   etag is right (…)" instead of a 500.

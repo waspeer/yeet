@@ -218,4 +218,18 @@ test.describe("complete and DELETE at once, on wrangler dev", () => {
     console.log(`complete + DELETE x${TRIALS}: ${JSON.stringify(outcomes)}`);
     expect(broken).toEqual([]);
   });
+
+  test("a complete sent again after it succeeded answers with the same link", async () => {
+    // The page retries a complete whose answer was lost; by then the upload
+    // is finished, which is no reason for an error.
+    const { id, etag } = await oneUploadedPart("twice.bin");
+    const first = await sendComplete(id, etag);
+    expect(first.status).toBe(200);
+    const second = await sendComplete(id, etag);
+    expect(second.status).toBe(200);
+    expect(await second.json()).toEqual(await first.json());
+    expect((await deleteUpload(id)).status).toBe(200);
+    // A deleted upload is still none.
+    expect((await sendComplete(id, etag)).status).toBe(404);
+  });
 });
