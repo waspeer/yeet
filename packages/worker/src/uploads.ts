@@ -444,6 +444,16 @@ export class Uploads {
   }
 
   /**
+   * readMeta() with the etag of the sidecar read (1 R2 call), for a write
+   * that must only replace that very version (`complete`, finishUpload()).
+   */
+  async readMetaVersion(id: string): Promise<{ meta: UploadMeta; etag: string } | null> {
+    const object = await this.bucket.get(this.dir(id) + ".meta.json");
+    if (!object) return null;
+    return { meta: await object.json<UploadMeta>(), etag: object.etag };
+  }
+
+  /**
    * Read the metadata sidecar (1 R2 call) for code that must not stop on a
    * bad one: `meta` is null if it is missing, not valid JSON, or not shaped
    * like a sidecar (parseUploadMeta()); `etag` is set whenever it exists.
@@ -955,6 +965,23 @@ export class Uploads {
         await this.bucket.delete(batch.slice(i, i + 1000));
       }
     }
+  }
+
+  /**
+   * Turn a pending upload into a finished one once R2 has completed its
+   * multipart upload (`complete`): its sidecar `meta`, as read at version
+   * `etag`, is written back without `pending_upload_id` and with the
+   * stored `fileSize`.
+   */
+  async finishUpload(
+    id: string,
+    meta: UploadMeta,
+    _etag: string,
+    fileSize: number,
+  ): Promise<"finished" | "deleted"> {
+    const { pending_upload_id: _, ...finished } = meta;
+    await this.writeMeta(id, { ...finished, file_size: fileSize });
+    return "finished";
   }
 
   /** Abort an unfinished multipart upload. Ignores ones already gone. */
