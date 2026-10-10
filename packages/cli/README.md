@@ -16,7 +16,7 @@ yeet upload footage/ --store      # zip without compressing (faster for media)
 One file is uploaded as it is. Several files, or a folder, become one zip
 with one link, made while it uploads. A compressed zip that could come out
 larger than about 7.8 GB is written to a temporary file first (in `$TMPDIR`,
-so it needs free disk space for about the size of the files plus 256 MB; it
+so it needs free disk space for about the size of the files plus 256 MiB; it
 is always deleted afterwards).
 `--store` never needs one. Ctrl-C during a zip upload deletes what was
 uploaded; a second Ctrl-C quits at once.

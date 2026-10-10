@@ -397,7 +397,7 @@ test.describe("round 2D: the zip size hook and the free space wording", () => {
     const r = await cli(["--help"]);
     expectExitCode(r, 0);
     const help = r.stdout.replace(/\s+/g, " ");
-    expect(help).toContain("(it needs about the files' size plus 256 MB of free space)");
+    expect(help).toContain("(it needs about the files' size plus 256 MiB of free space)");
     expect(help).not.toContain("that much");
   });
 });

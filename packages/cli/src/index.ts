@@ -106,7 +106,7 @@ Commands:
                      zip is made while it uploads; a compressed one that may
                      come out over 7.8 GB is written to a temporary file in
                      $TMPDIR first (it needs about the files' size plus
-                     256 MB of free space)
+                     256 MiB of free space)
                      --expires   link lifetime, e.g. 7d, 24h, 90m (default 30d, at most 365d)
                      --password  require this password to download
                      --store     zip without compressing (faster for audio, video, photos;
