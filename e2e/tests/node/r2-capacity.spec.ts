@@ -1,10 +1,14 @@
+import { MAX_LIST_PAGES } from "../../../packages/cli/src/limits.js";
 import {
   CLEANUP_BUDGET,
+  CLEANUP_JUMPS,
   CLEANUP_LIST_LIMIT,
   CLEANUP_SUMMARIES,
   runCleanup,
 } from "../../../packages/worker/src/cleanup.js";
 import {
+  DELETE_LIMIT,
+  JUMP_LIMIT,
   MAX_UNSIZED_PARTS,
   PAGE_LIMIT,
   PAGE_READS,
@@ -137,7 +141,6 @@ test.describe("the docs state the numbers derived from the constants", () => {
   // Round 1K: the constants were lowered after the phase 1J measurement;
   // this checks that docs/design/api.md and the README quote what the tests
   // above compute from them, so the next change cannot leave them stale.
-  const MAX_LIST_PAGES = 1000; // packages/cli/src/index.ts
   const n = (x: number) => x.toLocaleString("en");
   const read = async (path: string) =>
     (await readFile(new URL(path, import.meta.url), "utf-8")).replace(/\s+/g, " ");
@@ -159,7 +162,9 @@ test.describe("the docs state the numbers derived from the constants", () => {
     expect(doc).toContain(
       `More than ${n(MAX_LIST_PAGES * PAGE_READS)} sidecars without a summary** take more than ${n(MAX_LIST_PAGES)} pages at ${PAGE_READS} a page`,
     );
-    expect(doc).toContain(`1,000 pages hold about ${n(MAX_LIST_PAGES * PER_PAGE)} uploads`);
+    expect(doc).toContain(
+      `${n(MAX_LIST_PAGES)} pages hold about ${n(MAX_LIST_PAGES * PER_PAGE)} uploads`,
+    );
     expect(doc).toContain(
       `The cron gives ${CLEANUP_SUMMARIES} an hour (${24 * CLEANUP_SUMMARIES} a day)`,
     );
@@ -181,8 +186,13 @@ test.describe("the docs state the numbers derived from the constants", () => {
     );
     expect(doc).toContain(`gone through in ceil(N / ${PER_RUN}) hours`);
     expect(doc).toContain(`one without summaries in ceil(N / ${CLEANUP_SUMMARIES}) hours`);
-    expect(doc).toContain(`at most **3 list calls of at most ${CLEANUP_LIST_LIMIT} objects**`);
-    expect(doc).toContain(`so at most ${3 * CLEANUP_LIST_LIMIT} objects examined`);
+    expect(doc).toContain(
+      `at most **${1 + CLEANUP_JUMPS} list calls, of at most ${CLEANUP_LIST_LIMIT} and ${JUMP_LIMIT} objects**`,
+    );
+    expect(doc).toContain(
+      `so at most ${CLEANUP_LIST_LIMIT + CLEANUP_JUMPS * JUMP_LIMIT} objects examined`,
+    );
+    expect(doc).toContain(`\`limit: ${DELETE_LIMIT}\` (\`DELETE_LIMIT\`,`);
     expect(doc).toContain(`at most ${CLEANUP_SUMMARIES} summaries written`);
     expect(doc).toContain(`**At most ${PAGE_READS} reads**`);
     expect(doc).toContain(`**at most ${1 + PAGE_READS} R2 calls** per page`);

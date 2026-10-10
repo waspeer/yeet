@@ -200,8 +200,10 @@ set. Without it, requests do not pay any Sentry CPU cost.
 ## Unchanged
 
 Download links (`/_dl/:id`, Range support), the bucket layout and the
-custom-metadata summary, and `DELETE /api/uploads/:id` (beyond the auth
-changes above). `GET /api/uploads` and the cleanup keep their behaviour, but
+custom-metadata summary. `DELETE /api/uploads/:id` keeps its `200` and
+`404`, and since round 1L deletes at most 100 objects per request,
+answering `202` with `"done": false` while more is left (see "Deleting an
+upload" below). `GET /api/uploads` and the cleanup keep their behaviour, but
 each request and run does a bounded amount of work: `GET /api/uploads`
 answers one page per request with a `cursor` for the next (see "Listing a
 page" below), and the cleanup runs hourly over one slice of the bucket at
@@ -514,6 +516,62 @@ written back. On a failure it reads again after a random wait (up to
   per upload would count exactly, but costs a DO request per download from
   the daily quota the rate limits rely on.
 
+### Deleting an upload (DELETE /api/uploads/:id)
+
+Since round 1L one request deletes **at most 100 objects** of an upload:
+one list call under `<prefix>/<id>/` with `limit: 100` (`DELETE_LIMIT`,
+without metadata), one delete of what it listed, and the sidecar last, in
+a call of its own once nothing else is left (`Uploads.delete()`; at most
+3 R2 calls besides the sidecar read and a multipart abort). Before, one
+request listed and deleted every key of the upload, and an authenticated
+client can give an upload up to 10,000 part records (upload parts of
+unknown size and have `complete` refused; the records stay), so one
+request could list and delete about 10,000 objects.
+
+- **`200 {"deleted": "<id>"}`:** nothing of it is left.
+- **`202 {"deleted": "<id>", "done": false}`:** more is left. The sidecar
+  stays (sidecar last, so nothing is ever left without one), rewritten as
+  a deletion under way: `pending_upload_id: "deleted"`
+  (`DELETED_UPLOAD_ID`, which no R2 multipart upload has) and `expires_at`
+  now. So the upload is **gone for users after this one request**: a
+  pending upload is not listed and has no download page, no download is
+  counted, `PUT` of a part and `complete` answer `404` ("No upload in
+  progress", `isUploading()`), and the cron, which deletes expired
+  uploads, finishes the job (about 100 keys a run, never aborting the
+  marker as a multipart upload) if no further request does.
+- **`404 {"error": "Not found"}`:** nothing was listed.
+
+**Clients:**
+
+- **`yeet delete`** asks again while the answer says `done: false`, up to
+  200 requests per upload (`MAX_DELETE_ROUNDS` in
+  `packages/cli/src/limits.ts`, 20,000 objects); if it stops before the
+  end (the cap, or a later request fails) it still prints "Deleted <id>",
+  adding that the server's hourly cleanup removes the rest; a `404` on a
+  later request means the cleanup got there first. A `404` or an error on
+  the first request is an error, as before.
+- **The upload page** deletes only uploads it created itself, with their
+  size, so with no part records: 1 or 2 objects, always done in one
+  request (the cancel and the `pagehide` `keepalive` request need no
+  loop).
+- **An older CLI** sends one `DELETE` and takes any `2xx` as success: it
+  prints "Deleted" after a `202` too, and that is true for users (see
+  above); the rest goes with the cron.
+
+Tests: `e2e/tests/node/r2-regressions-1l.spec.ts` (2,000 part records on
+the strict bucket: one list of at most 100 objects and at most 4 R2 calls
+per request, the sidecar marked and never missing until the end, 21
+requests to delete all; a single `DELETE` finished by the cron),
+`delete-bounded.spec.ts` (on `wrangler dev`, and `yeet delete` against a
+stand-in server) and `download-records.spec.ts` (2,100 legacy records:
+22 requests). _Estimate, not measured:_ phase 1K measured a `DELETE` of a
+small upload at p50 4, p90 7 ms (n = 11); 100 objects listed add about
+1.5 ms at the cron's 15 µs per object, plus a delete call.
+
+Other deletions by a request use the same bounded `Uploads.delete()`: the
+download page and form of an expired upload (in `waitUntil()`), and a
+`complete` whose size does not match.
+
 ### Measurements (phase 1H)
 
 Measured on a real Workers Free deploy (a test account, Sentry off), with
@@ -583,7 +641,10 @@ phases mean little.
   - the last page of a bucket, with 0, 25 and 80 uploads (about 0, 50 and
     160 objects listed): p50 2, 3 and 5 ms, max 4, 4 and 7 (n = 10 each);
   - a page with 10 sidecar reads: p50 16, p90 21 (n = 22); with 5: p50 11,
-    p90 17 (n = 22): about 0.3–0.5 ms per read;
+    p90 17 (n = 22): against a full page's p50 7, about 0.8–0.9 ms per read at p50;
+    with phase 1K's (5 reads: p50 6 against 5 for a full page, 6 against
+    4 late) about 0.2–0.4: so **about 0.2–1.0 ms per read** (this said
+    "0.3–0.5" until round 1L);
   - a page with a jump over legacy records (600 objects): p50 18, p90 22
     (n = 12).
 
@@ -629,7 +690,69 @@ PBKDF2 stays at 20,000 iterations. _Estimates from the fits above, not
 measured:_ a full page about 1.7 + 150 × 0.02 ≈ 4.7 ms; a cron run at
 worst (100 objects and 3 summaries) about 2.9 + 100 × 0.015 + 3 × 1.26 ≈
 8.2 ms; a run with a `deleteUnder()` round (3 × 100 objects) about 2.9 +
-300 × 0.015 ≈ 7.4 ms. See "To measure next".
+300 × 0.015 ≈ 7.4 ms. Phase 1K measured these (below): the page and the
+summaries confirmed, the `deleteUnder()` round refuted (p50 10, p90 12).
+
+### Measurements (phase 1K)
+
+A short control measurement of the bounds of round 1K (`PAGE_LIMIT` 150,
+`PAGE_READS` 5, `CLEANUP_LIST_LIMIT` 100, `CLEANUP_SUMMARIES` 3,
+`MAX_UNSIZED_PARTS` 300), on a real Workers Free deploy of `c686b17` (a
+test account, Sentry off), measured as in phase 1J: CPU time per
+invocation from `wrangler tail`, the cron's `runCleanup()` called through
+a probe Worker on the same bucket. **Session noise:** a password check
+took p50 10, p90 14 ms early in the session (n = 60) and p50 8, p90 12
+late (n = 60), about as in phase 1H (8 and 13), faster than in phase 1J
+(13 and 20). "Late" below is the same measurement repeated at the end.
+
+- **`GET /api/uploads`** (a bucket of about 3,000 uploads with a summary):
+  - a full page (150 objects, 74 uploads) **during a walk**, pages spaced
+    out: p50 5, p90 8, max 11 ms (n = 66, two walks pooled); the **same
+    page repeated**: p50 4, p90 7 (n = 45); late p50 4, p90 4 (n = 15);
+  - a page with 5 sidecar reads: p50 6, p90 9 (n = 15); late p50 6, p90 7
+    (n = 15);
+  - a page with a jump (300 objects): p50 8, p90 13, max 18 (n = 51,
+    pooled); late p50 9, p90 12 (n = 15).
+- **`yeet list`** (the built CLI) over 3,052 uploads: 3 runs, each exit 0
+  with all 3,052 shown, in 6.8–11.0 s; the page requests of those runs,
+  back to back: p50 6, p90 10, max 13 ms (n = 36 captured of about 126).
+- **The cron** (`runCleanup()` through the probe Worker): a plain run of
+  100 objects p50 5, p90 9 (n = 20, pooled); a run with deletes p50 4,
+  p90 7 (n = 10); a run with 3 summaries p50 6, p90 7 (n = 15); a run with
+  a `deleteUnder()` round (300 objects: the slice and the jump, 100 each
+  with metadata, 100 without, and a delete) p50 10, p90 12, max 13
+  (n = 20, pooled). The real hourly run was not captured this time (it was
+  in phase 1J).
+- **`POST /api/uploads/:id/complete` of unknown size:** 300 part records
+  p50 14, p90 17 ms (n = 8, all `200`); 301 records, refused (`400`): p50
+  9, p90 11 (n = 8). Real R2 returns 301 objects to a `limit: 301`.
+- Other routes in the same session: `DELETE /api/uploads/:id` of a small
+  upload p50 4, p90 7, max 9 (n = 11); a sized `complete` p50 4, p90 9
+  (n = 10).
+- No `exceededCpu` anywhere.
+
+**The estimates of phases 1J and 1K, against these:**
+
+| estimated                                         | measured (1K)                     | verdict           |
+| ------------------------------------------------- | --------------------------------- | ----------------- |
+| a full page of 150 objects: about 4.7 ms          | p50 4–5, p90 7–8                  | confirmed (p50)   |
+| sidecar reads within a page's 10 ms               | 5 reads: p50 6, p90 9             | confirmed         |
+| cron, 3 summaries at worst: about 8.2 ms          | p50 6, p90 7                      | confirmed, better |
+| cron, a `deleteUnder()` round (300): about 7.4 ms | p50 10, p90 12, max 13            | refuted: higher   |
+| `complete`, 300 part records: about 6–10 ms       | p50 14, p90 17                    | refuted: higher   |
+| a page with a jump (300 objects)                  | p50 8, p90 13, max 18 (not given) | over 10 ms at p90 |
+
+**Decided (round 1L):** `MAX_UNSIZED_PARTS` 300 → 150; the jump over a
+`.downloads/` or `.parts/` run lists at most 50 objects (`JUMP_LIMIT`; a
+page with a jump at most 200, a cron slice with a jump 150); the cron
+deletes the keys its listing saw of an upload it did not see whole instead
+of listing it again (`deleteUnder()` round gone: at most 2 list calls a
+run); and a `DELETE /api/uploads/:id` deletes at most 100 objects per
+request (`DELETE_LIMIT`). The other constants stay. _Estimates, not
+measured_ (see "To measure next"): a page with a jump about p50 6, p90 10;
+the cron run that replaces the `deleteUnder()` one about p50 8, p90 10;
+the `complete` of 150 records about p50 7–9; a `DELETE` of 100 objects
+about 1.5 ms above a small one's p50 4, p90 7.
 
 ### Listing a page (GET /api/uploads)
 
@@ -678,9 +801,9 @@ asserted in `e2e/tests/node/r2-work-bounds.spec.ts` on a bucket returning
   at most 150 objects, about 75 finished uploads. Real R2 returns more
   than 150 per call, so the `limit` is the bound. 300 until round 1K;
   measured at 300 in phase 1J (p50 7–12, p90 10–17 ms, see "Measurements
-  (phase 1J)") and halved for headroom. _Estimate, not measured:_ about
-  1.7 + 150 × 0.02 ≈ 4.7 ms a page (the last page of a bucket listing
-  about 160 objects measured p50 5, max 7 ms).
+  (phase 1J)") and halved for headroom. Estimated at about 1.7 + 150 ×
+  0.02 ≈ 4.7 ms a page; measured in phase 1K at p50 5, p90 8 during a
+  walk (n = 66): confirmed.
 - **At most one more list call** (`PAGE_JUMPS`), only when the first ends
   inside a `.downloads/` or `.parts/` run: it continues after the run
   (`startAfter: <prefix>/<id>/<run>/~`), so an upload with thousands of
@@ -770,7 +893,11 @@ has with a note and exits 1; if the first page fails, that is the error.
 For any status whose `Retry-After` was too long to wait for, the note
 says when to try again (round 1K; before, only a `429` did), as "in N
 seconds", minutes or hours, or "later" above a day rather than the raw
-number. (Before round 1J a later page that was not JSON was an error
+number. The count is rounded up, in the smallest unit that keeps it at
+most 90 (round 1L: 90 seconds, then 2 minutes; 90 minutes, then 2 hours;
+before, 7,199 s read "120 minutes"), and the note closes the server's
+message without a doubled period ("(Service unavailable. Try again in 2
+minutes); run `yeet list` again", round 1L). (Before round 1J a later page that was not JSON was an error
 that printed nothing.) It fetches at most 1,000 pages, so a server that
 keeps answering with a cursor cannot keep it busy forever. Tested against
 a stand-in server in `e2e/tests/node/cli.spec.ts` and `verify-1j.spec.ts`,
@@ -820,8 +947,8 @@ amount of work, whatever the bucket holds:
 2. **Lists one slice from there:** one list call with custom metadata and
    `limit: 100` (`CLEANUP_LIST_LIMIT`, about 50 uploads), and at most one
    more to jump over a `.downloads/` or `.parts/` run it ends in
-   (`CLEANUP_JUMPS`). It leaves sidecars without a summary unread and
-   reserves 2 calls for each.
+   (`CLEANUP_JUMPS`, with `limit: 50`, `JUMP_LIMIT`). It leaves sidecars
+   without a summary unread and reserves 2 calls for each.
 3. **Gives sidecars without a summary theirs first**, at most **3 per
    run** (`CLEANUP_SUMMARIES`, 10 until round 1K): a get and a conditional put
    (`onlyIf: { etagMatches }`) each. The get also tells the run whether
@@ -830,42 +957,50 @@ amount of work, whatever the bucket holds:
    left without a summary wait for the next run. A sidecar that can never
    get one (see "Sidecars that never get a summary") takes one of the 3
    attempts in every run that reaches it.
-4. **Handles the uploads in key order:**
-   - **Expired, and pending for over 24 hours:** their keys go into batch
-     deletes, the sidecars in a batch of their own after all other keys; a
-     pending one first gets its multipart upload aborted (1 call; again in
-     each run while its deletion takes several).
-   - **An upload whose keys the listing did not all see, and the legacy
-     records of a current upload:** listed and deleted under
-     `<prefix>/<id>/` (or only `.downloads/` for a current upload) with
-     `deleteUnder()`, **one such upload per run and one round**: a list of
-     at most 100 keys without metadata and a delete, plus 1 for the
-     sidecar, deleted on its own once everything else is gone. An upload
-     with more keys takes several runs; the run stops at it, and the next
-     starts there.
+4. **Handles the uploads in key order**, deleting only keys its listing
+   saw, in batch deletes with the sidecars in a batch of their own after
+   all other keys:
+   - **Expired, and pending for over 24 hours:** all their keys; a pending
+     one first gets its multipart upload aborted (1 call; again in each run
+     while its deletion takes several; not for an upload whose deletion a
+     `DELETE` began, see "Deleting an upload").
+   - **The legacy records of a current upload:** its `.downloads/` keys.
+   - **An upload whose keys the listing did not all see** (it jumped over
+     the rest of a run): the keys it saw, but never its sidecar, and the
+     run stops there; the next run starts with that upload and sees the
+     next keys of the run. So such an upload takes one run per about 100
+     of its keys, and its sidecar goes once every other key is gone. Until
+     round 1L the run listed such an upload again on its own with
+     `deleteUnder()` (a third list call of up to 100 keys, and a delete):
+     phase 1K measured that run at p50 10, p90 12 ms (see "Measurements
+     (phase 1K)").
 5. **Saves the cursor** (1 call, only if it changed): after the last upload
    it finished. If it reached the end of the bucket, the next run starts at
    the beginning.
 
 **Work per run** (asserted in `e2e/tests/node/r2-work-bounds.spec.ts`, 415
-objects per list call): at most **3 list calls of at most 100 objects**
-(the slice, a jump, one `deleteUnder()` round), so at most 300 objects
-examined (usually one call of 100); at most 3 summaries written; and at
-most **45 R2 calls** (`CLEANUP_BUDGET`), a second guard from the time 50
-subrequests were assumed: a run's own work needs at most 17 (cursor read
-and write, 2 lists, 6 for summaries, 3 for `deleteUnder()`, 4 batch
+objects per list call): at most **2 list calls, of at most 100 and 50
+objects** (the slice and a jump), so at most 150 objects examined (usually
+one call of 100); at most 3 summaries written; and at most **45 R2 calls**
+(`CLEANUP_BUDGET`), a second guard from the time 50 subrequests were
+assumed: a run's own work needs at most 13 (cursor read and write, 2
+lists, a sidecar read after a short jump, 6 for summaries, 2 batch
 deletes), so the rest only limits multipart aborts. 100 rather than a
-page's 150 because a run may list three times. Measured at the bounds of
-round 1I (200 objects, 10 summaries; see "Measurements (phase 1J)"): p50
-6–7 ms for a plain run or one with deletes, 12 (p90 14) with a
-`deleteUnder()` round, 19 (p90 22) with 10 summaries, so the limit and the
-summaries were lowered in round 1K. _Estimates, not measured:_ at most
-about 2.9 + 100 × 0.015 + 3 × 1.26 ≈ 8.2 ms for a run with 3 summaries,
-and about 2.9 + 300 × 0.015 ≈ 7.4 ms for one with a `deleteUnder()` round.
+page's 150 because a run also writes summaries and deletes. Measured at
+the bounds of round 1K in phase 1K: a plain run p50 5, p90 9 ms; one with
+deletes p50 4, p90 7; one with 3 summaries p50 6, p90 7; one with a
+`deleteUnder()` round (300 objects) p50 10, p90 12, max 13 (see
+"Measurements (phase 1K)"). _Estimate, not measured:_ the run that now
+replaces the last (a slice of 100, a jump of 50, the deletes of what it
+saw) is a run with a jump and deletes: with the 1J slope of about 15 µs
+per object, about 2 ms below the `deleteUnder()` run, so about p50 8, p90
+10 ms.
 
 **The sidecar goes last** because it is what makes the listing see an
 upload: when a run (or a `DELETE /api/uploads/:id`) stops half-way, what is
-left still has its sidecar, and the next run finds it stale and goes on.
+left still has its sidecar, and the next run finds it stale and goes on (a
+`DELETE` marks it as a deletion under way, expired, see "Deleting an
+upload").
 Keys left without a sidecar would never be cleaned up.
 
 **Never cleaned up by the cron:** uploads whose sidecar it cannot read
@@ -883,7 +1018,9 @@ in (1 call of its budget), and so knows whether it is stale. Before round
 1J it handled the upload as current and deleted only its records, which
 was harmless: a later run lists it whole once few enough records are
 left (`e2e/tests/node/verify-1i.spec.ts`, with every jump empty: 12 runs
-before the fix, 11 after, to clean up 3 uploads of 600 records or parts).
+before the fix, 11 after, to clean up 3 uploads of 600 records or parts;
+20 since round 1L, whose runs delete only the keys they saw, about half a
+slice each when every jump comes back empty).
 
 **Runs per bucket** (`e2e/tests/node/r2-capacity.spec.ts` and
 `r2-work-bounds.spec.ts`; 415 objects per list call, every tenth upload
@@ -901,8 +1038,9 @@ So a bucket of N uploads with summaries is gone through in ceil(N / 49)
 hours (49 = the 50 uploads of 100 objects, minus the last, left for the
 next run; 5,000 uploads in about 4.3 days); one without summaries in
 ceil(N / 3) hours (72 a day). Deleting a run of legacy records or part
-records takes one run per about 100 keys (a stale upload with 30,000 such
-keys: 344 runs). At the bounds of round 1I: ceil(N / 99) and N / 10 hours,
+records takes one run per about 100 keys (a stale upload with 3,000
+records and 30,000 other keys after its sidecar: 329 runs, 344 before
+round 1L). At the bounds of round 1I: ceil(N / 99) and N / 10 hours,
 169 runs. Expired files are refused at request time regardless (the page,
 the form and `/_dl` check `expires_at`), so a later deletion costs only
 storage; `yeet list` shows them as expired until then.
@@ -921,25 +1059,36 @@ their upload has been reached (`cronUntil()` in `e2e/lib/bucket.ts`).
 
 ### To measure next (on a real deploy)
 
-Phase 1J measured what the earlier list asked for (see "Measurements
-(phase 1J)"). What remains is a **short control measurement of the bounds
-of round 1K**, on the same kind of deploy, against the estimates above:
+Phase 1K measured the bounds of round 1K (see "Measurements (phase 1K)").
+What remains is a **control measurement of the bounds of round 1L**, on the
+same kind of deploy and in the same way, against the estimates above
+(none of them measured yet):
 
-- `GET /api/uploads`: a full page (150 objects, 74 uploads; estimated
-  about 4.7 ms), one with 5 sidecar reads, and one with a jump (300
-  objects), during a walk and repeated; and `yeet list` through a bucket
-  of several thousand uploads.
-- The cron: a plain run of 100 objects, one with deletes, one with 3
-  summaries (estimated about 8.2 ms at worst), and one with a
-  `deleteUnder()` round (estimated about 7.4 ms).
-- `POST /api/uploads/:id/complete` of an upload of unknown size with 300
-  part records (estimated about 6–10 ms) and with 301 (refused).
-- If a page or a run is still over 10 ms, lower `PAGE_LIMIT`,
-  `CLEANUP_LIST_LIMIT`, `PAGE_READS` or `CLEANUP_SUMMARIES` (or
-  `MAX_UNSIZED_PARTS`). That is a change of the constant and of the
-  numbers in this file: the tests compute what they expect from the
-  constants, and `verify-1i.spec.ts` and `r2-capacity.spec.ts` check that
-  this file states their values and the numbers derived from them.
+- `GET /api/uploads`: a page with a jump of at most 50 objects (200 in
+  all; estimated p50 about 6, p90 about 10 ms), during a walk and
+  repeated, with an empty and a short jump among them.
+- The cron: a run that ends inside an upload's run of legacy records or
+  part records and deletes the keys it saw (a slice of 100, a jump of 50,
+  a batch delete; estimated p50 about 8, p90 about 10), for a current
+  upload with legacy records and for a stale one; and how many runs a
+  stale upload with a few thousand part records takes on real R2 (one per
+  about 100 keys expected).
+- `POST /api/uploads/:id/complete` of an upload of unknown size with 150
+  part records (estimated p50 about 7–9) and with 151 (refused, about 6);
+  and a sized `complete` with a long `parts` array (up to 10,000 entries,
+  refused for the declared size), not measured at all.
+- `DELETE /api/uploads/:id` of an upload with a few thousand part records:
+  each request (100 objects listed, one delete, the sidecar's rewrite;
+  estimated about 1.5 ms above a small `DELETE`'s p50 4, p90 7), the
+  number of requests `yeet delete` makes, and the cron finishing an
+  upload left after one request.
+- If a page, a run or a request is still over 10 ms, lower the constant
+  (`PAGE_LIMIT`, `JUMP_LIMIT`, `CLEANUP_LIST_LIMIT`, `PAGE_READS`,
+  `CLEANUP_SUMMARIES`, `MAX_UNSIZED_PARTS`, `DELETE_LIMIT`). That is a
+  change of the constant and of the numbers in this file: the tests
+  compute what they expect from the constants, and `verify-1i.spec.ts` and
+  `r2-capacity.spec.ts` check that this file states their values and the
+  numbers derived from them.
 
 ### Migrating a bucket of yeet < 0.2 (one-time)
 
@@ -1009,7 +1158,7 @@ The pre-release versions 1D and 1E wrote one empty object per download,
 `<prefix>/<id>/.downloads/<at>_<random>`. They are no longer written or
 counted: the listing jumps over them, the cron deletes them (as above,
 about 100 per hourly run), and `DELETE /api/uploads/:id` removes them with their
-upload. They are not added to the count first: that would take a
+upload (100 objects a request, see "Deleting an upload"). They are not added to the count first: that would take a
 conditional sidecar update per batch, and a failed delete after it would
 count them twice. They only exist in pre-release test buckets, whose counts
 drop back to what the sidecar holds. Records without an upload (a download

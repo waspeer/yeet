@@ -173,14 +173,16 @@ Rules of thumb:
   minutes or more. The cleanup also deletes legacy `.downloads/` records and
   adds the summary custom metadata to sidecars without one, so a test that
   seeds or inspects either holds the same lock. A cron run handles one
-  bounded slice of the bucket (about 50 uploads, at most 3 summaries, at
-  most about 100 keys of one upload it lists on its own), and the test
+  bounded slice of the bucket (about 50 uploads, at most 3 summaries, and
+  of an upload with more keys than that, the ones it saw), and the test
   bucket is shared by every test of the run, so one run rarely gets
   through it: wait for an effect with `cronUntil(check)`, which triggers
   runs until `check` holds, rather than one `triggerCron()` and
   `eventually()`. Sidecars the cron cannot read, or whose summary is too
   large, never get one, so leave none behind; `docs/design/api.md` has the
-  details.
+  details. A `DELETE /api/uploads/:id` deletes at most 100 objects and
+  answers `202` while more is left: delete a test upload with more (part
+  or legacy records) with `deleteUploadFully()`.
 - Likewise `GET /api/uploads` answers one page (about 50 uploads under
   `wrangler dev`, which returns at most 100 objects per list call);
   `listUploads()` follows the cursors and returns all of them.
