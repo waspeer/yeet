@@ -46,6 +46,7 @@ import {
   newConfigHome,
   randomFile,
   server,
+  sleep,
   startServer,
   test,
 } from "../../lib/index.js";
@@ -200,6 +201,9 @@ interface Recorded {
   path: string;
   body: Buffer;
   json?: Record<string, unknown>;
+  /** When the whole request had arrived, and when it was answered (performance.now()). */
+  receivedAt: number;
+  answeredAt?: number;
 }
 
 /**
@@ -221,7 +225,7 @@ async function standIn(
     req.on("end", async () => {
       const path = new URL(req.url!, "http://x").pathname;
       const body = Buffer.concat(chunks);
-      const r: Recorded = { method: req.method!, path, body };
+      const r: Recorded = { method: req.method!, path, body, receivedAt: performance.now() };
       if (req.headers["content-type"] === "application/json" && body.length)
         r.json = JSON.parse(body.toString());
       requests.push(r);
@@ -246,6 +250,7 @@ async function standIn(
                 : { deleted: "up1" };
       res.writeHead(status, { "Content-Type": "application/json" });
       res.end(JSON.stringify(reply));
+      r.answeredAt = performance.now();
     });
   });
   await new Promise<void>((resolve) => srv.listen(0, "127.0.0.1", resolve));
@@ -484,14 +489,55 @@ test.describe("yeet upload <folder>: the upload (stand-in server)", () => {
     }
   });
 
-  test("Ctrl-C while a part uploads: deleted, never completed, exit 130", async ({ tmp }) => {
+  /** The DELETE came after the server had answered every part it received. */
+  const deletedAfterParts = (s: Awaited<ReturnType<typeof standIn>>) => {
+    const [del] = s.deletes();
+    const lastAnswer = Math.max(...s.puts().map((p) => p.answeredAt ?? Infinity));
+    expect(del, "a DELETE").toBeDefined();
+    expect(del!.receivedAt, "DELETE before a part in flight was answered").toBeGreaterThan(
+      lastAnswer,
+    );
+  };
+
+  test("a failure waits for the parts in flight before it deletes the upload", async ({ tmp }) => {
+    // Regression: the CLI used to abort the other parts' requests and send
+    // DELETE at once. The server may still store such a part (and, for an
+    // upload of unknown size, write its part record) after the DELETE, which
+    // nothing ever removes (docs/design/api.md, known limitations).
+    const { root } = await album(tmp);
+    const s = await standIn(1000, async (r) => {
+      if (r.path.endsWith("/parts/1")) {
+        await sleep(100);
+        return 400; // not retried
+      }
+      if (r.method === "PUT") await sleep(600);
+    });
+    try {
+      const r = await cli(["upload", root], { env: s.env });
+      expectAborted(s, r, /stand-in error/);
+      const part1 = s.puts().find((p) => p.path.endsWith("/parts/1"))!;
+      // Other parts were in flight when part 1 failed.
+      expect(s.puts().filter((p) => p !== part1 && p.receivedAt < part1.answeredAt!).length).toBe(
+        2,
+      );
+      deletedAfterParts(s);
+    } finally {
+      await s.close();
+    }
+  });
+
+  test("Ctrl-C while parts upload: they finish, then the upload is deleted; exit 130", async ({
+    tmp,
+  }) => {
     const { root } = await album(tmp);
     let sawPart!: () => void;
     const partArrived = new Promise<void>((resolve) => (sawPart = resolve));
-    const s = await standIn(1000, (r) => {
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => (release = resolve));
+    const s = await standIn(1000, async (r) => {
       if (r.method !== "PUT") return;
       sawPart();
-      return "hold"; // never answer: the part is in flight when Ctrl-C comes
+      await released; // parts are in flight when Ctrl-C comes
     });
     const home = await newConfigHome();
     try {
@@ -502,12 +548,18 @@ test.describe("yeet upload <folder>: the upload (stand-in server)", () => {
       let stderr = "";
       child.stderr.setEncoding("utf-8").on("data", (c: string) => (stderr += c));
       await partArrived;
+      const closed = new Promise<number | null>((resolve) => child.on("close", resolve));
       child.kill("SIGINT");
-      const code = await new Promise<number | null>((resolve) => child.on("close", resolve));
+      await sleep(300);
+      release();
+      const code = await closed;
       expect(code, stderr).toBe(130);
       expect(stderr).toContain("Upload of album.zip cancelled; nothing was kept.");
       expect(s.completes()).toEqual([]);
       expect(s.deletes().map((d) => d.path)).toEqual(["/api/uploads/up1"]);
+      deletedAfterParts(s);
+      // No part was started after Ctrl-C.
+      expect(s.puts().length).toBeLessThanOrEqual(3);
     } finally {
       await s.close();
     }

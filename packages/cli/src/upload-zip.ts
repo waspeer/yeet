@@ -8,7 +8,8 @@
 // file stored (`--store`, or only already-compressed files), see
 // storedZipSize(). On any error (a file that cannot be read or changed while
 // it was read, a part that failed after its retries, Ctrl-C) the multipart
-// upload is aborted with DELETE and never completed, so no truncated zip is
+// upload is deleted (after the parts in flight finish) and never completed,
+// so no truncated zip is
 // ever published. See docs/design/zip.md.
 
 import { open, type FileHandle } from "node:fs/promises";
@@ -35,6 +36,9 @@ export class InterruptedError extends Error {
     super("Interrupted");
   }
 }
+
+/** How long a failed upload waits for its parts in flight before it aborts them and deletes. */
+const IN_FLIGHT_GRACE_MS = 30_000;
 
 /** Bytes read from disk per chunk. */
 const READ_CHUNK = 1024 * 1024;
@@ -153,16 +157,26 @@ export async function uploadZip(
     },
   );
 
-  const controller = new AbortController();
+  // After a failure no new part starts and no retry is made (`stop`), but
+  // parts in flight are let finish before the DELETE: one the server is
+  // still storing could otherwise land after it (and leave a part record
+  // nothing removes). Only if they take longer than IN_FLIGHT_GRACE_MS are
+  // their requests aborted (`requests`).
+  const stop = new AbortController();
+  const requests = new AbortController();
   let failure: unknown;
   const fail = (err: unknown) => {
     if (failure === undefined) {
       failure = err;
-      controller.abort(err);
+      stop.abort(err);
     }
   };
-  const onSigint = () => fail(new InterruptedError());
-  process.once("SIGINT", onSigint);
+  // A second Ctrl-C quits at once (the server's cleanup removes the upload).
+  const onSigint = () => {
+    if (failure instanceof InterruptedError) process.exit(130);
+    fail(new InterruptedError());
+  };
+  process.on("SIGINT", onSigint);
 
   const limit = MAX_UNSIZED_PARTS * partSize;
   const tooLarge = () =>
@@ -197,12 +211,12 @@ export async function uploadZip(
               "Content-Length": String(data.length),
             },
             duplex: "half",
-            signal: controller.signal,
+            signal: requests.signal,
           } as RequestInit,
         );
       },
       4,
-      controller.signal,
+      stop.signal,
     );
     parts.push(part);
   };
@@ -255,23 +269,19 @@ export async function uploadZip(
     parts.sort((a, b) => a.part_number - b.part_number);
     const { url } = await withRetries(
       () =>
-        api<{ url: string }>(
-          config,
-          "POST",
-          `/uploads/${id}/complete`,
-          { parts, size: produced },
-          { signal: controller.signal },
-        ),
+        api<{ url: string }>(config, "POST", `/uploads/${id}/complete`, { parts, size: produced }),
       4,
-      controller.signal,
+      stop.signal,
     );
     return url;
   } catch (err) {
     fail(err);
     // Stop reading files (cancels the zip and its current source), let the
-    // aborted part requests settle, then delete the multipart upload.
+    // parts in flight finish, then delete the multipart upload.
     await reader.cancel(failure).catch(() => {});
+    const grace = setTimeout(() => requests.abort(failure), IN_FLIGHT_GRACE_MS);
     await Promise.allSettled(inFlight);
+    clearTimeout(grace);
     await abortUpload(config, id);
     throw failure;
   } finally {
