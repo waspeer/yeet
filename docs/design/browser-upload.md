@@ -112,7 +112,8 @@ about half the page memory of `Uint8Array` bodies in WebKit.
   `NotFoundError: The object can not be found here`. The most likely cause is
   that the screen locked or Safari went to the background: iOS drops the
   upload, then revokes access to the picked `File`.
-- **Production consequences:**
+- **Production consequences** (all done in round 2C, see "Round 2C"
+  below):
   - Keep the screen awake with a Wake Lock.
   - Treat `NotFoundError` while reading as "file access lost", not as a
     retryable error, and say so plainly, e.g. "Safari stopped when the screen
@@ -162,6 +163,38 @@ local `wrangler dev`, 120 MiB (3 parts):
   only; real R2 is untested).
 - **Playwright WebKit cancels the `keepalive` DELETE sent on `pagehide`
   whenever a `page.route()` is active;** without interception it arrives.
+
+## Round 2C: the finished page (single file)
+
+What the page now does, besides phase 1B (details in [api.md](api.md),
+"Upload page module"):
+
+- **Look:** the yeet window of the download and login pages (`layout()`
+  in `template.ts`): striped title bar, close box, Geneva 12 px, black
+  borders and hard shadows, the black primary button. The select and the
+  progress bar are drawn in the same black and white.
+- **Options:** expiry (1, 7, 30 by default, 90 days, 1 year) and an
+  optional download password, chosen before the file; the done state
+  repeats both next to **Copy link**.
+- **Phone width:** touch-size targets and 16 px fields below 480 px or on
+  a touch screen; checked at 375 × 667 in all three engines (no sideways
+  scrolling, every target at least 44 px and on screen).
+- **Lost file access:** a failed read (`NotFoundError`) is "file access
+  lost", not a network error: the upload is kept, and choosing the same
+  file again continues from the first unacknowledged part. Tested by
+  renaming the file away on disk mid-upload: reading the `File` then fails
+  in every Playwright engine, in WebKit with the iPhone's own
+  `NotFoundError: The object can not be found here.` (Chromium:
+  `NotFoundError`, Firefox: `AbortError`).
+- **Found while testing:** once its file is gone, WebKit's
+  `File.lastModified` no longer returns the date the file had (it reads
+  the missing file again), so the page records name, size and
+  `lastModified` when the file is chosen.
+- **No cleanup `DELETE` after `complete`** (a verifier found that a
+  cancel or `pagehide` during `complete` could destroy a finished
+  upload), and the server's `complete` no longer undoes a concurrent
+  `DELETE`.
+- **Zipping** (several files, folders) is a later round.
 
 ## Untested
 
