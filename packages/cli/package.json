@@ -1,6 +1,6 @@
 {
   "name": "@waspeer/yeet",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Share files from your terminal with expiring, optionally password-protected download links, served by your own Cloudflare Worker",
   "keywords": [
     "cli",
@@ -23,7 +23,8 @@
     "yeet": "./dist/index.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "CHANGELOG.md"
   ],
   "type": "module",
   "publishConfig": {
