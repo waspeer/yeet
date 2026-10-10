@@ -87,6 +87,11 @@ Projects:
 | `webkit`   | `tests/browser/*` | download + upload pages in Playwright's WebKit (Desktop Safari)   |
 | `firefox`  | `tests/browser/*` | download + upload pages in Playwright's Firefox (Desktop Firefox) |
 
+With `YEET_E2E_MEASURE=1` there are three more projects, `measure-chromium`,
+`measure-webkit` and `measure-firefox` (`tests/measure/*`, opt-in measurements that are never
+part of a normal run): `YEET_E2E_MEASURE=1 npm run verify -- --project=measure-chromium
+--workers=1` prints the browser's RSS while the upload page zips a 1 GiB folder.
+
 Environment knobs: `YEET_E2E_WORKERS=<n>` (parallel Playwright workers,
 default 2 so a run does not max out a laptop; raise it on a bigger machine),
 `YEET_E2E_KEEP=1` (keep the temp directory with the R2 state and print its path).
@@ -367,6 +372,19 @@ logPath, stop() }`: another `wrangler dev` of the Worker, with its own ports,
   `resetStats(page)`: every value of the progress bar, and the main thread's
   worst lateness on a 10 ms `setInterval`.
 - `shareLink(page, timeout?)`: waits for the done state and returns the link.
+- `dropFiles(page, paths)`: drops several files at once (round 2C+2).
+- `dropTree(page, nodes)`, `treeOf(dir)`: drops files and folders. No test can make a
+  browser drop a real folder, so the drop carries stand-ins for the browser's
+  `webkitGetAsEntry()` entries (`file()`, `createReader().readEntries()` in batches,
+  Chromium's `getMetadata()`) around real `File`s: files on disk (backed by the file, so a
+  rename makes their reads fail) or made in the page (`text`, e.g. names that cannot exist
+  side by side on a case-insensitive disk). `treeOf(dir)` gives a folder on disk as Finder
+  drops it, `.DS_Store` included.
+- Folders can also be picked: `page.locator("#folder-input").setInputFiles(dir)` (a
+  `webkitdirectory` input) works in all three engines; it reports no empty folders.
+- The page's test hook `window.__yeetE2E = { maxUnsizedParts: n }` (set with
+  `page.addInitScript()` before `goto`) lowers its limit for zips of unknown size, so
+  `tests/browser/upload-zip.spec.ts` reaches the forced store with 51 MiB instead of 8 GB.
 
 The upload runs in a Web Worker. In Playwright 1.63, `page.route()`,
 `page.waitForRequest/Response()` and `context.on("request")` all see that

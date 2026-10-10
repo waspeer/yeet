@@ -56,15 +56,35 @@ const ORIGIN = "https://yeet.test";
 
 /** A strict bucket with a multipart complete that can run a hook mid-way. */
 class RaceBucket extends StrictBucket {
+  /** Runs when the route calls R2's complete, before R2 does anything (round 2C+2). */
+  beforeComplete?: () => Promise<void>;
   /** Runs after R2's complete made the file, before the route goes on. */
   duringComplete?: () => Promise<void>;
+  /**
+   * Refuse a second complete of the same multipart upload, as R2 may (what
+   * real R2 does is not measured; round 2C+2).
+   */
+  completeOnce = false;
+  readonly completed = new Set<string>();
   completes = 0;
+  /** With the object's size, as R2's head() has it. */
+  override async head(key: string) {
+    const found = await super.head(key);
+    return found ? { ...found, size: this.objects.get(key)!.body.length } : null;
+  }
   override resumeMultipartUpload(key: string, uploadId: string) {
     const base = super.resumeMultipartUpload(key, uploadId);
     return {
       abort: base.abort,
       complete: async (_parts: unknown) => {
+        const before = this.beforeComplete;
+        this.beforeComplete = undefined;
+        if (before) await before();
         if (this.aborted.includes(uploadId)) throw new Error("multipart upload aborted");
+        if (this.completeOnce && this.completed.has(uploadId)) {
+          throw new Error("multipart upload already completed");
+        }
+        this.completed.add(uploadId);
         this.completes++;
         this.seed(key, "abc");
         const hook = this.duringComplete;
@@ -212,5 +232,142 @@ test.describe("complete racing a DELETE, through the routes", () => {
     );
     expect(res.status).toBe(401);
     expect(b.calls).toEqual({});
+  });
+});
+
+// Round 2C+2 (leftovers of the 2C+ verifier). (a) A DELETE that aborted the
+// multipart upload after complete read the sidecar: R2's complete then
+// throws, and the route answered 400 "Could not complete the upload; check
+// that every part was uploaded…", which is not what happened. (b) A
+// complete sent again while the first is still running (the page retries a
+// complete whose answer it lost): if R2 refuses the second multipart
+// complete, the second request must still end well.
+test.describe("complete after R2 refused it (round 2C+2)", () => {
+  for (const records of [0, 150]) {
+    test(`a DELETE (${records ? "more than" : "at most"} DELETE_LIMIT objects) before R2's complete: 404 "it was deleted", not 400`, async () => {
+      const b = new RaceBucket({ maxCalls: Infinity });
+      seedPending(b, "c1", records);
+      let deleted: { status: number } | undefined;
+      b.beforeComplete = async () => {
+        deleted = await call(b, "DELETE", "/api/uploads/c1");
+      };
+      const res = await call(b, "POST", "/api/uploads/c1/complete", completeBody);
+      expect(deleted?.status).toBe(records ? 202 : 200);
+      expect(b.aborted).toEqual(["mp-c1"]);
+      expect(res).toEqual({
+        status: 404,
+        json: { error: "No upload in progress: it was deleted" },
+      });
+      expect(b.completes).toBe(0);
+      expect(b.objects.has(`${P}/c1/f.bin`)).toBe(false);
+      expect((await call(b, "GET", "/api/uploads")).json.uploads).toEqual([]);
+    });
+  }
+
+  test("a second complete inside the first, R2 refusing the second: both answer the same link", async () => {
+    const b = new RaceBucket({ maxCalls: Infinity });
+    b.completeOnce = true;
+    seedPending(b, "c2");
+    let inner: Awaited<ReturnType<typeof call>> | undefined;
+    b.duringComplete = async () => {
+      inner = await call(b, "POST", "/api/uploads/c2/complete", completeBody);
+    };
+    const outer = await call(b, "POST", "/api/uploads/c2/complete", completeBody);
+    expect(b.completes).toBe(1);
+    expect(inner).toEqual({ status: 200, json: { id: "c2", url: `${ORIGIN}/c2/f.bin` } });
+    expect(outer).toEqual(inner);
+    expect(b.sorted(`${P}/c2/`)).toEqual([`${P}/c2/.meta.json`, `${P}/c2/f.bin`]);
+    expect(sidecar(b, "c2")).toMatchObject({ filename: "f.bin", file_size: 3 });
+    expect(sidecar(b, "c2")?.pending_upload_id).toBeUndefined();
+  });
+
+  test("the same with the size unknown (part records): both 200, the upload whole", async () => {
+    const b = new RaceBucket({ maxCalls: Infinity });
+    b.completeOnce = true;
+    // Size unknown at create, one part record (as the page's zip uploads).
+    const meta: UploadMeta = {
+      filename: "f.zip",
+      uploaded_at: new Date().toISOString(),
+      expires_at: new Date(Date.now() + 30 * DAY).toISOString(),
+      pending_upload_id: "mp-c3",
+    };
+    b.seed(`${P}/c3/.meta.json`, JSON.stringify(meta), {
+      summary: JSON.stringify(summarize(meta)),
+    });
+    b.seed(`${P}/c3/.parts/1`, "", { size: "3" });
+    let inner: Awaited<ReturnType<typeof call>> | undefined;
+    b.duringComplete = async () => {
+      inner = await call(b, "POST", "/api/uploads/c3/complete", completeBody);
+    };
+    const outer = await call(b, "POST", "/api/uploads/c3/complete", completeBody);
+    expect(inner).toEqual({ status: 200, json: { id: "c3", url: `${ORIGIN}/c3/f.zip` } });
+    expect(outer).toEqual(inner);
+    expect(b.sorted(`${P}/c3/`)).toEqual([`${P}/c3/.meta.json`, `${P}/c3/f.zip`]);
+  });
+
+  test("R2 refusing a complete for another reason is still the 400, after one head and one read more", async () => {
+    const b = new RaceBucket({ maxCalls: Infinity });
+    b.completeOnce = true;
+    seedPending(b, "c4");
+    // As if R2 refused this multipart upload's complete without making the
+    // file (a wrong etag, say): nothing interferes.
+    b.completed.add("mp-c4");
+    b.reset();
+    const res = await call(b, "POST", "/api/uploads/c4/complete", completeBody);
+    expect(res.status).toBe(400);
+    expect(String(res.json.error)).toMatch(/^Could not complete the upload; check that every part/);
+    expect(b.calls).toEqual({ get: 2, head: 1 });
+    expect(sidecar(b, "c4")?.pending_upload_id).toBe("mp-c4");
+  });
+});
+
+// Round 2C+2 verifier: the head (and sidecar read) after a refused complete
+// must stay off the normal path, and the "no file, but finished" branch is
+// pinned too (no earlier test reached it).
+test.describe("complete after R2 refused it: verifier 2C+2", () => {
+  test("a normal complete (size known) makes no head and reads the sidecar once", async () => {
+    const b = new RaceBucket({ maxCalls: Infinity });
+    seedPending(b, "v1");
+    b.reset();
+    const res = await call(b, "POST", "/api/uploads/v1/complete", completeBody);
+    expect(res).toEqual({ status: 200, json: { id: "v1", url: `${ORIGIN}/v1/f.bin` } });
+    expect(b.completes).toBe(1);
+    expect(b.calls).toEqual({ get: 1, put: 1 });
+  });
+
+  test("a normal complete (size unknown, one part record) makes no head either", async () => {
+    const b = new RaceBucket({ maxCalls: Infinity });
+    const meta: UploadMeta = {
+      filename: "f.zip",
+      uploaded_at: new Date().toISOString(),
+      expires_at: new Date(Date.now() + 30 * DAY).toISOString(),
+      pending_upload_id: "mp-v2",
+    };
+    b.seed(`${P}/v2/.meta.json`, JSON.stringify(meta), {
+      summary: JSON.stringify(summarize(meta)),
+    });
+    b.seed(`${P}/v2/.parts/1`, "", { size: "3" });
+    b.reset();
+    const res = await call(b, "POST", "/api/uploads/v2/complete", completeBody);
+    expect(res.status).toBe(200);
+    expect(b.calls["head"]).toBeUndefined();
+    expect(b.calls["get"]).toBe(1);
+  });
+
+  test("R2 refused, no file, the sidecar finished meanwhile: 200 with the link", async () => {
+    const b = new RaceBucket({ maxCalls: Infinity });
+    b.completeOnce = true;
+    seedPending(b, "v3");
+    b.completed.add("mp-v3");
+    // Between the route's sidecar read and R2's complete, another request
+    // finished the upload (sidecar without pending_upload_id); no file.
+    b.beforeComplete = async () => {
+      const { pending_upload_id: _, ...finished } = sidecar(b, "v3")!;
+      b.seed(`${P}/v3/.meta.json`, JSON.stringify(finished), {
+        summary: JSON.stringify(summarize(finished)),
+      });
+    };
+    const res = await call(b, "POST", "/api/uploads/v3/complete", completeBody);
+    expect(res).toEqual({ status: 200, json: { id: "v3", url: `${ORIGIN}/v3/f.bin` } });
   });
 });

@@ -1,5 +1,7 @@
 // Helpers for driving the browser upload page (/upload).
 
+import { readdir, stat } from "node:fs/promises";
+import { basename, join } from "node:path";
 import { expect, type Page } from "@playwright/test";
 import { server } from "./env.js";
 
@@ -45,6 +47,155 @@ export async function dropFile(page: Page, path: string): Promise<void> {
       );
     }
   });
+}
+
+/** Drop several files at once (a real DataTransfer, as dropFile()). */
+export async function dropFiles(page: Page, paths: string[]): Promise<void> {
+  await page.evaluate(() => {
+    const helper = document.createElement("input");
+    helper.type = "file";
+    helper.multiple = true;
+    helper.id = "e2e-drop-source";
+    helper.hidden = true;
+    document.body.append(helper);
+  });
+  await page.locator("#e2e-drop-source").setInputFiles(paths);
+  await page.evaluate(() => {
+    const helper = document.getElementById("e2e-drop-source") as HTMLInputElement;
+    const data = new DataTransfer();
+    for (const file of helper.files!) data.items.add(file);
+    helper.remove();
+    const target = document.getElementById("drop")!;
+    for (const type of ["dragenter", "dragover", "drop"]) {
+      target.dispatchEvent(
+        new DragEvent(type, { dataTransfer: data, bubbles: true, cancelable: true }),
+      );
+    }
+  });
+}
+
+/**
+ * A file or folder to drop with dropTree(): a file on disk (`source`), a
+ * file made in the page (`text`, with `lastModified`), or a folder
+ * (`children`, with its `mtime`).
+ */
+export interface DropNode {
+  name: string;
+  source?: string;
+  text?: string;
+  lastModified?: number;
+  children?: DropNode[];
+  mtime?: number;
+}
+
+/** The DropNode of a folder on disk, as Finder would drop it (everything, .DS_Store included). */
+export async function treeOf(dir: string): Promise<DropNode> {
+  const children: DropNode[] = [];
+  for (const name of (await readdir(dir)).sort()) {
+    const path = join(dir, name);
+    const st = await stat(path);
+    children.push(st.isDirectory() ? await treeOf(path) : { name, source: path });
+  }
+  return { name: basename(dir), children, mtime: (await stat(dir)).mtimeMs };
+}
+
+/**
+ * Drop files and folders on the upload page. No test can make a browser
+ * drop a real folder, so the drop event carries stand-ins for what the
+ * browser hands out (webkitGetAsEntry() FileSystemEntry objects: isFile,
+ * isDirectory, name, file(), createReader().readEntries() in batches, and
+ * Chromium's getMetadata() for a folder's date), around real File objects:
+ * those of files on disk come from a helper file input, so they are backed
+ * by the file (a rename makes their reads fail, as on an iPhone).
+ */
+export async function dropTree(page: Page, nodes: DropNode[]): Promise<void> {
+  const sources: string[] = [];
+  const index = (node: DropNode): unknown => ({
+    ...node,
+    source: undefined,
+    index: node.source ? sources.push(node.source) - 1 : undefined,
+    children: node.children?.map(index),
+  });
+  const indexed = nodes.map(index);
+  await page.evaluate(() => {
+    const helper = document.createElement("input");
+    helper.type = "file";
+    helper.multiple = true;
+    helper.id = "e2e-drop-source";
+    helper.hidden = true;
+    document.body.append(helper);
+  });
+  if (sources.length) await page.locator("#e2e-drop-source").setInputFiles(sources);
+  await page.evaluate((tree) => {
+    type Node = {
+      name: string;
+      index?: number;
+      text?: string;
+      lastModified?: number;
+      children?: Node[];
+      mtime?: number;
+    };
+    const helper = document.getElementById("e2e-drop-source") as HTMLInputElement;
+    const files = [...(helper.files ?? [])];
+    helper.remove();
+    const later = (fn: () => void) => setTimeout(fn, 0);
+    const make = (node: Node, parent: string): unknown => {
+      const fullPath = `${parent}/${node.name}`;
+      if (node.children) {
+        const children = node.children;
+        return {
+          isFile: false,
+          isDirectory: true,
+          name: node.name,
+          fullPath,
+          createReader() {
+            // Two batches, then none, as Chromium hands out 100 at a time.
+            const batches = [children.slice(0, 2), children.slice(2), []];
+            return {
+              readEntries(ok: (entries: unknown[]) => void) {
+                const batch = batches.shift() ?? [];
+                later(() => ok(batch.map((child) => make(child, fullPath))));
+              },
+            };
+          },
+          getMetadata(ok: (m: { modificationTime: Date }) => void) {
+            later(() => ok({ modificationTime: new Date(node.mtime ?? Date.now()) }));
+          },
+        };
+      }
+      const file =
+        node.index !== undefined
+          ? files[node.index]!
+          : new File([node.text ?? ""], node.name, { lastModified: node.lastModified });
+      return {
+        isFile: true,
+        isDirectory: false,
+        name: node.name,
+        fullPath,
+        file(ok: (file: File) => void) {
+          later(() => ok(file));
+        },
+      };
+    };
+    const entries = tree.map((node) => make(node as Node, ""));
+    const data = {
+      files: [],
+      items: entries.map((entry) => ({
+        kind: "file",
+        type: "",
+        webkitGetAsEntry: () => entry,
+        getAsFile: () => null,
+      })),
+      types: ["Files"],
+      dropEffect: "none",
+    };
+    const target = document.getElementById("drop")!;
+    for (const type of ["dragenter", "dragover", "drop"]) {
+      const event = new Event(type, { bubbles: true, cancelable: true });
+      Object.defineProperty(event, "dataTransfer", { value: data });
+      target.dispatchEvent(event);
+    }
+  }, indexed);
 }
 
 /**

@@ -46,6 +46,7 @@ import {
 import { uploadPage } from "./upload-page.js";
 import { runCleanup } from "./cleanup.js";
 import {
+  DELETED_UPLOAD_ID,
   generateId,
   isExpired,
   isValidFilename,
@@ -483,13 +484,31 @@ api.post("/uploads/:id/complete", async (c) => {
   try {
     object = await multipart.complete(parts);
   } catch (err) {
-    const detail = err instanceof Error ? ` (${err.message})` : "";
-    return c.json(
-      {
-        error: `Could not complete the upload; check that every part was uploaded and its etag is right${detail}`,
-      },
-      400,
-    );
+    // R2 refused (round 2C+2). Not always the client's fault: another
+    // request may have completed this multipart upload meanwhile (a
+    // complete sent again while the first still runs; then the file
+    // exists and this request finishes like that one, the conditional
+    // sidecar write keeping it to one), or a DELETE may have aborted it.
+    // Only on this path: 1 head, and without a file 1 sidecar read.
+    const made = await c.env.BUCKET.head(uploads.fileKey(id, meta.filename));
+    if (made) {
+      object = made;
+    } else {
+      const now = await uploads.readSidecar(id);
+      if (!now.meta || now.meta.pending_upload_id === DELETED_UPLOAD_ID) {
+        return c.json({ error: "No upload in progress: it was deleted" }, 404);
+      }
+      if (!now.meta.pending_upload_id && now.meta.filename === meta.filename) {
+        return c.json({ id, url: shareUrl(new URL(c.req.url).origin, id, meta.filename) });
+      }
+      const detail = err instanceof Error ? ` (${err.message})` : "";
+      return c.json(
+        {
+          error: `Could not complete the upload; check that every part was uploaded and its etag is right${detail}`,
+        },
+        400,
+      );
+    }
   }
 
   const expected = [meta.file_size, body?.size as number | undefined].find(

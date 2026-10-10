@@ -30,5 +30,16 @@ export default defineConfig({
     { name: "chromium", testDir: "tests/browser", use: { ...devices["Desktop Chrome"] } },
     { name: "webkit", testDir: "tests/browser", use: { ...devices["Desktop Safari"] } },
     { name: "firefox", testDir: "tests/browser", use: { ...devices["Desktop Firefox"] } },
+    // Opt-in measurements (tests/measure), only with YEET_E2E_MEASURE=1:
+    // never part of a normal run, so never "skipped" in strict mode.
+    ...(process.env.YEET_E2E_MEASURE
+      ? (
+          [
+            ["measure-chromium", "Desktop Chrome"],
+            ["measure-webkit", "Desktop Safari"],
+            ["measure-firefox", "Desktop Firefox"],
+          ] as const
+        ).map(([name, device]) => ({ name, testDir: "tests/measure", use: { ...devices[device] } }))
+      : []),
   ],
 });

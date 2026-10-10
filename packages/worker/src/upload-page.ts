@@ -31,6 +31,9 @@ const PAGE_CSS = `
 .hint{color:#444;font-weight:normal;font-size:11px;margin-top:4px}
 .drop{border:2px dashed #000;padding:24px 12px;text-align:center;line-height:2;margin-bottom:12px}
 .drop.over{background:#eee}
+.pickers{display:inline-flex;gap:8px;flex-wrap:wrap;justify-content:center}
+.warning{border:2px solid #000;box-shadow:2px 2px 0 #000;padding:8px 10px;line-height:1.5;margin-bottom:4px}
+.hint.center{text-align:center;margin:0 0 8px}
 .row{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-top:12px}
 progress{width:100%;height:16px;margin-bottom:8px}
 input[readonly]{background:#fff}
@@ -40,7 +43,7 @@ input[readonly]{background:#fff}
 .logout button{box-shadow:none;border-width:1px;padding:2px 10px;font-size:11px}
 a.button{display:inline-flex;align-items:center;border:2px solid #000;background:#fff;color:#000;padding:5px 20px;box-shadow:2px 2px 0 #000;text-decoration:none}
 @media (max-width:480px),(pointer:coarse){a.button{min-height:44px}}
-@media (pointer:coarse){.drag-hint{display:none}}
+@media (pointer:coarse){.drag-hint,#choose-folder{display:none}}
 [hidden]{display:none!important}
 `.trim();
 
@@ -64,24 +67,42 @@ export function uploadPage(): string {
           <div class="hint">If you set one, people need it to download the file.</div>
         </div>
         <div id="drop" class="drop">
-          <span class="drag-hint">Drag a file here<br>or<br></span>
-          <button type="button" id="choose" class="primary" disabled>Choose file</button>
-          <input type="file" id="file-input" hidden>
+          <span class="drag-hint">Drag files or a folder here<br>or<br></span>
+          <span class="pickers">
+            <button type="button" id="choose" class="primary" disabled>Choose files</button>
+            <button type="button" id="choose-folder" hidden>Choose folder</button>
+          </span>
+          <input type="file" id="file-input" multiple hidden>
+          <input type="file" id="folder-input" webkitdirectory hidden>
         </div>
         <div id="idle-note" class="note" role="status"></div>
+        <div id="idle-error" class="error" role="alert" hidden></div>
+      </section>
+
+      <section id="state-confirm" hidden>
+        <div id="confirm-name" class="filename"></div>
+        <div id="confirm-size" class="meta"></div>
+        <div id="confirm-message" class="warning" role="alert"></div>
+        <div class="row">
+          <button type="button" id="confirm-upload" class="primary">Upload anyway</button>
+          <button type="button" id="confirm-back">Choose again</button>
+        </div>
       </section>
 
       <section id="state-uploading" hidden>
         <div id="up-name" class="filename"></div>
+        <div id="up-files" class="hint center" hidden></div>
         <progress id="bar" max="100" value="0" aria-label="Upload progress"></progress>
         <div class="meta"><span id="percent">0%</span> · <span id="amount"></span> · <span id="speed"></span></div>
         <div id="up-note" class="note" role="status"></div>
+        <div id="up-warn" class="hint center" hidden></div>
         <div class="row"><button type="button" id="cancel">Cancel</button></div>
       </section>
 
       <section id="state-done" hidden>
         <div id="done-name" class="filename"></div>
         <div class="summary">
+          <div id="done-files" hidden></div>
           <div id="done-expiry"></div>
           <div id="done-password"></div>
         </div>

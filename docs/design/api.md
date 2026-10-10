@@ -416,10 +416,14 @@ Numbers that are signed or used as keys must be spelled one way only:
 
     150 parts are up to about 7.9 GB at the 50 MiB part size. With the size
     known at create there is no such limit (R2's own 10,000 parts). The
-    upload page, and the CLI for a single file, always send the size, 0
-    included, so they never take this path (asserted:
+    upload page for a single file, and the CLI for a single file, always
+    send the size, 0 included, so they never take this path (asserted:
     `e2e/tests/node/unsized-complete.spec.ts` for the CLI,
-    `tests/browser/upload.spec.ts` for the page). **The CLI's compressed
+    `tests/browser/upload.spec.ts` for the page). **The upload page's
+    compressed zips do** (round 2C+2, see "Upload page module"), but only
+    when an upper bound of the zip's size fits these 150 parts; a larger
+    selection is stored completely and sent with its size, so the page
+    never meets this refusal. **The CLI's compressed
     zip uploads may** (`yeet upload <file1> <file2> …` or `<folder>`): a
     compressed zip's size is only known once it is written. The CLI knows
     the limit (`MAX_UNSIZED_PARTS` in `packages/cli/src/limits.ts`, kept
@@ -501,7 +505,29 @@ Numbers that are signed or used as keys must be spelled one way only:
   upload, or one being deleted, still gets the `404`.
 - **Errors R2 raises at `complete`** (e.g. a wrong etag): `400` with
   "Could not complete the upload; check that every part was uploaded and its
-  etag is right (…)" instead of a 500.
+  etag is right (…)" instead of a 500. Since round 2C+2 the route first
+  checks whether the refusal has another cause (1 `head` of the file, and
+  without a file 1 sidecar read; only on this error path, so a `complete`
+  that works makes no extra call):
+  - **The file exists:** another request completed this multipart upload
+    meanwhile (the upload page sends `complete` again when it lost the
+    answer to the first, and the first may still be running). This request
+    goes on as if its own R2 complete had worked, with the file's size: the
+    sidecar write is conditional (`finishUpload()`), so only one request
+    writes it and both answer `200` with the same link.
+  - **The sidecar is gone or the deletion marker:** a `DELETE` aborted the
+    multipart upload after `complete` read the sidecar. `404 {"error": "No
+upload in progress: it was deleted"}`, as when the `DELETE` lands after
+    R2's complete (before, a misleading `400`).
+  - **The sidecar is a finished one:** `200` with its link.
+  - Otherwise the `400` above.
+
+  What real R2 does with a second `complete` of one multipart upload
+  (refuse it, or answer like the first) is **not measured**; both are
+  handled. Tests: `e2e/tests/node/complete-route-race.spec.ts` ("complete
+  after R2 refused it"), on the in-memory bucket, with an R2 that refuses a
+  second complete.
+
 - **`422` body:**
   `{"error": "Size mismatch: expected X bytes, stored Y", "expected_size": X, "stored_size": Y}`.
 - **Size `0`:** a zero-length part (`Content-Length: 0`) is accepted, so an
@@ -597,12 +623,16 @@ request could list and delete about 10,000 objects.
   adding that the server's hourly cleanup removes the rest; a `404` on a
   later request means the cleanup got there first. A `404` or an error on
   the first request is an error, as before.
-- **The upload page** deletes only uploads it created itself, with their
-  size, so with no part records: 1 or 2 objects, always done in one
-  request (the cancel and the `pagehide` `keepalive` request need no
-  loop). It never sends that `DELETE` once it has sent `complete`, nor
-  for an upload it keeps to continue after losing access to the file
-  (see "Upload page module").
+- **The upload page** deletes only uploads it created itself. Of a
+  single file or a stored zip (size known) that is 1 or 2 objects, done
+  in one request. A compressed zip (round 2C+2, size unknown) has a part
+  record per part, up to 150: its cancel, its failure and its replacement
+  after lost files ask again while the answer is `202`, up to 5 requests;
+  the `pagehide` `keepalive` request is a single one, after which such an
+  upload is gone for users and the cron deletes the rest. It never sends
+  that `DELETE` once it has sent `complete`, nor for an upload it keeps
+  to continue (or replace) after losing access to the file (see "Upload
+  page module").
 - **An older CLI** sends one `DELETE` and takes any `2xx` as success: it
   prints "Deleted" after a `202` too, and that is true for users (see
   above); the rest goes with the cron.
@@ -1182,6 +1212,10 @@ would cost more than they do. The exception is the CLI's temporary zip
   takes more than 30 s after the failure (then it aborts the request), or
   when the user quits at once with a second Ctrl-C (or a Ctrl-C after
   another failure; round 2B.1).
+  The upload page's compressed zips (round 2C+2) wait the same way, up to
+  6 s, on a cancel or a failure; leaving the page mid-upload terminates
+  the worker at once, so there a part being stored can still leave its
+  record.
 - **A CLI zip larger than about 7.8 GB is written to disk first.** Since
   round 2B.1 a compressed zip whose worst case does not fit in
   `MAX_UNSIZED_PARTS` goes through a temporary file (see above), so it
@@ -1323,8 +1357,9 @@ a normalized header. Following RFC 9110 §14:
   in `template.ts`, so it looks like the download and login pages). The
   page script is `src/upload/main.ts` (`public/upload.js`), the upload
   runs in a Web Worker, `src/upload/worker.ts` (`public/upload-worker.js`),
-  and their messages are typed in `src/upload/protocol.ts`. `index.ts`
-  adds `Cache-Control: no-store`.
+  and their messages are typed in `src/upload/protocol.ts`; what a
+  selection uploads is decided in `src/upload/selection.ts` (round 2C+2).
+  `index.ts` adds `Cache-Control: no-store`.
 - **Options** (round 2C): before a file is chosen, "Link works for"
   (`EXPIRY_CHOICES`: 1 day, 7 days, 30 days by default, 90 days, 1 year
   = the 365-day maximum of `expires_in`) and an optional download
@@ -1335,7 +1370,8 @@ a normalized header. Following RFC 9110 §14:
   **Copy link**.
 - **Phone width:** below 480 px or on a touch screen, buttons and fields
   are at least 44 px high and fields 16 px (iOS Safari zooms into smaller
-  ones); on a touch screen the drop zone drops "Drag a file here". The
+  ones); on a touch screen the drop zone drops "Drag files or a folder
+  here" and the **Choose folder** button (round 2C+2). The
   screen is kept awake with a Wake Lock while uploading, where the browser
   has one.
 - **No cleanup after `complete`:** once the worker has sent `complete`
@@ -1343,7 +1379,38 @@ a normalized header. Following RFC 9110 §14:
   sends no `DELETE` on `pagehide`, and the worker ignores a cancel and
   never deletes it, even if `complete` fails (the cron removes an upload
   still pending after 24 hours). A retried `complete` of a finished
-  upload gets its `200` again (see "Completing an upload").
+  upload gets its `200` again (see "Completing an upload"). Since round
+  2C+2 the worker waits at least 5 s (`COMPLETE_RETRY_MIN_MS`) before it
+  sends `complete` again, because the first may still be running on the
+  server when its answer is lost; a second one meanwhile is handled too
+  ("Errors R2 raises at `complete`"). How long a `complete` takes on real
+  R2 is not measured.
+- **Several files or a folder** (round 2C+2): the file picker takes
+  several files, **Choose folder** a folder (`webkitdirectory`, hidden on
+  a touch screen), and a drop either (folders read with
+  `webkitGetAsEntry()`). One file is uploaded as before; anything else
+  becomes one zip, made in the Web Worker with the shared `zip.ts`
+  (`src/upload/selection.ts` decides, `src/upload/worker.ts` zips; the
+  rules, the names and the size bound are in
+  [zip.md](zip.md), "Callers", and
+  [browser-upload.md](browser-upload.md), "Round 2C+2"). The size:
+  - **every file stored** (only already-compressed or empty files):
+    `storedZipSize()`, sent at create, no part limit;
+  - **otherwise** sent at `complete`, so at most `MAX_UNSIZED_PARTS`
+    parts; the page deflates only if an upper bound of the zip fits them;
+  - **a larger selection** is stored completely and sent with its size.
+    If some of its files would have compressed, the page first says so
+    (more than about 7.8 GB, so uploaded uncompressed; for a smaller
+    download zip it yourself first, on a Mac with right-click →
+    Compress) with **Upload anyway** and **Choose again**.
+
+  A selection that cannot be zipped is refused before anything is
+  created: nothing in it but `.DS_Store` and empty folders, or two names
+  that would be the same in the zip (with both names). **Test hook:**
+  `window.__yeetE2E = { maxUnsizedParts: n }` before the page loads
+  lowers the page's limit (never above 150), so the e2e tests reach the
+  forced store with 51 MiB.
+
 - **Lost file access** (iOS revokes access to a picked file when the
   screen locks; see docs/design/browser-upload.md): the worker reads one
   byte of the file before each part attempt and after a failed one. If
@@ -1362,6 +1429,26 @@ a normalized header. Following RFC 9110 §14:
   it. WebKit aborts the upload and the file's reads as a page is left, so
   a page left mid-upload can reach this state just before `pagehide`;
   either way the upload is deleted.
+- **Lost files during a zip** (round 2C+2): a zip part is in memory, so
+  the worker reads one byte of the file it read last after a failed part
+  attempt, and a failed read of a file while zipping stops the zip; both
+  end the upload as `file`, kept on the server. Then:
+  - **a stored zip** (size known) is fully determined by its files, so
+    choosing the same files again (the same paths, sizes and dates, as
+    they were first chosen, and the same empty folders) continues it: the
+    zip is made again from the start, the parts the server has are cut
+    but not sent, and the first unacknowledged part goes out next ("…
+    Choose the same folder again to continue where it stopped.");
+  - **a compressed zip** cannot continue part-way, so the page says that
+    choosing the files again starts the upload over ("… the upload starts
+    over from the beginning, because a compressed zip can't continue
+    where it stopped."); the old upload is deleted when the new one
+    starts (or with **Cancel upload**, or when the page is left);
+  - either way, nothing deletes an upload once `complete` is sent.
 - **Tests:** `e2e/tests/browser/upload.spec.ts`,
-  `upload-resume.spec.ts`, `upload-mobile.spec.ts`; screenshots of each
-  state in `screenshots.spec.ts` (to `e2e/screenshots/2c/`, git-ignored).
+  `upload-resume.spec.ts`, `upload-mobile.spec.ts`, `upload-zip.spec.ts`
+  (zips: pickers, drops, the size paths, the warning, refusals, lost
+  files, cancel, no `DELETE` after `complete`), and
+  `tests/node/upload-selection.spec.ts` (`planSelection()` against the
+  CLI's `planUpload()`); screenshots of each state in `screenshots.spec.ts`
+  (to `e2e/screenshots/2c/` and, for zips, `2c2/`, git-ignored).
