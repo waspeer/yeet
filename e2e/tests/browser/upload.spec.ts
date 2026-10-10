@@ -313,30 +313,43 @@ test.describe("upload page", () => {
     expect(await serverLog()).not.toContain(`/api/uploads/${id}/complete`);
   });
 
-  // No page.route() here: with any route active, Playwright's WebKit cancels
-  // the keepalive DELETE sent from pagehide (it never reaches the server),
-  // while without interception it arrives. So the upload is kept "in flight"
-  // by its size instead, and the test leaves as soon as the first part starts.
-  test(
-    "leaving the page mid-upload deletes the upload",
-    { tag: "@slow" },
-    async ({ page, tmp }) => {
-      test.setTimeout(120_000);
-      const file = await randomFile(tmp, 120 * MiB, "leave me.bin");
-      await logIn(page);
-      const created = createdId(page);
-      const firstPart = page.waitForRequest((request) => isPart(request));
-      await choose(page, "input", file.path);
-      const id = await created;
-      await firstPart;
+  // With any route active, Playwright's WebKit cancels the keepalive DELETE
+  // sent from pagehide (it never reaches the server). So the part is held
+  // without a route still active when the page is left: its only attempt is
+  // answered 503 with Retry-After: 30, the worker waits 30 s before the
+  // next, and the route is removed before leaving (nothing is left held
+  // for Playwright to let through). Until round 2D this test raced a
+  // 120 MiB upload against the navigation, and lost when every part and
+  // the complete finished first.
+  test("leaving the page mid-upload deletes the upload", async ({ page, tmp }) => {
+    const file = await randomFile(tmp, 10 * MiB, "leave me.bin");
+    await logIn(page);
+    let refused = 0;
+    await page.route("**/api/uploads/*/parts/*", (route) => {
+      refused++;
+      return route.fulfill({
+        status: 503,
+        headers: { "Retry-After": "30" },
+        json: { error: "busy" },
+      });
+    });
+    const created = createdId(page);
+    await choose(page, "input", file.path);
+    const id = await created;
+    await expect(page.locator("#up-note")).toHaveText("The connection hiccupped. Trying again…");
+    await page.unrouteAll({ behavior: "wait" });
+    expect(refused).toBe(1);
+    await expect(page.getByRole("button", { name: "Cancel" })).toBeVisible();
 
-      // The page asks before leaving mid-upload; leave anyway.
-      page.once("dialog", (dialog) => void dialog.accept());
-      await page.goto("/");
-      await expectGone(id);
-      expect(await serverLog()).not.toContain(`/api/uploads/${id}/complete`);
-    },
-  );
+    // The page asks before leaving mid-upload; leave anyway.
+    page.once("dialog", (dialog) => void dialog.accept());
+    await page.goto("/");
+    await expectGone(id);
+    const log = await serverLog();
+    expect(log).toContain(`DELETE /api/uploads/${id} `);
+    expect(log).not.toContain(`/api/uploads/${id}/parts/`);
+    expect(log).not.toContain(`/api/uploads/${id}/complete`);
+  });
 
   // Once `complete` is sent the upload may already be finished on the
   // server: a cleanup DELETE then would destroy it (round 2C).

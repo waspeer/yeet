@@ -394,7 +394,10 @@ The upload runs in a Web Worker. In Playwright 1.63, `page.route()`,
 worker's requests in Chromium, WebKit and Firefox; the failure tests inject
 errors with `page.route()`. Exception: while any route is active, Playwright's
 WebKit cancels a `keepalive` fetch sent from `pagehide`, so the "leaving the
-page" test uses no route.
+page" test removes its route before it leaves. It cannot hold a part there
+either (`unrouteAll()` lets a held request through), so it answers the
+part's attempt with `503` and `Retry-After: 30`, and leaves while the
+worker waits.
 
 Losing access to the picked file (as iOS does when the screen locks) is
 simulated by renaming the file away on disk while a part is held, then
