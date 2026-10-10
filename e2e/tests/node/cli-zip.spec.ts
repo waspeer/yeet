@@ -106,6 +106,77 @@ test.describe("yeet upload: what gets zipped", () => {
     expect((await plan(["."].map((d) => join(root, d)))).name).toBe("Stems v2.zip");
   });
 
+  test("a symbolic link loop inside a folder is skipped as a loop, not as a link to nothing", async ({
+    tmp,
+  }) => {
+    // Regression (round 2B verification): ELOOP was reported as "a symbolic link to nothing".
+    const root = join(tmp, "loops");
+    await mkdir(root);
+    await writeFile(join(root, "a.txt"), "a");
+    await symlink("self", join(root, "self")); // points at itself
+    await symlink("pong", join(root, "ping"));
+    await symlink("ping", join(root, "pong"));
+    const p = await plan([root]);
+    expect(p.files.map((f) => f.path)).toEqual(["loops/a.txt"]);
+    const warnings = p.warnings.join("\n");
+    for (const name of ["self", "ping", "pong"]) {
+      expect(warnings).toContain(`Skipped ${root}/${name}: a symbolic link loop.`);
+    }
+    expect(warnings).not.toMatch(/to nothing/);
+  });
+
+  test("a top-level symbolic link loop is named as one, not as a missing file", async ({ tmp }) => {
+    // Regression (round 2B verification): it said "File not found".
+    const loop = join(tmp, "loop");
+    await symlink("loop", loop);
+    const other = await fileWith(tmp, "other.txt", "x");
+    for (const paths of [[loop], [other.path, loop]]) {
+      const err = await planUpload(paths).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(SelectionError);
+      expect(String(err)).toMatch(
+        /: .*loop is a symbolic link loop \(following it leads back to itself\)\./,
+      );
+      expect(String(err)).not.toMatch(/not found/);
+    }
+    // A link to a file that does not exist is still "not found".
+    await symlink(join(tmp, "gone"), join(tmp, "dangling"));
+    await expect(planUpload([join(tmp, "dangling")])).rejects.toThrow(/File not found: .*dangling/);
+  });
+
+  test("a file deleted while its folder is read: a selection error, not a raw ENOENT", async ({
+    tmp,
+  }) => {
+    // Regression (round 2B verification): the lstat() after readdir() threw
+    // ENOENT unwrapped. The race is forced by deleting the file right after
+    // readdir() lists the folder.
+    const root = join(tmp, "racy");
+    await mkdir(root);
+    await writeFile(join(root, "a.txt"), "a");
+    await writeFile(join(root, "b.txt"), "b");
+    const fsp = (await import("node:fs/promises")).default as unknown as Record<
+      string,
+      (...args: unknown[]) => Promise<unknown>
+    >;
+    const { syncBuiltinESMExports } = await import("node:module");
+    const realReaddir = fsp.readdir!;
+    fsp.readdir = async (...args: unknown[]) => {
+      const names = await realReaddir(...args);
+      if (args[0] === root) await fsp.rm!(join(root, "b.txt"));
+      return names;
+    };
+    syncBuiltinESMExports();
+    try {
+      const err = await planUpload([root]).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(SelectionError);
+      expect(String(err)).toContain(
+        `Cannot read ${root}/b.txt: it was removed or renamed while yeet read the folder. Try again.`,
+      );
+    } finally {
+      fsp.readdir = realReaddir;
+      syncBuiltinESMExports();
+    }
+  });
+
   test("several paths: yeet-<timestamp>.zip, files at the top level, folders as entries", async ({
     tmp,
   }) => {
