@@ -100,6 +100,8 @@ export function uploadPage(): string {
           <a id="login-again" class="button" href="/upload" hidden>Log in again</a>
           <button type="button" id="retry" class="primary">Retry</button>
           <button type="button" id="error-another">Choose another file</button>
+          <button type="button" id="choose-again" class="primary" hidden>Choose the file again</button>
+          <button type="button" id="discard" hidden>Cancel upload</button>
         </div>
       </section>
 

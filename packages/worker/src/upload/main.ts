@@ -1,7 +1,7 @@
 // The upload page (see upload-page.ts for the markup). Picks one file, hands it
 // to a dedicated Web Worker (worker.ts) and shows what the worker reports.
 
-import type { FromWorker, ToWorker } from "./protocol.js";
+import type { FromWorker, Resume, ToWorker } from "./protocol.js";
 
 type State = "idle" | "uploading" | "done" | "error";
 
@@ -42,6 +42,9 @@ const errorMessage = el("error-message");
 const loginAgain = el("login-again");
 const retry = el<HTMLButtonElement>("retry");
 const cancelButton = el<HTMLButtonElement>("cancel");
+const errorAnother = el<HTMLButtonElement>("error-another");
+const chooseAgain = el<HTMLButtonElement>("choose-again");
+const discard = el<HTMLButtonElement>("discard");
 
 let state: State = "idle";
 let worker: Worker | null = null;
@@ -59,6 +62,34 @@ let uploadId: string | null = null;
 let completing = false;
 /** When the link of the current upload stops working (from its start). */
 let expiresAt = new Date();
+/** The server's part size and the acknowledged parts of the current upload. */
+let partSize = 0;
+let parts = new Map<number, string>();
+
+/**
+ * An upload that stopped because the file could no longer be read (see
+ * FailureKind "file"). It stays open on the server; choosing the same file
+ * again (same name, size and lastModified) continues it from its first
+ * unacknowledged part, any other file starts afresh and deletes it.
+ */
+interface Resumable {
+  id: string;
+  partSize: number;
+  parts: Map<number, string>;
+  name: string;
+  size: number;
+  lastModified: number;
+  options: { expiresIn: number; password: string };
+  expiresAt: Date;
+}
+let resumable: Resumable | null = null;
+/**
+ * Name, size and date of the current file, taken when it was chosen: once
+ * the file is gone, WebKit's File.lastModified no longer gives the date
+ * it had (it reads the missing file again).
+ */
+let identity = { name: "", size: 0, lastModified: 0 };
+
 let samples: { at: number; sent: number }[] = [];
 let wakeLock: WakeLockSentinel | null = null;
 
@@ -132,16 +163,52 @@ function chosenOptions(): { expiresIn: number; password: string } {
   return { expiresIn, password: passwordInput.value };
 }
 
+function isSameFile(chosen: File, previous: Resumable): boolean {
+  return (
+    chosen.name === previous.name &&
+    chosen.size === previous.size &&
+    chosen.lastModified === previous.lastModified
+  );
+}
+
+/** Delete an upload this page left open (best effort; the cleanup gets it after 24 h). */
+function deleteOnServer(id: string): void {
+  void fetch(`/api/uploads/${encodeURIComponent(id)}`, { method: "DELETE" }).catch(() => {});
+}
+
 function start(chosen: File, opts = chosenOptions()): void {
   if (state === "uploading") return;
+  let resume: Resume | undefined;
+  if (resumable) {
+    const previous = resumable;
+    resumable = null;
+    if (isSameFile(chosen, previous)) {
+      resume = {
+        id: previous.id,
+        partSize: previous.partSize,
+        parts: [...previous.parts].map(([n, etag]) => ({ part_number: n, etag })),
+      };
+      opts = previous.options;
+      expiresAt = previous.expiresAt;
+      parts = new Map(previous.parts);
+    } else {
+      deleteOnServer(previous.id);
+    }
+  }
+  if (!resume) {
+    parts = new Map();
+    // Counted from now: the server counts from its create, moments later.
+    expiresAt = new Date(Date.now() + opts.expiresIn * 1000);
+  }
   file = chosen;
+  identity = { name: chosen.name, size: chosen.size, lastModified: chosen.lastModified };
   options = opts;
   uploadId = null;
   completing = false;
   cancelButton.hidden = false;
   samples = [{ at: performance.now(), sent: 0 }];
   idleNote.textContent = "";
-  upNote.textContent = "";
+  upNote.textContent = resume ? "Continuing where it stopped…" : "";
   el("up-name").textContent = chosen.name;
   renderProgress(0, chosen.size);
   show("uploading");
@@ -166,6 +233,7 @@ function start(chosen: File, opts = chosenOptions()): void {
     file: chosen,
     expiresIn: opts.expiresIn,
     ...(opts.password ? { password: opts.password } : {}),
+    ...(resume ? { resume } : {}),
   } satisfies ToWorker);
   void keepAwake();
 }
@@ -174,7 +242,10 @@ function onMessage(message: FromWorker): void {
   switch (message.type) {
     case "started":
       uploadId = message.id;
-      expiresAt = new Date(Date.now() + options.expiresIn * 1000);
+      partSize = message.partSize;
+      break;
+    case "part":
+      parts.set(message.part.part_number, message.part.etag);
       break;
     case "progress":
       renderProgress(message.sent, message.total);
@@ -200,8 +271,20 @@ function onMessage(message: FromWorker): void {
       show("done");
       break;
     case "failed":
+      if (message.kind === "file" && uploadId && file) {
+        resumable = {
+          id: uploadId,
+          partSize,
+          parts: new Map(parts),
+          ...identity,
+          options,
+          expiresAt,
+        };
+      }
       finish();
-      if (message.kind === "session") {
+      if (message.kind === "file") {
+        fileLost();
+      } else if (message.kind === "session") {
         fail("Your login has expired. Log in again, then upload the file again.", false);
         loginAgain.hidden = false;
       } else if (message.kind === "network") {
@@ -276,6 +359,24 @@ function fail(text: string, canRetry: boolean): void {
   errorMessage.textContent = text;
   loginAgain.hidden = true;
   retry.hidden = !canRetry;
+  errorAnother.hidden = false;
+  chooseAgain.hidden = true;
+  discard.hidden = true;
+  show("error");
+}
+
+/** The file can no longer be read (iOS: the screen locked). Nothing is deleted. */
+function fileLost(): void {
+  errorMessage.textContent = resumable
+    ? "The browser lost access to the file. On an iPhone this happens when the screen locks " +
+      "or you switch apps. Choose the same file again to continue where it stopped."
+    : "The browser lost access to the file. On an iPhone this happens when the screen locks " +
+      "or you switch apps. Choose the file again to upload it.";
+  loginAgain.hidden = true;
+  retry.hidden = true;
+  errorAnother.hidden = true;
+  chooseAgain.hidden = false;
+  discard.hidden = !resumable;
   show("error");
 }
 
@@ -305,9 +406,17 @@ cancelButton.addEventListener("click", () => {
 retry.addEventListener("click", () => {
   if (file) start(file, options);
 });
-el("error-another").addEventListener("click", () => {
+errorAnother.addEventListener("click", () => {
   show("idle");
   input.click();
+});
+// Opens the picker right away (a user gesture), staying in the error state
+// until a file is chosen: choosing one continues or restarts (start()).
+chooseAgain.addEventListener("click", () => input.click());
+discard.addEventListener("click", () => {
+  if (resumable) deleteOnServer(resumable.id);
+  resumable = null;
+  idleMessage("Upload cancelled.");
 });
 el("another").addEventListener("click", () => {
   file = null;
