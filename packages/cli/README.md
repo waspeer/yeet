@@ -17,8 +17,8 @@ One file is uploaded as it is. Several files, or a folder, become one zip
 with one link, made while it uploads. A compressed zip that could come out
 larger than about 7.8 GB is written to a temporary file first (in `$TMPDIR`,
 so it needs that much free disk space; it is always deleted afterwards).
-`--store` never needs one. Ctrl-C deletes the unfinished upload; a second
-Ctrl-C quits at once.
+`--store` never needs one. Ctrl-C during a zip upload deletes what was
+uploaded; a second Ctrl-C quits at once.
 
 Run `yeet --help` for every command and option, and see the
 [changelog](CHANGELOG.md) for what changed between versions.
