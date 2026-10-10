@@ -144,3 +144,16 @@ test("screenshots of the zip states", async ({ page, tmp, browserName }) => {
   await shareLink(page, 60_000);
   await shoot("6-done");
 });
+
+// Round 2D: the welcome page on /, to e2e/screenshots/2d/<engine>/, at
+// desktop and phone width.
+test("screenshots of the welcome page", async ({ page, browserName }) => {
+  const dir = join(dirname(ROOT), "2d", browserName);
+  await mkdir(dir, { recursive: true });
+  await page.goto("/");
+  await expect(page.getByRole("link", { name: "Upload files" })).toBeVisible();
+  for (const [name, size] of Object.entries(WIDTHS)) {
+    await page.setViewportSize(size);
+    await page.screenshot({ path: join(dir, `welcome-${name}.png`), fullPage: true });
+  }
+});

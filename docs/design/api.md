@@ -89,6 +89,24 @@ stays the same as today; the CLI and the tests depend on it.
 
 ### Routes
 
+- `GET /` (round 2D): the welcome page, built with `layout()` like the
+  others: what yeet is in one sentence, this yeet's address (the
+  request's origin, in a read-only field with **Copy address**), an
+  **Upload files** link to `/upload`, and a line with the command-line
+  tool's first command (`npx @waspeer/yeet login <address>`).
+  - **Public and the same for everyone:** no session or token check (it
+    also works with `UPLOAD_TOKEN` unset), no R2 call, no rate limiter:
+    the cheapest route (`e2e/tests/node/welcome.spec.ts` asserts zero R2
+    calls on the Worker's own handler).
+  - **Answer:** `200`, `text/html; charset=UTF-8`,
+    `Cache-Control: public, max-age=300` (nothing on it is private or
+    changes per visitor; the address is part of the URL any cache keys
+    on), and the anti-framing headers of every response. Until round 2D
+    `/` was the same `200` with a fox icon only and no `Cache-Control`.
+    No client depends on it: the CLI talks only to `/api/*`, the e2e
+    harness waits for `GET /health`, and tests that leave the upload
+    page navigate to `/`.
+- `GET /health`: `200 {"status": "ok"}`, for the e2e harness.
 - `GET /upload`
   - **Without a valid session:** a login form.
   - **With a valid session:** the upload UI.

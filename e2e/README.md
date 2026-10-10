@@ -372,6 +372,9 @@ logPath, stop() }`: another `wrangler dev` of the Worker, with its own ports,
   `resetStats(page)`: every value of the progress bar, and the main thread's
   worst lateness on a 10 ms `setInterval`.
 - `shareLink(page, timeout?)`: waits for the done state and returns the link.
+- `expectPhoneLayout(page, state)` (`layoutProblems(page)` for the details): at
+  the test's viewport (use 375 × 667), no sideways scrolling, every button, field
+  and `a.button` at least 44 px high and inside the screen, fields at 16 px.
 - `dropFiles(page, paths)`: drops several files at once (round 2C+2).
 - `dropTree(page, nodes)`, `treeOf(dir)`: drops files and folders. No test can make a
   browser drop a real folder, so the drop carries stand-ins for the browser's
@@ -399,7 +402,8 @@ aborting that part (`tests/browser/upload-resume.spec.ts`): Playwright gives
 the page a `File` backed by the path in all three engines, so its reads then
 fail (WebKit and Chromium `NotFoundError`, Firefox `AbortError`).
 `tests/browser/screenshots.spec.ts` saves every page state at desktop and
-phone width to `e2e/screenshots/2c/<engine>/` (git-ignored) for review.
+phone width to `e2e/screenshots/2c/<engine>/` (git-ignored) for review, the
+zip states to `2c2/` and the welcome page on `/` to `2d/`.
 
 ### Utilities — `util.ts`
 
