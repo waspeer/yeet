@@ -98,7 +98,7 @@ export const PAGE_LIMIT = 150;
 
 /**
  * Sidecars without a summary (yeet < 0.2) one page reads, one get each
- * (about 0.3 to 0.5 ms CPU each, phase 1J). A page of nothing but such
+ * (about 0.2 to 1.0 ms CPU each, phases 1J and 1K). A page of nothing but such
  * sidecars shows this many uploads.
  */
 export const PAGE_READS = 5;
@@ -148,6 +148,50 @@ export const MAX_UNSIZED_PARTS = 150;
  * (ceil(150 / 45) list calls and a delete).
  */
 export const PART_RECORDS_BUDGET = 50 - 4;
+
+/**
+ * Objects one `DELETE /api/uploads/:id` (and any other deletion of an
+ * upload by a request, see Uploads.delete()) lists and deletes at most: the
+ * `limit` of its one list call, without metadata. A yeet upload is 2
+ * objects, but an authenticated client can give one up to 10,000 part
+ * records (have `complete` refused, and they stay), and uploads of 1D/1E
+ * can hold thousands of legacy download records; until round 1L one
+ * request listed and deleted them all. An upload with more takes several
+ * requests (`202`, see api.md) or the cron. Phase 1K measured a `DELETE`
+ * of a small upload at p50 4, p90 7 ms CPU (n = 11). Estimate, not
+ * measured: at about 15 µs per object listed (the cron's fit, phase 1J), a
+ * full one about 1.5 ms more, plus a delete call.
+ */
+export const DELETE_LIMIT = 100;
+
+/**
+ * The `pending_upload_id` of an upload whose deletion is under way (see
+ * Uploads.delete()): no R2 multipart upload has this ID (theirs are long
+ * base64 strings), and nothing tries to resume or abort it.
+ */
+export const DELETED_UPLOAD_ID = "deleted";
+
+/**
+ * The sidecar of an upload whose deletion is under way: pending (so not
+ * listed, no download page, no download counted) and expired (so the cron
+ * deletes it).
+ */
+function deletionOf(meta: UploadMeta | null | undefined): UploadMeta {
+  const now = new Date().toISOString();
+  return {
+    filename: typeof meta?.filename === "string" ? meta.filename : "deleted",
+    uploaded_at: typeof meta?.uploaded_at === "string" ? meta.uploaded_at : now,
+    expires_at: now,
+    pending_upload_id: DELETED_UPLOAD_ID,
+  };
+}
+
+/** Whether a sidecar is of an upload still being uploaded (not of one being deleted). */
+export function isUploading(
+  meta: UploadMeta | null | undefined,
+): meta is UploadMeta & { pending_upload_id: string } {
+  return !!meta?.pending_upload_id && meta.pending_upload_id !== DELETED_UPLOAD_ID;
+}
 
 /**
  * Upload IDs are base64url. Anything else — in particular dot-segments
@@ -838,7 +882,8 @@ export class Uploads {
    * calls: a list (up to `limit` keys without metadata, default 1,000) and
    * a delete per round, and the upload's sidecar in a call of its own once
    * everything else is gone.
-   * Returns the calls made and whether nothing is left.
+   * Returns the calls made, whether nothing is left, and the objects
+   * listed and deleted.
    *
    * The sidecar goes last because it is what makes the listing (and so the
    * cron) see an upload: if the calls run out half-way, what is left is
@@ -849,8 +894,10 @@ export class Uploads {
     prefix: string,
     maxCalls: number,
     opts: { limit?: number; maxLists?: number } = {},
-  ): Promise<{ calls: number; done: boolean }> {
+  ): Promise<{ calls: number; done: boolean; listed: number; deleted: number }> {
     const maxLists = opts.maxLists ?? Infinity;
+    let listed = 0;
+    let deleted = 0;
     let lists = 0;
     if (!prefix.startsWith(`${this.prefix}/`) || !prefix.endsWith("/")) {
       throw new Error(`Unsafe prefix: ${JSON.stringify(prefix)}`);
@@ -870,11 +917,13 @@ export class Uploads {
       lists++;
       startAfter = undefined;
       const keys = page.objects.map((object) => object.key);
+      listed += keys.length;
       const others = keys.filter((key) => !this.isSidecarKey(key));
       for (const key of keys) if (this.isSidecarKey(key)) sidecars.add(key);
       if (others.length > 0) {
         await this.bucket.delete(others);
         calls++;
+        deleted += others.length;
       }
       if (page.truncated) {
         // More to list. Each round lists from the start, minus what is
@@ -885,13 +934,13 @@ export class Uploads {
         continue;
       }
       // Everything else is gone: only the sidecar may be left.
-      if (sidecars.size === 0) return { calls, done: true };
+      if (sidecars.size === 0) return { calls, done: true, listed, deleted };
       if (calls + 1 > maxCalls) break;
       await this.bucket.delete([...sidecars]);
       calls++;
-      return { calls, done: true };
+      return { calls, done: true, listed, deleted: deleted + sidecars.size };
     }
-    return { calls, done: false };
+    return { calls, done: false, listed, deleted };
   }
 
   /**
@@ -917,23 +966,33 @@ export class Uploads {
   }
 
   /**
-   * Delete every object of an upload, aborting its multipart upload if it
-   * never completed. Returns the number of objects removed.
+   * Delete an upload, at most `limit` (DELETE_LIMIT) objects per call:
+   * aborts its multipart upload if it never completed (not a deletion's,
+   * see DELETED_UPLOAD_ID), lists up to `limit` of its keys and deletes
+   * them, and deletes the sidecar last, once nothing else is left. At most
+   * 3 R2 calls besides the abort: the list, the delete, and the sidecar's
+   * delete or the write below.
+   *
+   * If more is left (`done: false`), the sidecar stays, so what is left is
+   * never keys without a sidecar that nothing would clean up; it is
+   * rewritten as a deletion in progress: pending (DELETED_UPLOAD_ID) and
+   * expired, so the upload is gone for users at once (not listed, no
+   * download page, no download counted, no part or complete accepted), and
+   * the cron, which deletes expired uploads, finishes the job if no further
+   * call does. `found` is false if nothing was listed: no such upload.
    */
-  async delete(id: string, meta?: UploadMeta | null): Promise<number> {
-    if (meta?.pending_upload_id) {
-      await this.abortPending(id, meta.filename, meta.pending_upload_id);
-    }
-
-    const keys: string[] = [];
-    let cursor: string | undefined;
-    do {
-      const page = await this.bucket.list({ prefix: this.dir(id), cursor });
-      keys.push(...page.objects.map((object) => object.key));
-      cursor = page.truncated ? page.cursor : undefined;
-    } while (cursor);
-
-    await this.deleteKeys(keys);
-    return keys.length;
+  async delete(
+    id: string,
+    meta?: UploadMeta | null,
+    limit = DELETE_LIMIT,
+  ): Promise<{ found: boolean; done: boolean; deleted: number }> {
+    if (isUploading(meta)) await this.abortPending(id, meta.filename, meta.pending_upload_id);
+    const result = await this.deleteUnder(this.dir(id), 3, { limit, maxLists: 1 });
+    if (!result.done && result.listed > 0) await this.writeMeta(id, deletionOf(meta));
+    return {
+      found: result.listed > 0 || !result.done,
+      done: result.done,
+      deleted: result.deleted,
+    };
   }
 }

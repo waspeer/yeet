@@ -342,7 +342,7 @@ test.describe("1G verifier: deleteUnder sidecar-last", () => {
     seedUpload(b, "x", { filename: "zz.bin" }); // sidecar sorts first
     const r = await new Uploads(b, P).deleteUnder(`${P}/x/`, 10);
     // list (sidecar only), list after it + delete the file, delete the sidecar.
-    expect(r).toEqual({ calls: 4, done: true });
+    expect(r).toEqual({ calls: 4, done: true, listed: 2, deleted: 2 });
     expect(b.sorted(`${P}/x/`)).toEqual([]);
   });
 });

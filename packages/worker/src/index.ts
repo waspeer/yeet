@@ -49,6 +49,7 @@ import {
   generateId,
   isExpired,
   isValidFilename,
+  isUploading,
   isValidId,
   MAX_UNSIZED_PARTS,
   PART_RECORDS_BUDGET,
@@ -330,7 +331,8 @@ api.put("/uploads/:id/parts/:number", async (c) => {
 
   const uploads = c.get("uploads");
   const meta = await uploads.readMeta(id);
-  if (!meta?.pending_upload_id) return c.json({ error: "No upload in progress" }, 404);
+  // (An upload whose deletion is under way is none, see Uploads.delete().)
+  if (!isUploading(meta)) return c.json({ error: "No upload in progress" }, 404);
 
   // With the size known, every part's length is known: check it right away.
   // Without it, a short part is only wrong if a later part follows, which
@@ -410,7 +412,8 @@ api.post("/uploads/:id/complete", async (c) => {
 
   const uploads = c.get("uploads");
   const meta = await uploads.readMeta(id);
-  if (!meta?.pending_upload_id) return c.json({ error: "No upload in progress" }, 404);
+  // (An upload whose deletion is under way is none, see Uploads.delete().)
+  if (!isUploading(meta)) return c.json({ error: "No upload in progress" }, 404);
 
   // Size known at create: every part was checked on PUT, so the upload has
   // exactly this many; a longer list can never complete.
@@ -509,8 +512,12 @@ api.delete("/uploads/:id", async (c) => {
   const { id } = c.req.param();
   if (!isValidId(id)) return c.json({ error: "Invalid upload" }, 400);
   const uploads = c.get("uploads");
-  const removed = await uploads.delete(id, await uploads.readMeta(id).catch(() => null));
-  if (removed === 0) return c.json({ error: "Not found" }, 404);
+  // At most DELETE_LIMIT objects per request. With more left, `202` and
+  // `done: false`: the upload is gone for users already (Uploads.delete()),
+  // and another DELETE (the CLI makes them) or the cron deletes the rest.
+  const result = await uploads.delete(id, await uploads.readMeta(id).catch(() => null));
+  if (!result.found) return c.json({ error: "Not found" }, 404);
+  if (!result.done) return c.json({ deleted: id, done: false }, 202);
   return c.json({ deleted: id });
 });
 

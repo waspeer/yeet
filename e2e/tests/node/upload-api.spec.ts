@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import {
   api,
   apiJson,
+  deleteUploadFully,
   downloadBytes,
   eventually,
   expect,
@@ -265,7 +266,7 @@ test.describe("upload API", () => {
     expect(await listObjects(`${server.uploadsPrefix}/${id}/.parts/`)).toHaveLength(
       MAX_UNSIZED_PARTS + 1,
     );
-    expect((await api(`/api/uploads/${id}`, { method: "DELETE" })).status).toBe(200);
+    expect((await deleteUploadFully(id)).status).toBe(200); // over DELETE_LIMIT objects
   });
 
   test(`size unknown: exactly ${MAX_UNSIZED_PARTS} part records complete, and the records are deleted`, async () => {

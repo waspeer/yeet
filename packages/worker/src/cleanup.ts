@@ -14,6 +14,7 @@
 // stable order, at least once every ceil(uploads / uploads per run) runs.
 
 import {
+  DELETED_UPLOAD_ID,
   isExpired,
   JUMP_LIMIT,
   summarize,
@@ -83,9 +84,9 @@ export interface CleanupReport {
   cursor: string | null;
 }
 
-/** Whether a stale upload has a multipart upload to abort. */
+/** Whether a stale upload has a multipart upload to abort (not one being deleted, see Uploads.delete()). */
 function isAbortable(pendingUploadId: string | undefined): boolean {
-  return !!pendingUploadId;
+  return !!pendingUploadId && pendingUploadId !== DELETED_UPLOAD_ID;
 }
 
 function isStale({ meta, stray }: ListedUpload, now: number): boolean {

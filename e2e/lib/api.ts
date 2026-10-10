@@ -218,6 +218,18 @@ export async function deleteUpload(id: string): Promise<Response> {
   return api(`/api/uploads/${encodeURIComponent(id)}`, { method: "DELETE" });
 }
 
+/**
+ * DELETE until done: a request deletes at most DELETE_LIMIT objects and
+ * answers 202 while more is left (round 1L). Returns the last response.
+ */
+export async function deleteUploadFully(id: string, maxRequests = 200): Promise<Response> {
+  for (let i = 1; ; i++) {
+    const res = await deleteUpload(id);
+    if (res.status !== 202 || i >= maxRequests) return res;
+    await res.body?.cancel();
+  }
+}
+
 /** The upload ID in a share link (`<origin>/<id>/<filename>`). */
 export function idFromUrl(shareUrl: string): string {
   const id = new URL(shareUrl).pathname.split("/")[1];

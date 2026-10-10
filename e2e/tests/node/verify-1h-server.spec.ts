@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import {
   api,
   apiJson,
+  deleteUploadFully,
   expect,
   listObjects,
   putObject,
@@ -47,5 +48,5 @@ test("size unknown, too many part records: refused without completing the multip
     .filter((k) => !k.startsWith(`${dir}.parts/`) && k !== `${dir}.meta.json`);
   expect(files).toEqual([]);
   expect((await readUploadMeta(id))?.pending_upload_id).toBeTruthy();
-  expect((await api(`/api/uploads/${id}`, { method: "DELETE" })).status).toBe(200);
+  expect((await deleteUploadFully(id)).status).toBe(200);
 });

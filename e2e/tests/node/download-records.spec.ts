@@ -9,6 +9,7 @@
 // test would delete these records while they are being looked at.
 
 import { randomBytes } from "node:crypto";
+import { DELETE_LIMIT } from "../../../packages/worker/src/uploads.js";
 import {
   CRON_TEST_TIMEOUT_MS,
   deleteUpload,
@@ -80,7 +81,7 @@ test.describe("legacy download records", () => {
       });
       expect(await recordCount(heavy.id)).toBe(1200);
 
-      // A run deletes at most 300 records (one deleteUnder() round), so
+      // A run deletes at most about CLEANUP_LIST_LIMIT records, so
       // 1,200 take a few runs.
       await cronUntil(
         async () => (await recordCount(heavy.id)) === 0 && (await recordCount(second.id)) === 0,
@@ -123,9 +124,29 @@ test.describe("legacy download records", () => {
   test("DELETE removes an upload with thousands of them", () =>
     exclusive("cron", async () => {
       test.setTimeout(Math.max(120_000, CRON_TEST_TIMEOUT_MS));
-      const { id } = await uploadViaApi({ filename: "gone.bin", data: randomBytes(32) });
+      const { id, url } = await uploadViaApi({ filename: "gone.bin", data: randomBytes(32) });
       await seedRecords(id, 2100);
-      expect((await deleteUpload(id)).status).toBe(200);
+      // Round 1L: at most DELETE_LIMIT objects a request. The first answers
+      // 202 with done: false, and the upload is gone for users at once.
+      const first = await deleteUpload(id);
+      expect(first.status).toBe(202);
+      expect(await first.json()).toEqual({ deleted: id, done: false });
+      expect((await listUploads()).some((upload) => upload.id === id)).toBe(false);
+      expect((await fetch(url)).status).toBe(404);
+      expect(await uploadObjects(id)).toHaveLength(2100 + 2 - DELETE_LIMIT);
+      // Each further request deletes up to DELETE_LIMIT more; the last 200.
+      let requests = 1;
+      for (;;) {
+        const before = (await uploadObjects(id)).length;
+        const res = await deleteUpload(id);
+        requests++;
+        expect(before - (await uploadObjects(id)).length).toBeLessThanOrEqual(DELETE_LIMIT);
+        if (res.status === 200) break;
+        expect(res.status).toBe(202);
+        expect(requests).toBeLessThan(100);
+      }
+      expect(requests).toBe(Math.ceil((2100 + 2) / DELETE_LIMIT));
       expect(await uploadObjects(id)).toHaveLength(0);
+      expect((await deleteUpload(id)).status).toBe(404);
     }));
 });

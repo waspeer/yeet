@@ -9,6 +9,7 @@ import { MAX_UNSIZED_PARTS, Uploads } from "../../../packages/worker/src/uploads
 import {
   api,
   apiJson,
+  deleteUploadFully,
   cli,
   expect,
   listObjects,
@@ -68,7 +69,7 @@ test.describe("1K verifier: complete of unknown size at the limit", () => {
     expect(res.status).toBe(400);
     // Reached multipart.complete (made-up etags), not the limit's refusal.
     expect(body.error).toMatch(/^Could not complete the upload/);
-    expect((await api(`/api/uploads/${id}`, { method: "DELETE" })).status).toBe(200);
+    expect((await deleteUploadFully(id)).status).toBe(200);
   });
 
   test(`${MAX_UNSIZED_PARTS} parts listed, ${MAX_UNSIZED_PARTS + 1} records (one not in the request): refused, nothing changed`, async () => {
@@ -84,7 +85,7 @@ test.describe("1K verifier: complete of unknown size at the limit", () => {
     // Records intact, no file object (the multipart upload was not completed).
     expect(keys.filter((k) => k.includes("/.parts/"))).toHaveLength(MAX_UNSIZED_PARTS + 1);
     expect(keys.filter((k) => !k.includes("/.parts/") && !k.endsWith("/.meta.json"))).toEqual([]);
-    expect((await api(`/api/uploads/${id}`, { method: "DELETE" })).status).toBe(200);
+    expect((await deleteUploadFully(id)).status).toBe(200);
   });
 
   test("a parts array with a duplicate is refused for that, whatever its length", async () => {
