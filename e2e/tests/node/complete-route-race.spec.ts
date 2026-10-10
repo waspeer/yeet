@@ -320,3 +320,54 @@ test.describe("complete after R2 refused it (round 2C+2)", () => {
     expect(sidecar(b, "c4")?.pending_upload_id).toBe("mp-c4");
   });
 });
+
+// Round 2C+2 verifier: the head (and sidecar read) after a refused complete
+// must stay off the normal path, and the "no file, but finished" branch is
+// pinned too (no earlier test reached it).
+test.describe("complete after R2 refused it: verifier 2C+2", () => {
+  test("a normal complete (size known) makes no head and reads the sidecar once", async () => {
+    const b = new RaceBucket({ maxCalls: Infinity });
+    seedPending(b, "v1");
+    b.reset();
+    const res = await call(b, "POST", "/api/uploads/v1/complete", completeBody);
+    expect(res).toEqual({ status: 200, json: { id: "v1", url: `${ORIGIN}/v1/f.bin` } });
+    expect(b.completes).toBe(1);
+    expect(b.calls).toEqual({ get: 1, put: 1 });
+  });
+
+  test("a normal complete (size unknown, one part record) makes no head either", async () => {
+    const b = new RaceBucket({ maxCalls: Infinity });
+    const meta: UploadMeta = {
+      filename: "f.zip",
+      uploaded_at: new Date().toISOString(),
+      expires_at: new Date(Date.now() + 30 * DAY).toISOString(),
+      pending_upload_id: "mp-v2",
+    };
+    b.seed(`${P}/v2/.meta.json`, JSON.stringify(meta), {
+      summary: JSON.stringify(summarize(meta)),
+    });
+    b.seed(`${P}/v2/.parts/1`, "", { size: "3" });
+    b.reset();
+    const res = await call(b, "POST", "/api/uploads/v2/complete", completeBody);
+    expect(res.status).toBe(200);
+    expect(b.calls["head"]).toBeUndefined();
+    expect(b.calls["get"]).toBe(1);
+  });
+
+  test("R2 refused, no file, the sidecar finished meanwhile: 200 with the link", async () => {
+    const b = new RaceBucket({ maxCalls: Infinity });
+    b.completeOnce = true;
+    seedPending(b, "v3");
+    b.completed.add("mp-v3");
+    // Between the route's sidecar read and R2's complete, another request
+    // finished the upload (sidecar without pending_upload_id); no file.
+    b.beforeComplete = async () => {
+      const { pending_upload_id: _, ...finished } = sidecar(b, "v3")!;
+      b.seed(`${P}/v3/.meta.json`, JSON.stringify(finished), {
+        summary: JSON.stringify(summarize(finished)),
+      });
+    };
+    const res = await call(b, "POST", "/api/uploads/v3/complete", completeBody);
+    expect(res).toEqual({ status: 200, json: { id: "v3", url: `${ORIGIN}/v3/f.bin` } });
+  });
+});

@@ -76,7 +76,9 @@ async function treeRss(
 
 const MiBof = (kib: number) => Math.round(kib / 1024);
 
-for (const kind of ["compressed", "stored"] as const) {
+// "single": one 1 GiB file, uploaded as-is (no zip): the baseline that
+// separates the zip code from the engine (verifier 2C+2).
+for (const kind of ["compressed", "stored", "single"] as const) {
   test(`peak RSS of the browser for a 1 GiB folder, ${kind}`, async ({
     page,
     tmp,
@@ -88,7 +90,9 @@ for (const kind of ["compressed", "stored"] as const) {
     // 8 × 128 MiB. Compressed: 4 noise WAVs (incompressible, deflated
     // anyway) and 4 mostly silent WAVs; stored: 8 noise MP3s.
     for (let i = 1; i <= 8; i++) {
-      if (kind === "stored") await randomFile(root, 128 * MiB, `take ${i}.mp3`);
+      if (kind === "single") {
+        if (i === 1) await randomFile(root, 1024 * MiB, "take.mp3");
+      } else if (kind === "stored") await randomFile(root, 128 * MiB, `take ${i}.mp3`);
       else if (i % 2) await randomFile(root, 128 * MiB, `noise ${i}.wav`);
       else await silentWavFile(root, (128 * MiB - 44) / 176_400, { name: `quiet ${i}.wav` });
     }
@@ -112,7 +116,8 @@ for (const kind of ["compressed", "stored"] as const) {
       }
     })();
     const started = Date.now();
-    await page.locator("#folder-input").setInputFiles(root);
+    if (kind === "single") await page.locator("#file-input").setInputFiles(join(root, "take.mp3"));
+    else await page.locator("#folder-input").setInputFiles(root);
     const url = await shareLink(page, 14 * 60_000);
     const seconds = (Date.now() - started) / 1000;
     await page.waitForTimeout(10_000);
@@ -121,7 +126,7 @@ for (const kind of ["compressed", "stored"] as const) {
     const after = await rssNow();
     const { size } = await downloadSha256(url);
     const report =
-      `${browserName} ${kind} 1 GiB folder: ${seconds.toFixed(1)} s, zip ${size} bytes; ` +
+      `${browserName} ${kind} 1 GiB ${kind === "single" ? "file" : "folder"}: ${seconds.toFixed(1)} s, zip ${size} bytes; ` +
       `RSS of ${after.processes} browser processes: before ${MiBof(before.kib)} MiB, ` +
       `peak ${MiBof(peak.kib)} MiB (+${MiBof(peak.kib - before.kib)}), ` +
       `10 s after ${MiBof(after.kib)} MiB; largest at the peak: ${peak.largest} MiB`;

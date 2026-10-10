@@ -341,4 +341,14 @@ test.describe("upload page: the zip's size", () => {
     expect(sameZip(a, zip(planSelection(later, OPTS)))).toBe(false);
     expect(storedZipSize(zipEntries(a))).toBe(a.size);
   });
+
+  // Verifier 2C+2: an empty folder renamed (same count, same files) is another zip.
+  test("sameZip: another empty folder (same number of them) is not the same zip", () => {
+    const a = zip(planSelection(folder("F", { "a.mp3": "1" }, ["empty-1"]), OPTS));
+    const b = zip(planSelection(folder("F", { "a.mp3": "1" }, ["empty-2"]), OPTS));
+    expect(sameZip(a, b)).toBe(false);
+    expect(sameZip(a, zip(planSelection(folder("F", { "a.mp3": "1" }, ["empty-1"]), OPTS)))).toBe(
+      true,
+    );
+  });
 });
