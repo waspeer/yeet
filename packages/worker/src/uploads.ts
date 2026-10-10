@@ -979,7 +979,18 @@ export class Uploads {
    * expired, so the upload is gone for users at once (not listed, no
    * download page, no download counted, no part or complete accepted), and
    * the cron, which deletes expired uploads, finishes the job if no further
-   * call does. `found` is false if nothing was listed: no such upload.
+   * call does. `found` is false if nothing was listed and nothing is left:
+   * no such upload.
+   *
+   * The marker is written whenever more is left, even if the one list call
+   * returned no keys: R2 may answer with a truncated page of fewer objects
+   * than asked, even none, and a truncated page means keys are left. Without
+   * the marker, the `202` would claim the upload gone while it stays listed
+   * and downloadable, and (not expired) the cron would not delete it either.
+   * If no sidecar was read, the marker gives the keys left one (as when
+   * keys without a sidecar are listed), so the cron cleans them up; if R2
+   * claimed keys that do not exist, the marker is all there is, pending
+   * (never shown) and expired, so the cron deletes it.
    */
   async delete(
     id: string,
@@ -988,7 +999,7 @@ export class Uploads {
   ): Promise<{ found: boolean; done: boolean; deleted: number }> {
     if (isUploading(meta)) await this.abortPending(id, meta.filename, meta.pending_upload_id);
     const result = await this.deleteUnder(this.dir(id), 3, { limit, maxLists: 1 });
-    if (!result.done && result.listed > 0) await this.writeMeta(id, deletionOf(meta));
+    if (!result.done) await this.writeMeta(id, deletionOf(meta));
     return {
       found: result.listed > 0 || !result.done,
       done: result.done,

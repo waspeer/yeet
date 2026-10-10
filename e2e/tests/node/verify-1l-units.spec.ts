@@ -238,13 +238,14 @@ test.describe("1L verifier: the deletion-under-way sidecar", () => {
     }
   });
 
-  test("FINDING: an empty first list page answers done: false without marking the upload", async () => {
+  test("an empty truncated first list page marks the upload (fix 1L.1)", async () => {
     // R2 may return a truncated page with fewer objects than asked, even
     // none (the listing code handles that everywhere). Uploads.delete() then
     // reports found and not done (the route answers 202, "gone for users
-    // already"), but writes no marker, as nothing was listed. An old CLI
-    // (one DELETE) reports "Deleted", and the upload stays listed and
-    // downloadable; not expired, so the cron does not delete it either.
+    // already"). Until fix 1L.1 it wrote no marker, as nothing was listed: an
+    // old CLI (one DELETE) reported "Deleted" while the upload stayed listed
+    // and downloadable, and, not expired, the cron did not delete it either.
+    // A truncated page means keys are left, so the marker is written.
     const b = new StrictBucket({ maxCalls: Infinity });
     seedUpload(b, "emp", {});
     const uploads = new Uploads(b, P);
@@ -260,8 +261,27 @@ test.describe("1L verifier: the deletion-under-way sidecar", () => {
     };
     const result = await uploads.delete("emp", await uploads.readMeta("emp"));
     expect(result).toEqual({ found: true, done: false, deleted: 0 });
-    expect(sidecarOf(b, "emp")!.body.pending_upload_id).toBeUndefined();
-    expect((await uploads.listPage()).uploads.map((u) => u.id)).toEqual(["emp"]);
+    expect(sidecarOf(b, "emp")!.body.pending_upload_id).toBe(DELETED_UPLOAD_ID);
+    expect((await uploads.listPage()).uploads.map((u) => u.id)).toEqual([]);
+    expect(await uploads.readMeta("emp")).toMatchObject({ pending_upload_id: DELETED_UPLOAD_ID });
+    // The next DELETE (or the cron) finishes the job.
+    for (let i = 0; i < 5 && b.sorted(`${P}/emp/`).length > 0; i++) await deleteRequest(b, "emp");
+    expect(b.sorted(`${P}/emp/`)).toEqual([]);
+  });
+
+  test("an empty truncated page for an upload without a sidecar writes only an expired marker (fix 1L.1)", async () => {
+    // Keys without a sidecar (or none: R2 claimed more were left): the
+    // marker is pending (never listed, no page) and expired (the cron
+    // deletes it with whatever else is under the ID).
+    const b = new StrictBucket({ maxCalls: Infinity });
+    const uploads = new Uploads(b, P);
+    b.list = async () =>
+      ({ objects: [], truncated: true, cursor: "x", delimitedPrefixes: [] }) as never;
+    const result = await uploads.delete("ghost", null);
+    expect(result).toEqual({ found: true, done: false, deleted: 0 });
+    const marker = sidecarOf(b, "ghost")!.body;
+    expect(marker.pending_upload_id).toBe(DELETED_UPLOAD_ID);
+    expect(Date.parse(marker.expires_at as string)).toBeLessThanOrEqual(Date.now());
   });
 
   test("race: a complete that lands after the marker brings the upload back (documented)", async () => {
@@ -403,12 +423,12 @@ for (const seedNo of [21, 22, 23, 24, 25, 26, 27, 28]) {
         finished.delete(id);
         hidden.add(id);
       } else {
-        // `done: false` (202) but no marker: R2 returned an empty page (see
-        // the FINDING test above). The upload is still a live one.
+        // `done: false` (202) but no marker: fixed in 1L.1 (an empty
+        // truncated page now writes the marker too), so never expected.
         unmarked++;
       }
     }
-    if (unmarked) console.log(`seed ${seedNo}: ${unmarked} DELETE(s) done: false without a marker`);
+    expect(unmarked, "DELETEs done: false without a marker").toBe(0);
     const seen = new Map<string, number>();
     let after: string | undefined;
     let pages = 0;
