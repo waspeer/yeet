@@ -38,6 +38,9 @@ input[readonly]{background:#fff}
 .summary{text-align:center;line-height:1.8;margin-bottom:12px}
 .logout{text-align:center;margin-top:20px}
 .logout button{box-shadow:none;border-width:1px;padding:2px 10px;font-size:11px}
+a.button{display:inline-flex;align-items:center;border:2px solid #000;background:#fff;color:#000;padding:5px 20px;box-shadow:2px 2px 0 #000;text-decoration:none}
+@media (max-width:480px),(pointer:coarse){a.button{min-height:44px}}
+@media (pointer:coarse){.drag-hint{display:none}}
 [hidden]{display:none!important}
 `.trim();
 
@@ -94,7 +97,7 @@ export function uploadPage(): string {
       <section id="state-error" hidden>
         <div id="error-message" class="error" role="alert"></div>
         <div class="row">
-          <a id="login-again" href="/upload" hidden>Log in again</a>
+          <a id="login-again" class="button" href="/upload" hidden>Log in again</a>
           <button type="button" id="retry" class="primary">Retry</button>
           <button type="button" id="error-another">Choose another file</button>
         </div>
