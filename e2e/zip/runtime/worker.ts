@@ -13,7 +13,6 @@ export default {
     if (url.pathname === "/info") {
       return Response.json({
         userAgent: navigator.userAgent,
-        nodeCompat: typeof (globalThis as { process?: unknown }).process !== "undefined",
         formats: await formats(),
       });
     }

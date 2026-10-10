@@ -24,11 +24,12 @@ test("workerd (no nodejs_compat): fixture zips pass check.py and the local reade
     readyPath: "/info",
   });
   try {
+    // nodejs_compat is off by configuration (e2e/zip/runtime/wrangler.jsonc).
     const info = (await (await fetch(`${worker.baseURL}/info`)).json()) as {
-      nodeCompat: boolean;
+      userAgent: string;
       formats: Record<string, boolean>;
     };
-    expect(info.nodeCompat).toBe(false);
+    expect(info.userAgent).toBe("Cloudflare-Workers");
     expect(info.formats["deflate-raw"]).toBe(true);
     // workerd's local zone is UTC: DOS times are UTC unless ?tz= says otherwise.
     const tz = -new Date(MTIME).getTimezoneOffset();
