@@ -494,12 +494,16 @@ api.post("/uploads/:id/complete", async (c) => {
     if (made) {
       object = made;
     } else {
+      // No file but a finished sidecar is no second complete (that one's
+      // file exists): a DELETE has deleted the file and not yet the
+      // sidecar (round 2D). A link to it would be dead, so it is deleted.
       const now = await uploads.readSidecar(id);
-      if (!now.meta || now.meta.pending_upload_id === DELETED_UPLOAD_ID) {
+      if (
+        !now.meta ||
+        now.meta.pending_upload_id === DELETED_UPLOAD_ID ||
+        !now.meta.pending_upload_id
+      ) {
         return c.json({ error: "No upload in progress: it was deleted" }, 404);
-      }
-      if (!now.meta.pending_upload_id && now.meta.filename === meta.filename) {
-        return c.json({ id, url: shareUrl(new URL(c.req.url).origin, id, meta.filename) });
       }
       const detail = err instanceof Error ? ` (${err.message})` : "";
       return c.json(
@@ -611,7 +615,13 @@ app.post("/logout", (c) => {
 
 app.get("/health", (c) => c.json({ status: "ok" }));
 
-app.get("/", (c) => c.html(landingPage()));
+// GET / — the welcome page: what yeet is, this yeet's address, a way to
+// /upload. The cheapest route: no R2 call, no session or token check, and
+// the same page for everyone at this address (so a browser may keep it a while).
+app.get("/", (c) => {
+  c.header("Cache-Control", "public, max-age=300");
+  return c.html(landingPage(new URL(c.req.url).origin));
+});
 
 // GET /_dl/:id — the file itself, behind a short-lived signed link that the
 // password check hands out. Registered before /:id/:filename? so it wins.

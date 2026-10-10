@@ -19,6 +19,7 @@ import { join } from "node:path";
 import { Readable } from "node:stream";
 import { MAX_UNSIZED_PARTS, maxUnsizedParts } from "../../../packages/cli/src/limits.js";
 import { planUpload } from "../../../packages/cli/src/selection.js";
+import * as uploadZip from "../../../packages/cli/src/upload-zip.js";
 import { cliZipOptions, zipSizeBound } from "../../../packages/cli/src/upload-zip.js";
 import { createZip } from "../../../packages/cli/src/zip.js";
 import {
@@ -335,5 +336,68 @@ test.describe("verifier 2B.1: the temporary file (stand-in server)", () => {
     } finally {
       await s.close();
     }
+  });
+});
+
+// Round 2D (leftovers of 2B.1): YEET_TEST_ZIP_SIZE_BOUND could raise the
+// bound as well as lower it, and the docs and --help said the temporary
+// file "needs that much free disk space", which reads as about 7.8 GB.
+test.describe("round 2D: the zip size hook and the free space wording", () => {
+  test("YEET_TEST_ZIP_SIZE_BOUND only lowers the bound; malformed values are ignored", () => {
+    const saved = process.env.YEET_TEST_ZIP_SIZE_BOUND;
+    try {
+      const cases: [string | undefined, number][] = [
+        [undefined, 5000],
+        ["", 5000],
+        ["abc", 5000],
+        ["-1", 5000],
+        ["1.5", 5000],
+        ["Infinity", 5000],
+        ["5001", 5000],
+        ["1000000000000", 5000],
+        ["5000", 5000],
+        ["4999", 4999],
+        ["0", 0],
+      ];
+      for (const [value, expected] of cases) {
+        if (value === undefined) delete process.env.YEET_TEST_ZIP_SIZE_BOUND;
+        else process.env.YEET_TEST_ZIP_SIZE_BOUND = value;
+        // Through the namespace, so this file still loads where it is missing.
+        expect(uploadZip.testZipSizeBound(5000), String(value)).toBe(expected);
+      }
+    } finally {
+      if (saved === undefined) delete process.env.YEET_TEST_ZIP_SIZE_BOUND;
+      else process.env.YEET_TEST_ZIP_SIZE_BOUND = saved;
+    }
+  });
+
+  test("a raised YEET_TEST_ZIP_SIZE_BOUND cannot send a zip that fits to the temporary file", async ({
+    tmp,
+  }) => {
+    const root = await album(tmp);
+    const cliTmp = await cliTmpDir(tmp);
+    // 1 MiB parts: the album's zip (about 45 KB) streams.
+    const s = await standIn(1024 * 1024);
+    try {
+      const r = await cli(["upload", root], {
+        env: { ...s.env, TMPDIR: cliTmp, YEET_TEST_ZIP_SIZE_BOUND: "1000000000000" },
+      });
+      expectExitCode(r, 0);
+      expect(r.stderr).not.toContain("temporary file");
+      expect(s.creates()).toHaveLength(1);
+      expect(s.create()!.json).not.toHaveProperty("size");
+      expect(s.deletes()).toEqual([]);
+      expect(await contents(cliTmp)).toEqual([]);
+    } finally {
+      await s.close();
+    }
+  });
+
+  test("--help says how much free space the temporary file needs", async () => {
+    const r = await cli(["--help"]);
+    expectExitCode(r, 0);
+    const help = r.stdout.replace(/\s+/g, " ");
+    expect(help).toContain("(it needs about the files' size plus 256 MB of free space)");
+    expect(help).not.toContain("that much");
   });
 });

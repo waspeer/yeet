@@ -89,6 +89,24 @@ stays the same as today; the CLI and the tests depend on it.
 
 ### Routes
 
+- `GET /` (round 2D): the welcome page, built with `layout()` like the
+  others: what yeet is in one sentence, this yeet's address (the
+  request's origin, in a read-only field with **Copy address**), an
+  **Upload files** link to `/upload`, and a line with the command-line
+  tool's first command (`npx @waspeer/yeet login <address>`).
+  - **Public and the same for everyone:** no session or token check (it
+    also works with `UPLOAD_TOKEN` unset), no R2 call, no rate limiter:
+    the cheapest route (`e2e/tests/node/welcome.spec.ts` asserts zero R2
+    calls on the Worker's own handler).
+  - **Answer:** `200`, `text/html; charset=UTF-8`,
+    `Cache-Control: public, max-age=300` (nothing on it is private or
+    changes per visitor; the address is part of the URL any cache keys
+    on), and the anti-framing headers of every response. Until round 2D
+    `/` was the same `200` with a fox icon only and no `Cache-Control`.
+    No client depends on it: the CLI talks only to `/api/*`, the e2e
+    harness waits for `GET /health`, and tests that leave the upload
+    page navigate to `/`.
+- `GET /health`: `200 {"status": "ok"}`, for the e2e harness.
 - `GET /upload`
   - **Without a valid session:** a login form.
   - **With a valid session:** the upload UI.
@@ -519,7 +537,12 @@ Numbers that are signed or used as keys must be spelled one way only:
     multipart upload after `complete` read the sidecar. `404 {"error": "No
 upload in progress: it was deleted"}`, as when the `DELETE` lands after
     R2's complete (before, a misleading `400`).
-  - **The sidecar is a finished one:** `200` with its link.
+  - **The sidecar is a finished one, but there is no file:** the same
+    `404` (round 2D; until then `200` with its link). A `complete` that
+    won would have left its file, so this is a `DELETE` that has deleted
+    the file and not yet the sidecar (it deletes the sidecar last), and
+    the link would be dead. A genuine second `complete` finds the file
+    (the case above) and still gets `200`.
   - Otherwise the `400` above.
 
   What real R2 does with a second `complete` of one multipart upload
@@ -1219,7 +1242,8 @@ would cost more than they do. The exception is the CLI's temporary zip
 - **A CLI zip larger than about 7.8 GB is written to disk first.** Since
   round 2B.1 a compressed zip whose worst case does not fit in
   `MAX_UNSIZED_PARTS` goes through a temporary file (see above), so it
-  needs that much free disk space (checked; the CLI suggests `--store`
+  needs free disk space for its worst case, about the input plus 256 MiB
+  (`zipSizeBound()` + `FREE_SPACE_MARGIN`; checked; the CLI suggests `--store`
   when it is short), and the upload starts only once it is zipped. A
   SIGKILL or a crash leaves the file in the OS's temporary folder. The
   first, unused upload it creates and deletes to learn `part_size` costs
@@ -1432,13 +1456,28 @@ a normalized header. Following RFC 9110 §14:
 - **Lost files during a zip** (round 2C+2): a zip part is in memory, so
   the worker reads one byte of the file it read last after a failed part
   attempt, and a failed read of a file while zipping stops the zip; both
-  end the upload as `file`, kept on the server. Then:
+  end the upload as `file`, kept on the server. Only that file is probed,
+  not every file read so far (decided in round 2D): the probe only tells
+  a lost file from a network failure, and iOS revokes access to every
+  picked file at once, so the file read last answers for all of them; the
+  bytes of the files before it are already in the parts held in memory,
+  so losing one of them cannot stop this upload; and a folder of 10,000
+  files would cost up to 10,000 reads after every failed attempt. A file
+  lost on its own (renamed on a Mac) is found when it is read: zipping
+  it, or making a stored zip again when continuing. Then:
   - **a stored zip** (size known) is fully determined by its files, so
     choosing the same files again (the same paths, sizes and dates, as
     they were first chosen, and the same empty folders) continues it: the
     zip is made again from the start, the parts the server has are cut
     but not sent, and the first unacknowledged part goes out next ("…
-    Choose the same folder again to continue where it stopped.");
+    Choose the same folder again to continue where it stopped.").
+    Not if the browser's time zone changed since the upload started
+    (round 2D): `zip.ts` writes the entries' DOS dates in the zone of
+    the moment, so the zip made again would differ from the parts
+    already uploaded. The page compares `zoneOffsets()` (the offset at
+    each entry's date) with the one taken at the start and, if it
+    differs, starts over ("The time zone changed since the upload
+    started, so it starts over.") and deletes the old upload;
   - **a compressed zip** cannot continue part-way, so the page says that
     choosing the files again starts the upload over ("… the upload starts
     over from the beginning, because a compressed zip can't continue

@@ -41,8 +41,6 @@ input[readonly]{background:#fff}
 .summary{text-align:center;line-height:1.8;margin-bottom:12px}
 .logout{text-align:center;margin-top:20px}
 .logout button{box-shadow:none;border-width:1px;padding:2px 10px;font-size:11px}
-a.button{display:inline-flex;align-items:center;border:2px solid #000;background:#fff;color:#000;padding:5px 20px;box-shadow:2px 2px 0 #000;text-decoration:none}
-@media (max-width:480px),(pointer:coarse){a.button{min-height:44px}}
 @media (pointer:coarse){.drag-hint,#choose-folder{display:none}}
 [hidden]{display:none!important}
 `.trim();

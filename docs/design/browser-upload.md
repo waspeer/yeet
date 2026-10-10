@@ -239,7 +239,9 @@ module", and [zip.md](zip.md), "Callers"):
   files again (paths, sizes, dates as first chosen, the same empty
   folders) continues it: the zip is made again from the start (the files
   are read once more up to there, locally) and the parts the server
-  already has are not sent again. A **compressed zip** cannot continue
+  already has are not sent again; unless the time zone changed meanwhile
+  (round 2D: the DOS dates would differ), then it starts over. A
+  **compressed zip** cannot continue
   part-way: the page says choosing the files again starts the upload
   over, and deletes the old upload when the new one starts. Nothing
   deletes an upload once `complete` is sent.

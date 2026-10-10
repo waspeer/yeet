@@ -83,6 +83,7 @@ test.describe("anti-framing headers", () => {
       "/api, 403",
     );
     expectNoFraming(await fetch(`${server.baseURL}/health`), "/health");
+    expectNoFraming(await fetch(`${server.baseURL}/`), "the welcome page");
     expect((await deleteUpload(id)).status).toBe(200);
   });
 });

@@ -53,8 +53,11 @@ your yeet and delete them, so treat it like a password.
 
 ## Step 3: upload your first file
 
-1. Open `https://yeet.<something>.workers.dev/upload` (your address from step 2,
-   followed by `/upload`). Bookmark it.
+1. Open your yeet address from step 2 (`https://yeet.<something>.workers.dev`)
+   in your browser. You see a page that says **This is your yeet**, with
+   your address on it (click **Copy address** to keep it somewhere).
+   Click **Upload files**. This opens your upload page, `/upload`;
+   bookmark it.
 2. Paste your upload token and click **Log in**. This browser stays logged in
    for 90 days.
 3. Choose how long the link works under **Link works for** (30 days unless
@@ -95,6 +98,7 @@ People downloading a password-protected file just enter its password again.
 Acceptance checks for the coordinator (remove when the guide is final):
 - The token field on the Deploy page has no help text, so step 1 must come before step 2.
 - The vars UPLOADS_PREFIX and DOWNLOAD_URL_TTL must no longer appear on the Deploy page (1A removes them).
+- / must show the welcome page with the address and an Upload files link to /upload.
 - /upload must show a login form, accept the token, and then show the drop zone.
 - The 90-day session and logout on token change are covered by e2e tests.
 -->

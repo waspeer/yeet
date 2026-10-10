@@ -559,7 +559,10 @@ class Upload {
    * PUT one part of the zip (held in memory, so it can be sent again), and
    * after a failed attempt check that the files can still be read: a lost
    * file (iOS) shows first as a failed upload, and the zip cannot go on
-   * without it.
+   * without it. Only the file read last is probed, not every one read so
+   * far: iOS revokes them all at once, and the earlier ones' bytes are
+   * already in the parts in memory (docs/design/api.md, "Lost files
+   * during a zip").
    */
   private async sendZipPart(n: number, body: Blob, length: number): Promise<string> {
     try {

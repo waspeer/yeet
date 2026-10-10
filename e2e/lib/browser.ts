@@ -2,8 +2,44 @@
 
 import { readdir, stat } from "node:fs/promises";
 import { basename, join } from "node:path";
-import { expect, type Page } from "@playwright/test";
+import {
+  expect,
+  type ElementHandle,
+  type FileChooser,
+  type Locator,
+  type Page,
+} from "@playwright/test";
 import { server } from "./env.js";
+
+/**
+ * Pick a folder on a `webkitdirectory` input (a locator, or the file
+ * chooser the page opened), and resolve once the page has its files.
+ *
+ * Not `setInputFiles(dir)` alone: for a folder, Playwright 1.63 waits for
+ * the input's `input` event with a listener it adds through an evaluate
+ * sent alongside the files, not before them. When the browser lists a
+ * small folder faster than that evaluate arrives (seen in WebKit under
+ * load), the event fires first and setInputFiles never resolves, although
+ * the page got the files (round 2D). So the listener here is in place
+ * before the files are set, and the call that may hang is not waited for.
+ */
+export async function setFolder(target: Locator | FileChooser, dir: string): Promise<void> {
+  const input = (
+    "element" in target && typeof target.element === "function" ? target.element() : target
+  ) as Pick<ElementHandle<HTMLInputElement>, "evaluate" | "setInputFiles">;
+  await input.evaluate((el) => {
+    (el as unknown as { __picked: Promise<void> }).__picked = new Promise((resolve) =>
+      el.addEventListener("input", () => resolve(), { once: true }),
+    );
+  });
+  const setting = input.setInputFiles(dir);
+  // May never settle (see above); it is dropped when the page closes.
+  setting.catch(() => {});
+  await Promise.race([
+    setting,
+    input.evaluate((el) => (el as unknown as { __picked: Promise<void> }).__picked),
+  ]);
+}
 
 /** Log in through the real form on /upload, as a person would. */
 export async function logIn(page: Page): Promise<void> {
@@ -249,4 +285,61 @@ export async function resetStats(page: Page): Promise<void> {
 export async function shareLink(page: Page, timeout = 60_000): Promise<string> {
   await expect(page.getByRole("button", { name: "Copy link" })).toBeVisible({ timeout });
   return page.locator("#link").inputValue();
+}
+
+// ---------------------------------------------------------------------------
+// Phone width (an iPhone SE: 375 × 667): no sideways scrolling, targets of at
+// least 44 px (Apple's minimum), fields at 16 px (iOS zooms into smaller ones).
+// ---------------------------------------------------------------------------
+
+export interface LayoutProblems {
+  scrollWidth: number;
+  width: number;
+  small: string[];
+  outside: string[];
+  smallText: string[];
+}
+
+/** Everything wrong with the visible layout at this width. */
+export function layoutProblems(page: Page): Promise<LayoutProblems> {
+  return page.evaluate(() => {
+    const width = window.innerWidth;
+    const visible = (el: Element) => {
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && getComputedStyle(el).visibility !== "hidden";
+    };
+    const name = (el: Element) =>
+      `${el.tagName.toLowerCase()}${el.id ? `#${el.id}` : ""} "${(el.textContent ?? "").trim().slice(0, 20)}"`;
+    const targets = [
+      ...document.querySelectorAll("button, select, input:not([type=file]), a.button"),
+    ].filter(visible);
+    const small: string[] = [];
+    const outside: string[] = [];
+    for (const el of targets) {
+      const rect = el.getBoundingClientRect();
+      if (rect.height < 44) small.push(`${name(el)}: ${rect.height.toFixed(0)} px high`);
+      if (rect.left < 0 || rect.right > width) outside.push(name(el));
+    }
+    const smallText = [...document.querySelectorAll("select, input:not([type=file])")]
+      .filter(visible)
+      .filter((el) => parseFloat(getComputedStyle(el).fontSize) < 16)
+      .map(name);
+    return {
+      scrollWidth: document.documentElement.scrollWidth,
+      width,
+      small,
+      outside,
+      smallText,
+    };
+  });
+}
+
+export async function expectPhoneLayout(page: Page, state: string): Promise<void> {
+  const problems = await layoutProblems(page);
+  expect(problems.scrollWidth, `${state}: page wider than the screen`).toBeLessThanOrEqual(
+    problems.width,
+  );
+  expect(problems.small, `${state}: targets under 44 px`).toEqual([]);
+  expect(problems.outside, `${state}: targets off screen`).toEqual([]);
+  expect(problems.smallText, `${state}: fields under 16 px`).toEqual([]);
 }

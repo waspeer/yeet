@@ -354,7 +354,10 @@ test.describe("complete after R2 refused it: verifier 2C+2", () => {
     expect(b.calls["get"]).toBe(1);
   });
 
-  test("R2 refused, no file, the sidecar finished meanwhile: 200 with the link", async () => {
+  // Until round 2D this answered 200 with the link. No file means no
+  // complete won (its file would exist): a DELETE is deleting the upload,
+  // so the link would be dead (see the round 2D test below).
+  test("R2 refused, no file, the sidecar finished meanwhile: 404, no dead link", async () => {
     const b = new RaceBucket({ maxCalls: Infinity });
     b.completeOnce = true;
     seedPending(b, "v3");
@@ -368,6 +371,62 @@ test.describe("complete after R2 refused it: verifier 2C+2", () => {
       });
     };
     const res = await call(b, "POST", "/api/uploads/v3/complete", completeBody);
-    expect(res).toEqual({ status: 200, json: { id: "v3", url: `${ORIGIN}/v3/f.bin` } });
+    expect(res).toEqual({
+      status: 404,
+      json: { error: "No upload in progress: it was deleted" },
+    });
+  });
+});
+
+// Round 2D (leftover (a) of 2C+2): R2 refused the complete, the file is
+// gone, the sidecar says finished. A genuine second complete never sees
+// that (the first one's file exists, so the route takes the head's
+// object); it is a DELETE that has deleted the file and not yet the
+// sidecar. Answering 200 there handed the page a dead link.
+class PausingBucket extends RaceBucket {
+  /** Set: the next delete of a sidecar waits for `release` (after `paused`). */
+  gate?: { paused: () => void; release: Promise<void> };
+  override async delete(keys: string | string[]) {
+    const list = typeof keys === "string" ? [keys] : keys;
+    const gate = this.gate;
+    if (gate && list.some((key) => key.endsWith("/.meta.json"))) {
+      this.gate = undefined;
+      gate.paused();
+      await gate.release;
+    }
+    return super.delete(keys);
+  }
+}
+
+test.describe("complete during a DELETE that has deleted the file (round 2D)", () => {
+  test("a complete finished, then a DELETE deleted the file: a complete sent again inside that gets 404, not a dead link", async () => {
+    const b = new PausingBucket({ maxCalls: Infinity });
+    b.completeOnce = true;
+    seedPending(b, "d1");
+    let first: Awaited<ReturnType<typeof call>> | undefined;
+    let deleting: Promise<{ status: number }> | undefined;
+    let release = () => {};
+    b.beforeComplete = async () => {
+      // This request read the pending sidecar; meanwhile another complete
+      // of the same upload finishes it...
+      first = await call(b, "POST", "/api/uploads/d1/complete", completeBody);
+      // ...and a DELETE deletes the file, and stops before the sidecar.
+      const paused = new Promise<void>((resolve) => {
+        b.gate = { paused: resolve, release: new Promise((done) => (release = done)) };
+      });
+      deleting = call(b, "DELETE", "/api/uploads/d1");
+      await paused;
+      expect(b.objects.has(`${P}/d1/f.bin`)).toBe(false);
+      expect(sidecar(b, "d1")?.pending_upload_id).toBeUndefined();
+    };
+    const second = await call(b, "POST", "/api/uploads/d1/complete", completeBody);
+    release();
+    expect(first).toEqual({ status: 200, json: { id: "d1", url: `${ORIGIN}/d1/f.bin` } });
+    expect(second).toEqual({
+      status: 404,
+      json: { error: "No upload in progress: it was deleted" },
+    });
+    expect((await deleting!).status).toBe(200);
+    expect(b.sorted(`${P}/d1/`)).toEqual([]);
   });
 });

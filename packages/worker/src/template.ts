@@ -41,9 +41,12 @@ progress{-webkit-appearance:none;appearance:none;border:1px solid #000;backgroun
 progress::-webkit-progress-bar{background:#fff}
 progress::-webkit-progress-value{background:#000}
 progress::-moz-progress-bar{background:#000}
+a.button{display:inline-flex;align-items:center;justify-content:center;font-size:12px;border:2px solid #000;background:#fff;color:#000;padding:5px 20px;box-shadow:2px 2px 0 #000;text-decoration:none}
+a.button:active{box-shadow:none;transform:translate(2px,2px)}
+a.button.primary{background:#000;color:#fff}
 @media (max-width:480px),(pointer:coarse){
 .body{padding:20px 16px}
-button{min-height:44px;padding:10px 20px}
+button,a.button{min-height:44px;padding:10px 20px}
 input[type=password],input[type=text],select{font-size:16px;min-height:44px}
 }
 `.trim();
@@ -147,9 +150,68 @@ export function downloadPage(opts: {
   return layout(`yeet \u2014 ${escHtml(filename)}`, body);
 }
 
-export function landingPage(): string {
+/**
+ * The command-line tool's first step, as the welcome page shows it with this
+ * yeet's address. (CLI 0.3.0 has `login <url>`; there is no `setup` yet.)
+ */
+export function cliCommand(origin: string): string {
+  return `npx @waspeer/yeet login ${origin}`;
+}
+
+// Only what the shared layout has no class for: the address field, its
+// note, and the line about the command-line tool.
+const WELCOME_CSS = `
+.address{margin-bottom:8px}
+.address input{margin-bottom:8px;font-family:Monaco,Menlo,monospace}
+.note{text-align:center;color:#444;min-height:1em;margin-bottom:12px}
+.cli{color:#444;font-size:11px;line-height:1.6;text-align:center;margin-top:20px}
+.cli code{font-family:Monaco,Menlo,monospace;overflow-wrap:anywhere;background:#eee;padding:0 2px}
+`.trim();
+
+/**
+ * GET /: what yeet is, this yeet's address (`origin`, from the request) to
+ * keep, and the way to /upload. Public and the same for everyone: no
+ * secret, no session, nothing from the bucket.
+ */
+export function landingPage(origin: string): string {
+  const address = escHtml(origin);
   const body = `
-    <div class="icon">&#129418;</div>`;
+    <style>${WELCOME_CSS}</style>
+    <div class="icon">&#129418;</div>
+    <div class="filename">This is your yeet</div>
+    <div class="meta">yeet shares your files through links that expire.</div>
+    <hr>
+    <div class="address">
+      <label for="address">Your yeet address</label>
+      <input type="text" id="address" value="${address}" readonly
+        autocapitalize="off" autocorrect="off" spellcheck="false">
+      <div class="center"><button type="button" id="copy-address">Copy address</button></div>
+    </div>
+    <div id="copy-note" class="note" role="status"></div>
+    <div class="center"><a class="button primary" href="/upload">Upload files</a></div>
+    <div class="cli">On a Mac you can also upload from Terminal:<br><code>${escHtml(cliCommand(origin))}</code></div>
+    <script type="module">
+      const field = document.getElementById("address");
+      const note = document.getElementById("copy-note");
+      document.getElementById("copy-address").addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(field.value);
+          note.textContent = "Address copied.";
+          return;
+        } catch {
+          // no Clipboard API, no permission, or not a secure context
+        }
+        field.focus();
+        field.select();
+        let copied = false;
+        try {
+          copied = document.execCommand("copy");
+        } catch {
+          // not supported
+        }
+        note.textContent = copied ? "Address copied." : "Select the address and copy it.";
+      });
+    </script>`;
   return layout("yeet", body);
 }
 

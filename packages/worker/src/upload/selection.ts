@@ -315,7 +315,8 @@ export function formatBytes(bytes: number): string {
  * Whether a zip chosen again is the very same as one whose upload stopped:
  * the same files (paths, sizes and dates as they were chosen), the same
  * empty folders and the same choice of stored or deflated per file. Only
- * then can a stored zip, whose bytes are fully determined, continue.
+ * then can a stored zip, whose bytes are fully determined, continue (if
+ * the time zone is unchanged too: zoneOffsets()).
  */
 export function sameZip(a: ZipPlan, b: ZipPlan): boolean {
   return (
@@ -333,4 +334,18 @@ export function sameZip(a: ZipPlan, b: ZipPlan): boolean {
     }) &&
     a.dirs.every((d, i) => d.path === b.dirs[i]!.path)
   );
+}
+
+/**
+ * The UTC offsets zip.ts writes the DOS dates of `plan`'s entries in: the
+ * browser's time zone, at each entry's own date (so summer and winter time
+ * differ, but stay the same as long as the zone does). If the zone changes
+ * (travel, a changed setting), a zip made again gets other dates than the
+ * parts already uploaded, so a stored zip only continues if this is
+ * unchanged (round 2D).
+ */
+export function zoneOffsets(plan: Pick<ZipPlan, "files" | "dirs">): string {
+  return [...plan.files, ...plan.dirs]
+    .map((entry) => new Date(entry.lastModified).getTimezoneOffset())
+    .join(",");
 }

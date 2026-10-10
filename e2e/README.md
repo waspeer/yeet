@@ -258,7 +258,7 @@ All exported from `lib/index.ts`.
   `YEET_STUB_SLOW_READ_MS=<ms>` delays each read of a file named `slow*` (so zipping can be
   interrupted), and `YEET_STUB_ENOSPC_AFTER=<n>` makes writes to the temporary
   `upload.zip` fail with `ENOSPC` after n bytes. The CLI's own test hooks: `YEET_TEST_MAX_UNSIZED_PARTS` lowers its 150-part
-  cap for zips of unknown size, `YEET_TEST_ZIP_SIZE_BOUND` replaces its worst-case zip size.
+  cap for zips of unknown size, `YEET_TEST_ZIP_SIZE_BOUND` lowers its worst-case zip size (never raises it).
 
 ### Stand-in server — `stand-in.ts`
 
@@ -372,6 +372,9 @@ logPath, stop() }`: another `wrangler dev` of the Worker, with its own ports,
   `resetStats(page)`: every value of the progress bar, and the main thread's
   worst lateness on a 10 ms `setInterval`.
 - `shareLink(page, timeout?)`: waits for the done state and returns the link.
+- `expectPhoneLayout(page, state)` (`layoutProblems(page)` for the details): at
+  the test's viewport (use 375 × 667), no sideways scrolling, every button, field
+  and `a.button` at least 44 px high and inside the screen, fields at 16 px.
 - `dropFiles(page, paths)`: drops several files at once (round 2C+2).
 - `dropTree(page, nodes)`, `treeOf(dir)`: drops files and folders. No test can make a
   browser drop a real folder, so the drop carries stand-ins for the browser's
@@ -380,8 +383,14 @@ logPath, stop() }`: another `wrangler dev` of the Worker, with its own ports,
   rename makes their reads fail) or made in the page (`text`, e.g. names that cannot exist
   side by side on a case-insensitive disk). `treeOf(dir)` gives a folder on disk as Finder
   drops it, `.DS_Store` included.
-- Folders can also be picked: `page.locator("#folder-input").setInputFiles(dir)` (a
-  `webkitdirectory` input) works in all three engines; it reports no empty folders.
+- Folders can also be picked: `setFolder(page.locator("#folder-input"), dir)`, or
+  `setFolder(await chooser, dir)` for a file chooser the page opened (a
+  `webkitdirectory` input), works in all three engines; it reports no empty folders.
+  Use it rather than `setInputFiles(dir)`: for a folder, Playwright 1.63 waits for the
+  input's `input` event with a listener it adds alongside the files, and when the
+  browser lists a small folder first (seen in WebKit under load: the page had the
+  files and showed the link, the call never returned) it waits forever.
+  `setFolder()` adds its own listener first and does not wait for that call.
 - The page's test hook `window.__yeetE2E = { maxUnsizedParts: n }` (set with
   `page.addInitScript()` before `goto`) lowers its limit for zips of unknown size, so
   `tests/browser/upload-zip.spec.ts` reaches the forced store with 51 MiB instead of 8 GB.
@@ -391,7 +400,10 @@ The upload runs in a Web Worker. In Playwright 1.63, `page.route()`,
 worker's requests in Chromium, WebKit and Firefox; the failure tests inject
 errors with `page.route()`. Exception: while any route is active, Playwright's
 WebKit cancels a `keepalive` fetch sent from `pagehide`, so the "leaving the
-page" test uses no route.
+page" test removes its route before it leaves. It cannot hold a part there
+either (`unrouteAll()` lets a held request through), so it answers the
+part's attempt with `503` and `Retry-After: 30`, and leaves while the
+worker waits.
 
 Losing access to the picked file (as iOS does when the screen locks) is
 simulated by renaming the file away on disk while a part is held, then
@@ -399,7 +411,8 @@ aborting that part (`tests/browser/upload-resume.spec.ts`): Playwright gives
 the page a `File` backed by the path in all three engines, so its reads then
 fail (WebKit and Chromium `NotFoundError`, Firefox `AbortError`).
 `tests/browser/screenshots.spec.ts` saves every page state at desktop and
-phone width to `e2e/screenshots/2c/<engine>/` (git-ignored) for review.
+phone width to `e2e/screenshots/2c/<engine>/` (git-ignored) for review, the
+zip states to `2c2/` and the welcome page on `/` to `2d/`.
 
 ### Utilities — `util.ts`
 
