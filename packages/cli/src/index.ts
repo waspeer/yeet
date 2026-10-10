@@ -621,7 +621,7 @@ async function upload(
   } catch (err) {
     if (err instanceof InterruptedError) {
       process.stderr.write(`Upload of ${plan.name} cancelled; nothing was kept.\n`);
-      process.exit(130);
+      process.exit(err.exitCode);
     }
     die(
       `Upload of ${plan.name} failed: ${err instanceof Error ? err.message : err}\n` +

@@ -5,8 +5,10 @@
 // 2. the upload against a stand-in server that records every request, with
 //    tiny part sizes so small files take many parts: exact part sizes, the
 //    size at complete, and every failure path (unreadable file, a file that
-//    changes while it is read, a part that keeps failing, Ctrl-C, the
-//    150-part limit of uploads of unknown size): DELETE, never complete;
+//    changes while it is read, a part that keeps failing, Ctrl-C, the guard
+//    on the 150-part limit of uploads of unknown size): DELETE, never
+//    complete (the temporary-file path for larger zips is in
+//    cli-zip-tempfile.spec.ts);
 // 3. the real Worker (wrangler dev): zips of several files and of a folder
 //    downloaded and checked with check.py and per-entry SHA-256, and a failed
 //    upload that leaves nothing in the bucket.
@@ -445,34 +447,30 @@ test.describe("yeet upload <folder>: the upload (stand-in server)", () => {
     }
   });
 
-  test("a zip of unknown size past 150 parts: stopped before part 151, deleted", async ({
+  test("the guard: a zip of unknown size that outgrows its estimate stops before part 151", async ({
     tmp,
   }) => {
-    // 20 KB of noise deflates to about 20 KB: about 200 parts of 100 bytes.
+    // The bound (zipSizeBound()) is a worst case, so this cannot happen in
+    // normal use; YEET_TEST_ZIP_SIZE_BOUND=0 makes the CLI stream a zip of
+    // about 200 parts of 100 bytes (20 KB of noise) as if it fitted in 150.
     const root = join(tmp, "big");
     await mkdir(root);
     await randomFile(root, 20 * KiB, "noise.bin");
     const s = await standIn(100);
     try {
-      const r = await cli(["upload", root], { env: s.env, timeoutMs: 120_000 });
-      expectAborted(s, r, /The zip would be larger than 15\.0 KB \(150 parts of 100 B\).*--store/);
+      const r = await cli(["upload", root], {
+        env: { ...s.env, YEET_TEST_ZIP_SIZE_BOUND: "0" },
+        timeoutMs: 120_000,
+      });
+      expectAborted(
+        s,
+        r,
+        /The zip grew past 15\.0 KB \(150 parts of 100 B\).*a bug in yeet.*--store/,
+      );
+      expect(s.creates()).toHaveLength(1);
+      expect(s.create()!.json).not.toHaveProperty("size");
       const numbers = s.puts().map((p) => Number(p.path.split("/").pop()));
-      expect(Math.max(...numbers)).toBeLessThanOrEqual(CLI_MAX_UNSIZED_PARTS);
-    } finally {
-      await s.close();
-    }
-  });
-
-  test("stored files alone over the limit: refused before any part is sent", async ({ tmp }) => {
-    const root = join(tmp, "photos");
-    await mkdir(root);
-    await randomFile(root, 20 * KiB, "IMG_0001.JPG"); // stored by its extension
-    await fileWith(root, "notes.txt", "deflated");
-    const s = await standIn(100);
-    try {
-      const r = await cli(["upload", root], { env: s.env });
-      expectAborted(s, r, /The zip would be larger than/);
-      expect(s.puts()).toEqual([]);
+      expect(Math.max(...numbers)).toBe(CLI_MAX_UNSIZED_PARTS);
     } finally {
       await s.close();
     }
