@@ -6,6 +6,7 @@ import {
 } from "../../../packages/worker/src/cleanup.js";
 import { encodeListCursor, parseListCursor } from "../../../packages/worker/src/parse.js";
 import {
+  JUMP_LIMIT,
   PAGE_JUMPS,
   PAGE_LIMIT,
   PAGE_READS,
@@ -150,7 +151,9 @@ async function walk(
 function expectBounds(work: { lists: number; listed: number; gets: number; total: number }[]) {
   for (const [i, w] of work.entries()) {
     expect(w.lists, `page ${i}: lists`).toBeLessThanOrEqual(1 + PAGE_JUMPS);
-    expect(w.listed, `page ${i}: objects`).toBeLessThanOrEqual((1 + PAGE_JUMPS) * PAGE_LIMIT);
+    expect(w.listed, `page ${i}: objects`).toBeLessThanOrEqual(
+      PAGE_LIMIT + PAGE_JUMPS * JUMP_LIMIT,
+    );
     expect(w.gets, `page ${i}: reads`).toBeLessThanOrEqual(PAGE_READS);
     expect(w.total, `page ${i}: R2 calls`).toBeLessThanOrEqual(1 + PAGE_READS);
   }
@@ -363,6 +366,9 @@ test.describe("1I verifier: pinned constants and the guard's threshold", () => {
     expect(doc).toContain(`**At most ${PAGE_READS} reads**`);
     expect(doc).toContain(`at most **${CLEANUP_SUMMARIES} per`);
     expect(PAGE_JUMPS).toBe(1); // "at most one more list call" in the docs
+    // Round 1L: the jump's own limit, and the page's bound that follows.
+    expect(doc).toContain(`\`limit: ${JUMP_LIMIT}\` (\`JUMP_LIMIT\``);
+    expect(doc).toContain(`At most ${PAGE_LIMIT + JUMP_LIMIT} objects then`);
     const wrangler = await readFile(
       new URL("../../../packages/worker/wrangler.jsonc", import.meta.url),
       "utf-8",

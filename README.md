@@ -145,12 +145,13 @@ with more than 5,000 of them, `yeet list` stops at its limit of 1,000 pages
 and shows only part until they are. To update them all at once, see
 "Migrating a bucket of yeet < 0.2" in [docs/design/api.md](docs/design/api.md).
 The page and cleanup sizes were lowered after measuring the earlier, larger
-ones on the free plan; the CPU of the new sizes is estimated from those
-measurements (see "Measurements (phase 1J)" there).
+ones on the free plan, and measured again (see "Measurements (phase 1K)"
+there); the smaller bounds of round 1L are estimated from those
+measurements, not measured yet.
 
 The CLI and the upload page always tell the server a file's size up
 front. A client of the API that does not can complete an upload of at most
-300 parts (about 15.7 GB).
+150 parts (about 7.9 GB).
 
 ## Security notes
 

@@ -98,7 +98,7 @@ export const PAGE_LIMIT = 150;
 
 /**
  * Sidecars without a summary (yeet < 0.2) one page reads, one get each
- * (about 0.3 to 0.5 ms CPU each, phase 1J). A page of nothing but such
+ * (about 0.2 to 1.0 ms CPU each, phases 1J and 1K). A page of nothing but such
  * sidecars shows this many uploads.
  */
 export const PAGE_READS = 5;
@@ -106,23 +106,37 @@ export const PAGE_READS = 5;
 /**
  * Extra list calls one page may make, only to jump over the rest of a
  * `.downloads/` or `.parts/` run its list call ended in (see listAll()). So
- * a page makes at most 2 list calls and examines at most 2 × PAGE_LIMIT
- * objects; without such runs (anything yeet 0.2 and later writes for a
- * finished upload), 1 call and PAGE_LIMIT objects.
+ * a page makes at most 2 list calls and examines at most PAGE_LIMIT +
+ * JUMP_LIMIT objects; without such runs (anything yeet 0.2 and later
+ * writes for a finished upload), 1 call and PAGE_LIMIT objects.
  */
 export const PAGE_JUMPS = 1;
+
+/**
+ * Objects a jump over a `.downloads/` or `.parts/` run lists at most (its
+ * `limit`), for a page and for a cron run. The jump only has to reach what
+ * follows the run: the upload's sidecar and file (a yeet upload has at most
+ * 2 keys outside its runs); anything after that is a bonus the next page
+ * or run lists anyway, and a short jump is handled like any short page R2
+ * may return. Phase 1K measured a page with a jump of PAGE_LIMIT (300
+ * objects) at p50 8, p90 13, max 18 ms CPU (n = 51), against p50 5, p90 8
+ * for a full page of 150; at 50 (round 1L) a jump page lists at most 200
+ * objects. Estimate, not measured: p50 about 6, p90 about 10 ms.
+ */
+export const JUMP_LIMIT = 50;
 
 /**
  * Part records `POST /api/uploads/:id/complete` of an upload of unknown size
  * reads at most (one per part sent, records of parts not in the request
  * included). Above it the request is refused (400) before anything changes,
  * telling the client to start again with the size: CPU, not R2 calls, is
- * the binding limit, and the complete of 4,000 records took 82 to 138 ms
- * CPU on Workers Free (phase 1J, n = 3). 300 parts are up to about 15.7 GB
- * at the 50 MiB part size. The CLI and the upload page always send the
- * size, so they never take this path.
+ * the binding limit. The complete of 4,000 records took 82 to 138 ms CPU on
+ * Workers Free (phase 1J, n = 3), of 300 records p50 14, p90 17 ms (phase
+ * 1K, n = 8), so 300 (round 1K) was lowered to 150 in round 1L. 150 parts
+ * are up to about 7.9 GB at the 50 MiB part size. The CLI and the upload
+ * page always send the size, so they never take this path.
  */
-export const MAX_UNSIZED_PARTS = 300;
+export const MAX_UNSIZED_PARTS = 150;
 
 /**
  * R2 calls `POST /api/uploads/:id/complete` of an upload of unknown size may
@@ -130,9 +144,54 @@ export const MAX_UNSIZED_PARTS = 300;
  * subrequests the Free plan was assumed to allow, minus its 4 other ones
  * (the Bearer rate-limit call, the sidecar read, the multipart complete and
  * the sidecar write). A second guard behind MAX_UNSIZED_PARTS: it only
- * refuses first if R2 returns fewer than 7 records per list call.
+ * refuses first if R2 returns fewer than 4 records per list call
+ * (ceil(150 / 45) list calls and a delete).
  */
 export const PART_RECORDS_BUDGET = 50 - 4;
+
+/**
+ * Objects one `DELETE /api/uploads/:id` (and any other deletion of an
+ * upload by a request, see Uploads.delete()) lists and deletes at most: the
+ * `limit` of its one list call, without metadata. A yeet upload is 2
+ * objects, but an authenticated client can give one up to 10,000 part
+ * records (have `complete` refused, and they stay), and uploads of 1D/1E
+ * can hold thousands of legacy download records; until round 1L one
+ * request listed and deleted them all. An upload with more takes several
+ * requests (`202`, see api.md) or the cron. Phase 1K measured a `DELETE`
+ * of a small upload at p50 4, p90 7 ms CPU (n = 11). Estimate, not
+ * measured: at about 15 µs per object listed (the cron's fit, phase 1J), a
+ * full one about 1.5 ms more, plus a delete call.
+ */
+export const DELETE_LIMIT = 100;
+
+/**
+ * The `pending_upload_id` of an upload whose deletion is under way (see
+ * Uploads.delete()): no R2 multipart upload has this ID (theirs are long
+ * base64 strings), and nothing tries to resume or abort it.
+ */
+export const DELETED_UPLOAD_ID = "deleted";
+
+/**
+ * The sidecar of an upload whose deletion is under way: pending (so not
+ * listed, no download page, no download counted) and expired (so the cron
+ * deletes it).
+ */
+function deletionOf(meta: UploadMeta | null | undefined): UploadMeta {
+  const now = new Date().toISOString();
+  return {
+    filename: typeof meta?.filename === "string" ? meta.filename : "deleted",
+    uploaded_at: typeof meta?.uploaded_at === "string" ? meta.uploaded_at : now,
+    expires_at: now,
+    pending_upload_id: DELETED_UPLOAD_ID,
+  };
+}
+
+/** Whether a sidecar is of an upload still being uploaded (not of one being deleted). */
+export function isUploading(
+  meta: UploadMeta | null | undefined,
+): meta is UploadMeta & { pending_upload_id: string } {
+  return !!meta?.pending_upload_id && meta.pending_upload_id !== DELETED_UPLOAD_ID;
+}
 
 /**
  * Upload IDs are base64url. Anything else — in particular dot-segments
@@ -529,7 +588,8 @@ export class Uploads {
    * (`startAfter`), so it costs at most one call per upload; the upload is
    * then marked incomplete (its keys are not all listed). `jumpCalls`
    * allows that many such calls beyond `maxListCalls` (still within the
-   * budget), so that a listing of one call still gets past such a run.
+   * budget), so that a listing of one call still gets past such a run;
+   * `jumpLimit` caps the objects each of them lists.
    *
    * Stops when the budget is spent, and then returns the uploads listed so
    * far (never a partly listed last one) with `truncated: true` and the
@@ -548,6 +608,8 @@ export class Uploads {
       maxListCalls?: number;
       jumpCalls?: number;
       limit?: number;
+      /** The `limit` of the calls made under `jumpCalls` (default: `limit`). */
+      jumpLimit?: number;
     } = {},
   ): Promise<Listing> {
     const budget = opts.budget ?? LIST_BUDGET;
@@ -592,7 +654,7 @@ export class Uploads {
         prefix: base,
         ...next,
         include: ["customMetadata"],
-        ...limit,
+        ...(jump && opts.jumpLimit !== undefined ? { limit: opts.jumpLimit } : limit),
       });
       calls++;
       for (const object of page.objects) {
@@ -705,8 +767,13 @@ export class Uploads {
           // Nothing before it was listed: the budget does not stretch to this
           // one upload (more keys than it lists, not a yeet upload). Return it
           // unread, and incomplete if partly listed, so that the next listing
-          // gets past it rather than stalling.
-          unread = firstLeft;
+          // gets past it rather than stalling. If its sidecar was listed
+          // without a summary and its read fits, it is read like any other
+          // (round 1L: a jump answered with only the sidecar left such an
+          // upload out of the page, and the next page started after it).
+          const read = firstLeft.sidecar && !firstLeft.meta ? readCost : 0;
+          if (read > 0 && calls + reads + read <= budget) reads += read;
+          else unread = firstLeft;
           kept.push(firstLeft);
           resumeAfter = this.keyAfter(firstLeft.id);
         }
@@ -746,8 +813,8 @@ export class Uploads {
    *
    * Bounded per request whatever the bucket holds (CPU, not R2 calls, is
    * what limits a request on the Free plan): one list call of at most
-   * PAGE_LIMIT objects, at most PAGE_JUMPS more to jump over the rest of a
-   * `.downloads/` or `.parts/` run, and reads of sidecars without a summary,
+   * PAGE_LIMIT objects, at most PAGE_JUMPS more of at most JUMP_LIMIT to
+   * jump over the rest of a `.downloads/` or `.parts/` run, and reads of sidecars without a summary,
    * 1 + PAGE_READS R2 calls in all. listAll() keeps its guarantees per
    * page: no partly listed upload (but the one a stalled listing must get
    * past), the next page starts right before the first upload this one
@@ -763,6 +830,7 @@ export class Uploads {
       maxListCalls: 1,
       jumpCalls: PAGE_JUMPS,
       limit: PAGE_LIMIT,
+      jumpLimit: JUMP_LIMIT,
       ...(after !== undefined ? { after } : {}),
     });
     const uploads = listing.uploads
@@ -814,7 +882,8 @@ export class Uploads {
    * calls: a list (up to `limit` keys without metadata, default 1,000) and
    * a delete per round, and the upload's sidecar in a call of its own once
    * everything else is gone.
-   * Returns the calls made and whether nothing is left.
+   * Returns the calls made, whether nothing is left, and the objects
+   * listed and deleted.
    *
    * The sidecar goes last because it is what makes the listing (and so the
    * cron) see an upload: if the calls run out half-way, what is left is
@@ -825,8 +894,10 @@ export class Uploads {
     prefix: string,
     maxCalls: number,
     opts: { limit?: number; maxLists?: number } = {},
-  ): Promise<{ calls: number; done: boolean }> {
+  ): Promise<{ calls: number; done: boolean; listed: number; deleted: number }> {
     const maxLists = opts.maxLists ?? Infinity;
+    let listed = 0;
+    let deleted = 0;
     let lists = 0;
     if (!prefix.startsWith(`${this.prefix}/`) || !prefix.endsWith("/")) {
       throw new Error(`Unsafe prefix: ${JSON.stringify(prefix)}`);
@@ -846,11 +917,13 @@ export class Uploads {
       lists++;
       startAfter = undefined;
       const keys = page.objects.map((object) => object.key);
+      listed += keys.length;
       const others = keys.filter((key) => !this.isSidecarKey(key));
       for (const key of keys) if (this.isSidecarKey(key)) sidecars.add(key);
       if (others.length > 0) {
         await this.bucket.delete(others);
         calls++;
+        deleted += others.length;
       }
       if (page.truncated) {
         // More to list. Each round lists from the start, minus what is
@@ -861,13 +934,13 @@ export class Uploads {
         continue;
       }
       // Everything else is gone: only the sidecar may be left.
-      if (sidecars.size === 0) return { calls, done: true };
+      if (sidecars.size === 0) return { calls, done: true, listed, deleted };
       if (calls + 1 > maxCalls) break;
       await this.bucket.delete([...sidecars]);
       calls++;
-      return { calls, done: true };
+      return { calls, done: true, listed, deleted: deleted + sidecars.size };
     }
-    return { calls, done: false };
+    return { calls, done: false, listed, deleted };
   }
 
   /**
@@ -893,23 +966,33 @@ export class Uploads {
   }
 
   /**
-   * Delete every object of an upload, aborting its multipart upload if it
-   * never completed. Returns the number of objects removed.
+   * Delete an upload, at most `limit` (DELETE_LIMIT) objects per call:
+   * aborts its multipart upload if it never completed (not a deletion's,
+   * see DELETED_UPLOAD_ID), lists up to `limit` of its keys and deletes
+   * them, and deletes the sidecar last, once nothing else is left. At most
+   * 3 R2 calls besides the abort: the list, the delete, and the sidecar's
+   * delete or the write below.
+   *
+   * If more is left (`done: false`), the sidecar stays, so what is left is
+   * never keys without a sidecar that nothing would clean up; it is
+   * rewritten as a deletion in progress: pending (DELETED_UPLOAD_ID) and
+   * expired, so the upload is gone for users at once (not listed, no
+   * download page, no download counted, no part or complete accepted), and
+   * the cron, which deletes expired uploads, finishes the job if no further
+   * call does. `found` is false if nothing was listed: no such upload.
    */
-  async delete(id: string, meta?: UploadMeta | null): Promise<number> {
-    if (meta?.pending_upload_id) {
-      await this.abortPending(id, meta.filename, meta.pending_upload_id);
-    }
-
-    const keys: string[] = [];
-    let cursor: string | undefined;
-    do {
-      const page = await this.bucket.list({ prefix: this.dir(id), cursor });
-      keys.push(...page.objects.map((object) => object.key));
-      cursor = page.truncated ? page.cursor : undefined;
-    } while (cursor);
-
-    await this.deleteKeys(keys);
-    return keys.length;
+  async delete(
+    id: string,
+    meta?: UploadMeta | null,
+    limit = DELETE_LIMIT,
+  ): Promise<{ found: boolean; done: boolean; deleted: number }> {
+    if (isUploading(meta)) await this.abortPending(id, meta.filename, meta.pending_upload_id);
+    const result = await this.deleteUnder(this.dir(id), 3, { limit, maxLists: 1 });
+    if (!result.done && result.listed > 0) await this.writeMeta(id, deletionOf(meta));
+    return {
+      found: result.listed > 0 || !result.done,
+      done: result.done,
+      deleted: result.deleted,
+    };
   }
 }

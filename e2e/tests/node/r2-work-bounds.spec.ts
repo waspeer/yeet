@@ -7,6 +7,7 @@ import {
 } from "../../../packages/worker/src/cleanup.js";
 import { encodeListCursor, parseListCursor } from "../../../packages/worker/src/parse.js";
 import {
+  JUMP_LIMIT,
   PAGE_JUMPS,
   PAGE_LIMIT,
   PAGE_READS,
@@ -126,8 +127,9 @@ function expectPageBounds(work: PageWork[]) {
   for (const [i, w] of work.entries()) {
     expect(w.lists, `page ${i}: list calls`).toBeLessThanOrEqual(1 + PAGE_JUMPS);
     expect(w.maxListed, `page ${i}: objects per list call`).toBeLessThanOrEqual(PAGE_LIMIT);
+    // Round 1L: a jump lists at most JUMP_LIMIT objects (200 a page, not 300).
     expect(w.listed, `page ${i}: objects examined`).toBeLessThanOrEqual(
-      (1 + PAGE_JUMPS) * PAGE_LIMIT,
+      PAGE_LIMIT + PAGE_JUMPS * JUMP_LIMIT,
     );
     expect(w.gets, `page ${i}: sidecar reads`).toBeLessThanOrEqual(PAGE_READS);
     expect(w.total, `page ${i}: R2 calls`).toBeLessThanOrEqual(1 + PAGE_READS);
@@ -178,6 +180,8 @@ test.describe("work of one GET /api/uploads page (real R2 page sizes)", () => {
     const { seen, work } = await allPages(b);
     expectPageBounds(work);
     expect(max(work, "lists")).toBe(1 + PAGE_JUMPS);
+    // The bound is reached: a full first call and a full jump.
+    expect(max(work, "listed")).toBe(PAGE_LIMIT + PAGE_JUMPS * JUMP_LIMIT);
     expect([...seen].sort()).toEqual(finished);
     console.log(
       `400 uploads with records and parts: ${work.length} pages, max ${max(work, "listed")} objects`,
@@ -243,13 +247,13 @@ async function cronRuns(b: StrictBucket, done: () => boolean, maxRuns: number) {
 
 function expectRunBounds(work: RunWork[]) {
   for (const [i, w] of work.entries()) {
-    // The slice, a jump, and one deleteUnder() round.
-    expect(w.lists, `run ${i + 1}: list calls`).toBeLessThanOrEqual(1 + CLEANUP_JUMPS + 1);
+    // The slice and a jump (round 1L: no deleteUnder() round any more).
+    expect(w.lists, `run ${i + 1}: list calls`).toBeLessThanOrEqual(1 + CLEANUP_JUMPS);
     expect(w.maxListed, `run ${i + 1}: objects per list call`).toBeLessThanOrEqual(
       CLEANUP_LIST_LIMIT,
     );
     expect(w.listed, `run ${i + 1}: objects examined`).toBeLessThanOrEqual(
-      (2 + CLEANUP_JUMPS) * CLEANUP_LIST_LIMIT,
+      CLEANUP_LIST_LIMIT + CLEANUP_JUMPS * JUMP_LIMIT,
     );
     expect(w.summaries, `run ${i + 1}: summaries written`).toBeLessThanOrEqual(CLEANUP_SUMMARIES);
     expect(w.total, `run ${i + 1}: R2 calls`).toBeLessThanOrEqual(CLEANUP_BUDGET);

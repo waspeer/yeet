@@ -22,7 +22,14 @@ test.describe("readPartSizes with a record limit", () => {
   test(`lists at most ${MAX_UNSIZED_PARTS + 1} records, on full and random short pages`, async () => {
     for (const randomPages of [false, true]) {
       for (const seed of [1, 2, 3, 4, 5]) {
-        for (const parts of [0, 1, 299, MAX_UNSIZED_PARTS, MAX_UNSIZED_PARTS + 1, 4000]) {
+        for (const parts of [
+          0,
+          1,
+          MAX_UNSIZED_PARTS - 1,
+          MAX_UNSIZED_PARTS,
+          MAX_UNSIZED_PARTS + 1,
+          4000,
+        ]) {
           const b = new StrictBucket({ randomPages, seed: seed * 10_000 + parts, maxCalls: 1000 });
           Object.assign(b, REAL_R2_CAPS);
           for (let n = 1; n <= parts; n++) b.seed(`${P}/x/.parts/${n}`, "", { size: "5" });

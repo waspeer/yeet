@@ -5,6 +5,7 @@ import { open } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
+import { MAX_DELETE_ROUNDS, MAX_LIST_PAGES } from "./limits.js";
 
 const README_URL = "https://github.com/waspeer/yeet#readme";
 
@@ -260,16 +261,23 @@ function tooManyAttempts(seconds: number): string {
   return `Too many wrong upload tokens were tried from this address. Try again ${waitText(seconds)}.`;
 }
 
+/** The most of one unit waitText() says before it uses the next ("90 minutes", then "2 hours"). */
+const MAX_IN_UNIT = 90;
+
 /**
  * When to try again, for a message: "in 45 seconds", "in 15 minutes", "in 3
- * hours" (rounded up), or "later" for no wait known or one over a day (a
- * server may send any Retry-After, 100000000000000000000 included).
+ * hours", or "later" for no wait known or one over a day (a server may send
+ * any Retry-After, 100000000000000000000 included). The count is rounded up
+ * and given in the smallest unit that keeps it at most MAX_IN_UNIT: so at
+ * most two digits, 90 seconds or 2 minutes, 90 minutes or 2 hours.
  */
 function waitText(seconds: number): string {
   const unit = (n: number, name: string) => `in ${n} ${name}${n === 1 ? "" : "s"}`;
   if (!(seconds > 0) || seconds > 86_400) return "later";
-  if (seconds < 120) return unit(seconds, "second");
-  if (seconds < 120 * 60) return unit(Math.ceil(seconds / 60), "minute");
+  const whole = Math.ceil(seconds);
+  if (whole <= MAX_IN_UNIT) return unit(whole, "second");
+  const minutes = Math.ceil(seconds / 60);
+  if (minutes <= MAX_IN_UNIT) return unit(minutes, "minute");
   return unit(Math.ceil(seconds / 3600), "hour");
 }
 
@@ -490,14 +498,6 @@ interface UploadsPage {
 }
 
 /**
- * The most pages `yeet list` fetches. A page holds about 75 uploads (at
- * least 5), so 1,000 pages are about 74,000 uploads, or 5,000 sidecars of
- * yeet < 0.2 without a summary; it stops a server that
- * keeps answering with more pages from keeping the CLI busy forever.
- */
-const MAX_LIST_PAGES = 1000;
-
-/**
  * Every upload, fetched page by page, one request after the other (each
  * request does a small, bounded amount of work on the server). A page that
  * fails with a network error, 5xx or 429 is retried with backoff
@@ -511,7 +511,8 @@ async function fetchAllUploads(
   const byId = new Map<string, ListedUpload>();
   const fetchedSoFar = (reason: string) => ({
     uploads: [...byId.values()],
-    incomplete: `Could not fetch every page (${reason}); run \`yeet list\` again for the rest.`,
+    // (Without the reason's own final period: "(… in 2 minutes); run".)
+    incomplete: `Could not fetch every page (${reason.replace(/\.$/, "")}); run \`yeet list\` again for the rest.`,
   });
   let cursor: string | null = null;
   for (let pages = 0; ; pages++) {
@@ -614,13 +615,41 @@ async function listFiles(showDownloads: boolean): Promise<void> {
   notes();
 }
 
+/**
+ * Delete one upload. A server deletes at most 100 objects per request and
+ * answers `done: false` (202) while more is left, the upload already gone
+ * for users; this asks again, up to MAX_DELETE_ROUNDS requests. Returns
+ * whether objects may be left for the server's cleanup (the cap reached, or
+ * a later request failed). An error of the first request is thrown.
+ */
+async function deleteUpload(config: Config, id: string): Promise<boolean> {
+  const path = `/uploads/${encodeURIComponent(id)}`;
+  for (let round = 1; ; round++) {
+    let result: { done?: unknown } | undefined;
+    try {
+      result = await api<{ done?: unknown } | undefined>(config, "DELETE", path);
+    } catch (err) {
+      if (round === 1) throw err;
+      // Deleted meanwhile (by the cleanup): nothing left.
+      if (err instanceof ApiError && err.status === 404) return false;
+      return true;
+    }
+    if (result?.done !== false) return false;
+    if (round >= MAX_DELETE_ROUNDS) return true;
+  }
+}
+
 async function deleteUploads(ids: string[]): Promise<void> {
   const config = loadConfig();
   let failed = false;
   for (const id of ids) {
     try {
-      await api(config, "DELETE", `/uploads/${encodeURIComponent(id)}`);
-      process.stderr.write(`Deleted ${id}\n`);
+      const left = await deleteUpload(config, id);
+      process.stderr.write(
+        left
+          ? `Deleted ${id} (the server removes the rest of its storage in its hourly cleanup)\n`
+          : `Deleted ${id}\n`,
+      );
     } catch (err) {
       failed = true;
       process.stderr.write(`Could not delete ${id}: ${err instanceof Error ? err.message : err}\n`);

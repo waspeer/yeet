@@ -49,6 +49,7 @@ import {
   generateId,
   isExpired,
   isValidFilename,
+  isUploading,
   isValidId,
   MAX_UNSIZED_PARTS,
   PART_RECORDS_BUDGET,
@@ -330,7 +331,8 @@ api.put("/uploads/:id/parts/:number", async (c) => {
 
   const uploads = c.get("uploads");
   const meta = await uploads.readMeta(id);
-  if (!meta?.pending_upload_id) return c.json({ error: "No upload in progress" }, 404);
+  // (An upload whose deletion is under way is none, see Uploads.delete().)
+  if (!isUploading(meta)) return c.json({ error: "No upload in progress" }, 404);
 
   // With the size known, every part's length is known: check it right away.
   // Without it, a short part is only wrong if a later part follows, which
@@ -364,9 +366,16 @@ api.put("/uploads/:id/parts/:number", async (c) => {
   return c.json({ part_number: part.partNumber, etag: part.etag });
 });
 
-/** The `parts` of a complete request, sorted, or an error message. */
+/** R2's limit on the parts of a multipart upload; part numbers are 1 to this. */
+const MAX_PARTS = 10_000;
+
+/**
+ * The `parts` of a complete request, sorted, or an error message. Arrays
+ * longer than R2 allows are refused before any entry is looked at.
+ */
 function parseParts(value: unknown): { partNumber: number; etag: string }[] | string {
   if (!Array.isArray(value) || value.length === 0) return "Missing parts";
+  if (value.length > MAX_PARTS) return `Invalid parts: at most ${MAX_PARTS}`;
   const parts: { partNumber: number; etag: string }[] = [];
   for (const part of value as unknown[]) {
     const { part_number: partNumber, etag } = (part ?? {}) as Record<string, unknown>;
@@ -403,7 +412,24 @@ api.post("/uploads/:id/complete", async (c) => {
 
   const uploads = c.get("uploads");
   const meta = await uploads.readMeta(id);
-  if (!meta?.pending_upload_id) return c.json({ error: "No upload in progress" }, 404);
+  // (An upload whose deletion is under way is none, see Uploads.delete().)
+  if (!isUploading(meta)) return c.json({ error: "No upload in progress" }, 404);
+
+  // Size known at create: every part was checked on PUT, so the upload has
+  // exactly this many; a longer list can never complete.
+  if (meta.file_size !== undefined) {
+    const count = Math.max(1, Math.ceil(meta.file_size / PART_SIZE));
+    if (parts.length > count) {
+      return c.json(
+        {
+          error:
+            `Invalid parts: an upload of ${meta.file_size} bytes has ${count} ` +
+            `part${count === 1 ? "" : "s"} (part_size ${PART_SIZE} bytes), not ${parts.length}`,
+        },
+        400,
+      );
+    }
+  }
 
   // Size unknown at create: check the layout R2 requires from the recorded
   // part sizes, so the client gets a clear error instead of R2's.
@@ -486,8 +512,12 @@ api.delete("/uploads/:id", async (c) => {
   const { id } = c.req.param();
   if (!isValidId(id)) return c.json({ error: "Invalid upload" }, 400);
   const uploads = c.get("uploads");
-  const removed = await uploads.delete(id, await uploads.readMeta(id).catch(() => null));
-  if (removed === 0) return c.json({ error: "Not found" }, 404);
+  // At most DELETE_LIMIT objects per request. With more left, `202` and
+  // `done: false`: the upload is gone for users already (Uploads.delete()),
+  // and another DELETE (the CLI makes them) or the cron deletes the rest.
+  const result = await uploads.delete(id, await uploads.readMeta(id).catch(() => null));
+  if (!result.found) return c.json({ error: "Not found" }, 404);
+  if (!result.done) return c.json({ deleted: id, done: false }, 202);
   return c.json({ deleted: id });
 });
 

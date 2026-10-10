@@ -1,5 +1,5 @@
 // Independent verifier of round 1K: the MAX_UNSIZED_PARTS boundaries of
-// `complete` (array length and record count, 300/301), and the CLI's
+// `complete` (array length and record count, at the limit and one past it), and the CLI's
 // Retry-After parsing and "Try again" wording at their edges.
 
 import { createServer } from "node:http";
@@ -9,6 +9,7 @@ import { MAX_UNSIZED_PARTS, Uploads } from "../../../packages/worker/src/uploads
 import {
   api,
   apiJson,
+  deleteUploadFully,
   cli,
   expect,
   listObjects,
@@ -62,11 +63,13 @@ test.describe("1K verifier: complete of unknown size at the limit", () => {
     await seedRecords(id, 1, MAX_UNSIZED_PARTS, 10);
     const res = await complete(id, { parts: madeUp(MAX_UNSIZED_PARTS) });
     const body = (await res.json()) as { error: string };
-    console.log(`300/300: ${res.status} ${body.error.slice(0, 60)}`);
+    console.log(
+      `${MAX_UNSIZED_PARTS}/${MAX_UNSIZED_PARTS}: ${res.status} ${body.error.slice(0, 60)}`,
+    );
     expect(res.status).toBe(400);
     // Reached multipart.complete (made-up etags), not the limit's refusal.
     expect(body.error).toMatch(/^Could not complete the upload/);
-    expect((await api(`/api/uploads/${id}`, { method: "DELETE" })).status).toBe(200);
+    expect((await deleteUploadFully(id)).status).toBe(200);
   });
 
   test(`${MAX_UNSIZED_PARTS} parts listed, ${MAX_UNSIZED_PARTS + 1} records (one not in the request): refused, nothing changed`, async () => {
@@ -82,7 +85,7 @@ test.describe("1K verifier: complete of unknown size at the limit", () => {
     // Records intact, no file object (the multipart upload was not completed).
     expect(keys.filter((k) => k.includes("/.parts/"))).toHaveLength(MAX_UNSIZED_PARTS + 1);
     expect(keys.filter((k) => !k.includes("/.parts/") && !k.endsWith("/.meta.json"))).toEqual([]);
-    expect((await api(`/api/uploads/${id}`, { method: "DELETE" })).status).toBe(200);
+    expect((await deleteUploadFully(id)).status).toBe(200);
   });
 
   test("a parts array with a duplicate is refused for that, whatever its length", async () => {
@@ -115,7 +118,7 @@ test.describe("1K verifier: complete of unknown size at the limit", () => {
       expect(r, `${n}`).toBeNull();
       expect(b.calls["list"] ?? 0).toBeLessThanOrEqual(46);
     }
-    // And on full pages, 300 is read whole in one call, 301 refused after 301 listed.
+    // And on full pages, the limit is read whole in one call, one more refused after that many listed.
     for (const [n, ok] of [
       [MAX_UNSIZED_PARTS, true],
       [MAX_UNSIZED_PARTS + 1, false],
@@ -222,9 +225,15 @@ test.describe("1K verifier: CLI Retry-After edges", () => {
   });
 
   for (const [value, when] of [
-    ["119", "Try again in 119 seconds."],
+    // Round 1L: the smallest unit that keeps the count at most 90 (two
+    // digits): before, 119 s read "119 seconds" and 7199 s "120 minutes".
+    ["90", "Try again in 90 seconds."],
+    ["91", "Try again in 2 minutes."],
+    ["119", "Try again in 2 minutes."],
     ["121", "Try again in 3 minutes."],
-    ["7199", "Try again in 120 minutes."],
+    ["5400", "Try again in 90 minutes."],
+    ["5401", "Try again in 2 hours."],
+    ["7199", "Try again in 2 hours."],
     ["86400", "Try again in 24 hours."],
     ["86401", "Try again later."],
     ["9".repeat(400), "Try again later."],
@@ -236,7 +245,9 @@ test.describe("1K verifier: CLI Retry-After edges", () => {
       console.log(`RA ${value.slice(0, 32)}: tries ${r.tries}, ${note.slice(60, 160)}`);
       expect(r.code).toBe(1);
       expect(r.tries).toBe(1);
-      expect(note).toContain(`Service unavailable. ${when}`);
+      // Round 1L: one period, not "(… minutes.); run".
+      expect(note).toContain(`(Service unavailable. ${when.replace(/\.$/, "")}); run`);
+      expect(note).not.toContain(".)");
     });
   }
 

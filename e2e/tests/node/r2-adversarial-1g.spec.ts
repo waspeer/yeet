@@ -113,6 +113,13 @@ async function runUntil(b: CheckedBucket, maxRuns: number, done: () => boolean) 
   return { run: Infinity, maxCalls };
 }
 
+// Runs the random mixes below may take. Their deletions dominate, at about
+// one run per CLEANUP_LIST_LIMIT keys of an upload (fewer on the random
+// short pages of seeds 2 and 4), so the bound scales inversely with it. At
+// 100, seed 4 needed 3,719 runs in round 1K and 3,618 in round 1L, against a
+// fixed bound of 4,000 before; this gives it twice that.
+const RANDOM_MIX_MAX_RUNS = Math.ceil((2 * 3_800 * 100) / CLEANUP_LIST_LIMIT);
+
 test.describe("1G verifier: cron on adversarial buckets", () => {
   for (const seedNo of [1, 2, 3, 4]) {
     test(`random mix (seed ${seedNo}): <=45 calls, live untouched, no orphan, converges`, async () => {
@@ -140,7 +147,7 @@ test.describe("1G verifier: cron on adversarial buckets", () => {
         if (!isStaleShape(s) && !s.noSidecar) b.live.add(id);
         if (pick(0.01)) for (let j = 0; j < 300; j++) b.seed(`${P}/${id}~junk${j}`); // top-level junk
       }
-      const { run, maxCalls } = await runUntil(b, 4000, () => {
+      const { run, maxCalls } = await runUntil(b, RANDOM_MIX_MAX_RUNS, () => {
         for (const [id, s] of shapes) {
           const keys = b.sorted(`${P}/${id}/`);
           if (isStaleShape(s) && keys.length) return false;
@@ -158,7 +165,7 @@ test.describe("1G verifier: cron on adversarial buckets", () => {
       });
       console.log(`seed ${seedNo}: converged after ${run} runs, max calls ${maxCalls}`);
       expect(b.violations).toEqual([]);
-      expect(run).toBeLessThan(4000);
+      expect(run).toBeLessThan(RANDOM_MIX_MAX_RUNS);
       // Live uploads keep their file and sidecar; summaries match bodies.
       for (const id of b.live) {
         const s = shapes.get(id)!;
@@ -342,7 +349,7 @@ test.describe("1G verifier: deleteUnder sidecar-last", () => {
     seedUpload(b, "x", { filename: "zz.bin" }); // sidecar sorts first
     const r = await new Uploads(b, P).deleteUnder(`${P}/x/`, 10);
     // list (sidecar only), list after it + delete the file, delete the sidecar.
-    expect(r).toEqual({ calls: 4, done: true });
+    expect(r).toEqual({ calls: 4, done: true, listed: 2, deleted: 2 });
     expect(b.sorted(`${P}/x/`)).toEqual([]);
   });
 });
