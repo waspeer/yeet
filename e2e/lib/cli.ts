@@ -3,7 +3,7 @@
 // YEET_* variables are dropped, so ~/.config/yeet is never read or written.
 
 import { expect } from "@playwright/test";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { mkdtemp } from "node:fs/promises";
 import { join } from "node:path";
 import { server } from "./env.js";
@@ -35,6 +35,42 @@ export interface CliResult {
   durationMs: number;
 }
 
+/** CLI processes started by this Playwright worker that have not exited yet. */
+const running = new Set<ChildProcess>();
+
+/**
+ * Start `node <args>` (the CLI) in its own process group and track it until
+ * it exits, so killRunningClis() can stop it if its test ends first (a
+ * timeout, a failed assertion): a CLI must never outlive its test, let alone
+ * the harness. Tests that need the child itself (e.g. to send SIGINT) use
+ * this instead of child_process.spawn.
+ */
+export function spawnCli(args: string[], options: SpawnOptions): ChildProcess {
+  const child = spawn(process.execPath, args, { ...options, detached: true });
+  running.add(child);
+  child.on("exit", () => running.delete(child));
+  return child;
+}
+
+/** SIGKILL every CLI process group still running; returns their PIDs. */
+export function killRunningClis(): number[] {
+  const pids: number[] = [];
+  for (const child of running) {
+    if (child.pid === undefined) continue;
+    pids.push(child.pid);
+    try {
+      process.kill(-child.pid, "SIGKILL");
+    } catch {
+      // already gone
+    }
+  }
+  running.clear();
+  return pids;
+}
+
+// Also when the worker itself goes (Playwright tears it down after a timeout).
+process.on("exit", () => killRunningClis());
+
 /** A fresh, empty XDG_CONFIG_HOME inside the run's temp directory. */
 export function newConfigHome(): Promise<string> {
   return mkdtemp(join(server.tmpRoot, "xdg-"));
@@ -62,17 +98,17 @@ export async function cli(args: string[], opts: CliOptions = {}): Promise<CliRes
   }
 
   const started = Date.now();
-  const child = spawn(process.execPath, [server.cliPath, ...args], {
+  const child = spawnCli([server.cliPath, ...args], {
     cwd: opts.cwd,
     env,
     stdio: ["pipe", "pipe", "pipe"],
   });
   let stdout = "";
   let stderr = "";
-  child.stdout.setEncoding("utf-8").on("data", (chunk: string) => (stdout += chunk));
-  child.stderr.setEncoding("utf-8").on("data", (chunk: string) => (stderr += chunk));
-  child.stdin.on("error", () => {}); // the CLI may exit before reading stdin
-  child.stdin.end(opts.stdin ?? "");
+  child.stdout!.setEncoding("utf-8").on("data", (chunk: string) => (stdout += chunk));
+  child.stderr!.setEncoding("utf-8").on("data", (chunk: string) => (stderr += chunk));
+  child.stdin!.on("error", () => {}); // the CLI may exit before reading stdin
+  child.stdin!.end(opts.stdin ?? "");
 
   const timeoutMs = opts.timeoutMs ?? 60_000;
   const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);

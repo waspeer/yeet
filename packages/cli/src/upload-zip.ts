@@ -9,8 +9,7 @@
 // storedZipSize(). On any error (a file that cannot be read or changed while
 // it was read, a part that failed after its retries, Ctrl-C) the multipart
 // upload is deleted (after the parts in flight finish) and never completed,
-// so no truncated zip is
-// ever published. See docs/design/zip.md.
+// so no truncated zip is ever published. See docs/design/zip.md.
 
 import { open, type FileHandle } from "node:fs/promises";
 import { Duplex } from "node:stream";

@@ -47,6 +47,7 @@ import {
   randomFile,
   server,
   sleep,
+  spawnCli,
   startServer,
   test,
 } from "../../lib/index.js";
@@ -541,12 +542,12 @@ test.describe("yeet upload <folder>: the upload (stand-in server)", () => {
     });
     const home = await newConfigHome();
     try {
-      const child = spawn(process.execPath, [server.cliPath, "upload", root], {
+      const child = spawnCli([server.cliPath, "upload", root], {
         env: { ...process.env, ...s.env, HOME: home, XDG_CONFIG_HOME: home, NO_COLOR: "1" },
         stdio: ["ignore", "pipe", "pipe"],
       });
       let stderr = "";
-      child.stderr.setEncoding("utf-8").on("data", (c: string) => (stderr += c));
+      child.stderr!.setEncoding("utf-8").on("data", (c: string) => (stderr += c));
       await partArrived;
       const closed = new Promise<number | null>((resolve) => child.on("close", resolve));
       child.kill("SIGINT");
@@ -562,6 +563,92 @@ test.describe("yeet upload <folder>: the upload (stand-in server)", () => {
       expect(s.puts().length).toBeLessThanOrEqual(3);
     } finally {
       await s.close();
+    }
+  });
+
+  test("the server goes away mid-upload: exit 1 within the retry budget, at low CPU", async ({
+    tmp,
+  }) => {
+    test.setTimeout(90_000);
+    const { root } = await album(tmp);
+    let s!: Awaited<ReturnType<typeof standIn>>;
+    s = await standIn(1000, (r) => {
+      // After part 2 arrives nothing answers any more, and nothing listens.
+      if (r.path.endsWith("/parts/2")) void s.close();
+    });
+    const home = await newConfigHome();
+    // /usr/bin/time -p reports the CLI's own CPU time (user + sys) on stderr.
+    const child = spawn("/usr/bin/time", ["-p", process.execPath, server.cliPath, "upload", root], {
+      env: { ...process.env, ...s.env, HOME: home, XDG_CONFIG_HOME: home, NO_COLOR: "1" },
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: true,
+    });
+    let stderr = "";
+    child.stderr.setEncoding("utf-8").on("data", (c: string) => (stderr += c));
+    try {
+      const code = await new Promise<number | null>((resolve) => child.on("close", resolve));
+      expect(code, stderr).toBe(1);
+      expect(stderr).toMatch(/Upload of album\.zip failed: Could not reach/);
+      const seconds = (name: string) =>
+        Number(new RegExp(`^${name} ([\\d.]+)$`, "m").exec(stderr)?.[1]);
+      // Retries back off 1 + 2 + 4 s for the part and again for the DELETE.
+      expect(seconds("real")).toBeLessThan(30);
+      expect(seconds("user") + seconds("sys"), stderr).toBeLessThan(5);
+    } finally {
+      try {
+        process.kill(-child.pid!, "SIGKILL");
+      } catch {
+        // exited
+      }
+      await s.close().catch(() => {});
+    }
+  });
+});
+
+// Regression (harness): a CLI started by a test used to outlive it when the
+// test failed or timed out before the CLI exited (cli()'s own kill comes only
+// after its timeoutMs), and kept running after the harness had gone. The
+// reapClis fixture (lib/index.ts) now kills it when the test ends.
+test.describe("a CLI the test leaves running", () => {
+  test.describe.configure({ mode: "serial" });
+  let pid: number | undefined;
+  let s: Awaited<ReturnType<typeof standIn>> | undefined;
+
+  test("is started against a server that never answers, and left behind", async ({ tmp }) => {
+    const { root } = await album(tmp);
+    s = await standIn(1000, () => "hold");
+    const home = await newConfigHome();
+    const child = spawnCli([server.cliPath, "upload", root], {
+      env: { ...process.env, ...s.env, HOME: home, XDG_CONFIG_HOME: home },
+      stdio: "ignore",
+    });
+    pid = child.pid;
+    await eventually(() => s!.requests.length > 0, { message: "the CLI's first request" });
+  });
+
+  test("is killed when that test ends", async () => {
+    try {
+      expect(pid).toBeDefined();
+      await eventually(
+        () => {
+          try {
+            process.kill(pid!, 0);
+            return false;
+          } catch {
+            return true;
+          }
+        },
+        { timeoutMs: 3000, message: `CLI process ${pid} to be gone` },
+      );
+    } finally {
+      if (pid) {
+        try {
+          process.kill(-pid, "SIGKILL");
+        } catch {
+          // gone
+        }
+      }
+      await s?.close();
     }
   });
 });
