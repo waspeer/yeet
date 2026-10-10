@@ -6,9 +6,9 @@ import { Duplex, Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import zlib from "node:zlib";
 import { fixtureEntries } from "../fixtures.ts";
-import { createZip, type ZipOptions } from "../zip.ts";
+import { createZip, type ZipOptions } from "../../../packages/cli/src/zip.ts";
 
-const [defaultOut, zlibOut] = process.argv.slice(2);
+const [defaultOut, zlibOut] = process.argv.slice(2) as [string, string];
 
 async function deflateRawWorks(): Promise<string> {
   try {

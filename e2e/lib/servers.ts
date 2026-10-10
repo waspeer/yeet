@@ -76,6 +76,10 @@ export async function startServer(opts: {
   token: string;
   persistDir?: string;
   vars?: Record<string, string>;
+  /** Another Worker's wrangler config (`-c`), e.g. e2e/zip/runtime/wrangler.jsonc. Default: packages/worker's. */
+  config?: string;
+  /** Path polled until it answers 2xx. Default: /health. */
+  readyPath?: string;
 }): Promise<ExtraServer> {
   const persistDir = opts.persistDir ?? (await mkdtemp(join(server.tmpRoot, "extra-r2-")));
   const [port, inspectorPort] = [await freePort(), await freePort()];
@@ -96,6 +100,7 @@ export async function startServer(opts: {
     "--log-level",
     "info",
     ...Object.entries(vars).flatMap(([name, value]) => ["--var", `${name}:${value}`]),
+    ...(opts.config ? ["-c", opts.config] : []),
   ];
   const { FORCE_COLOR: _, ...env } = process.env;
   const child = spawn(join(server.workerDir, "node_modules", ".bin", "wrangler"), args, {
@@ -136,7 +141,9 @@ export async function startServer(opts: {
       throw new Error(`wrangler dev exited early. Log:\n${await readFile(logPath, "utf-8")}`);
     }
     try {
-      const res = await fetch(`${baseURL}/health`, { signal: AbortSignal.timeout(2000) });
+      const res = await fetch(`${baseURL}${opts.readyPath ?? "/health"}`, {
+        signal: AbortSignal.timeout(2000),
+      });
       if (res.ok) break;
     } catch {
       // not listening yet

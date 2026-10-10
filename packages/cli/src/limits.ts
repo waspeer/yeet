@@ -18,3 +18,15 @@ export const MAX_LIST_PAGES = 1000;
  * hourly cleanup deletes whatever is left after the last.
  */
 export const MAX_DELETE_ROUNDS = 200;
+
+/**
+ * The most parts a server completes for an upload whose size it was not told
+ * at create (`MAX_UNSIZED_PARTS` in packages/worker/src/uploads.ts, round
+ * 1L; an e2e test keeps the two equal). A compressed zip's size is only known
+ * once it is written, so a zip upload takes that path: at the 50 MiB part
+ * size, 150 parts are 7.86 GB of zip. The CLI stops before part 151 rather
+ * than upload parts the server will refuse to complete. A zip whose size is
+ * known up front (every file stored: `--store`, or only already-compressed
+ * files) is sent with its size and has no such limit.
+ */
+export const MAX_UNSIZED_PARTS = 150;

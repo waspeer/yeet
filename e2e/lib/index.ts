@@ -3,12 +3,23 @@
 import { test as base } from "@playwright/test";
 import { rm } from "node:fs/promises";
 import { clientIp } from "./api.js";
+import { killRunningClis } from "./cli.js";
 import { makeTempDir } from "./util.js";
 
 export const test = base.extend<{
   /** A per-test temp directory for fixtures and downloads, removed afterwards. */
   tmp: string;
+  /** Automatic: kills CLI processes a test leaves running (see spawnCli()). */
+  reapClis: void;
 }>({
+  reapClis: [
+    // oxlint-disable-next-line no-empty-pattern -- Playwright fixtures must destructure
+    async ({}, use) => {
+      await use();
+      killRunningClis();
+    },
+    { auto: true },
+  ],
   // oxlint-disable-next-line no-empty-pattern -- Playwright fixtures must destructure
   tmp: async ({}, use) => {
     const dir = await makeTempDir("test-");

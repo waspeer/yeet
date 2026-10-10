@@ -7,7 +7,8 @@
     "noUncheckedIndexedAccess": true,
     "skipLibCheck": true,
     "noEmit": true,
-    "types": ["node"]
+    "types": ["node"],
+    "allowImportingTsExtensions": true
   },
-  "include": ["lib/**/*", "tests/**/*", "playwright.config.ts"]
+  "include": ["lib/**/*", "tests/**/*", "zip/**/*", "playwright.config.ts"]
 }

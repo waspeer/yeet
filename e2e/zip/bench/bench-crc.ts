@@ -3,7 +3,7 @@
 import os from "node:os";
 import zlib from "node:zlib";
 import { noise } from "../fixtures.ts";
-import { crc32Js } from "../zip.ts";
+import { crc32Js } from "../../../packages/cli/src/zip.ts";
 
 const SIZE = 64 * 1024 * 1024;
 const CHUNK = 64 * 1024;
@@ -20,7 +20,7 @@ for (let n = 0; n < 256; n++) {
 }
 function crc32Table(d: Uint8Array, previous = 0): number {
   let c = ~previous;
-  for (let i = 0; i < d.length; i++) c = TABLE[(c ^ d[i]) & 0xff] ^ (c >>> 8);
+  for (let i = 0; i < d.length; i++) c = TABLE[(c ^ d[i]!) & 0xff]! ^ (c >>> 8);
   return ~c >>> 0;
 }
 
@@ -32,7 +32,7 @@ const zlibCrc = (zlib as { crc32?: (d: Uint8Array, p: number) => number }).crc32
 if (zlibCrc) impls.push(["zlib.crc32 (native)", zlibCrc]);
 
 console.log(
-  `${process.version} ${os.cpus()[0].model}, ${SIZE / 1024 / 1024} MiB random in ${CHUNK / 1024} KiB chunks, median of 7`,
+  `${process.version} ${os.cpus()[0]!.model}, ${SIZE / 1024 / 1024} MiB random in ${CHUNK / 1024} KiB chunks, median of 7`,
 );
 let reference: number | undefined;
 for (const [label, fn] of impls) {
@@ -46,7 +46,7 @@ for (const [label, fn] of impls) {
   }
   reference ??= crc;
   times.sort((a, b) => a - b);
-  const median = times[3];
+  const median = times[3]!;
   console.log(
     `  ${label.padEnd(28)} ${(SIZE / 1e6 / (median / 1000)).toFixed(0).padStart(6)} MB/s  crc=${crc.toString(16)}${crc === reference ? "" : " MISMATCH"}`,
   );

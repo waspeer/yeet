@@ -1,18 +1,21 @@
-// Streaming ZIP writer built on Web Streams. Prototype (phase 0c).
+// Streaming ZIP writer built on Web Streams. See docs/design/zip.md.
+//
+// This file exists twice, byte for byte: packages/cli/src/zip.ts and
+// packages/worker/src/zip.ts. Edit one, copy it over the other;
+// scripts/check-zip-copies.mjs fails when they differ.
 //
 // Isomorphic by construction: the only globals used are ReadableStream,
 // TransformStream, TextEncoder, Uint8Array/DataView and (as an overridable
 // default) CompressionStream. Anything runtime-specific (a faster deflate, a
-// native CRC-32) is injected through options. No imports, no dependencies, so
-// the file can be copied verbatim into packages that must be self-contained.
+// native CRC-32) is injected through options. No imports, no dependencies.
 //
-// Output layout per entry (sizes are unknown when the header is written, so
-// general purpose bit 3 is always set for file entries):
+// Output layout per file entry (sizes are unknown when the header is
+// written, so general purpose bit 3 is always set for file entries):
 //
 //   local file header | file data | data descriptor
 //
-// followed by the central directory, an optional ZIP64 end of central
-// directory record + locator, and the end of central directory record.
+// followed by the central directory, a ZIP64 end of central directory
+// record + locator when needed, and the end of central directory record.
 
 /** One file (or directory, when `path` ends in "/") to add to the archive. */
 export interface ZipEntry {
@@ -21,15 +24,16 @@ export interface ZipEntry {
   /** Modification time in milliseconds since the epoch. Defaults to the time the entry is written. */
   lastModified?: number;
   /**
-   * Uncompressed size in bytes, if known up front. When given and below the
-   * ZIP64 threshold the entry is written without ZIP64 structures; the
-   * stream must then yield exactly this many bytes or the archive errors.
+   * Uncompressed size in bytes, if known up front (fs.stat, File.size). When
+   * given and below the ZIP64 threshold the entry is written without ZIP64
+   * structures; the stream must then yield exactly this many bytes or the
+   * archive errors (which also catches files that change while being read).
    * When omitted the entry is written with ZIP64 local fields (safe for any size).
    */
   size?: number;
   /** Deflate this entry. Defaults to `options.compress`, then to the extension heuristic. */
   compress?: boolean;
-  /** Entry contents. Not called for directories. */
+  /** Entry contents. Called once, when the entry is reached. Not called for directories. */
   stream?: () => ReadableStream<Uint8Array>;
 }
 
@@ -43,21 +47,13 @@ export interface ZipOptions {
   /**
    * Default compression for entries that do not set `compress`.
    * `true` (default): deflate, except for already-compressed extensions (see `isCompressedPath`).
-   * `false`: store everything.
+   * `false`: store everything (the CLI's --store).
    */
   compress?: boolean;
   /** Factory for a raw-deflate transform. Defaults to `new CompressionStream("deflate-raw")`. */
   deflateRaw?: () => ByteTransform;
-  /** CRC-32 update function with zlib's signature `(data, previous) => crc`. Defaults to a pure JS slice-by-8. */
+  /** CRC-32 update function with zlib's signature `(data, previous) => crc`. Defaults to `crc32Js`. */
   crc32?: (data: Uint8Array, previous: number) => number;
-  /**
-   * "auto" (default): ZIP64 structures only where needed (entries with an
-   * unknown or large `size`, offsets or counts past the classic limits).
-   * "always": ZIP64 for every entry and the end records. Testing only:
-   * ditto rejects stored entries whose central header carries ZIP64 sizes
-   * below 4 GiB.
-   */
-  zip64?: "auto" | "always";
   /**
    * Minutes east of UTC used for the DOS date/time fields, which have no
    * time zone and are shown as-is by readers that ignore the UTC timestamp
@@ -65,14 +61,6 @@ export interface ZipOptions {
    * the producer's local offset at each entry's mtime (always 0 in workerd).
    */
   timeZoneOffset?: number;
-  /**
-   * Prototype-only knobs for testing reader compatibility of ZIP64 variants.
-   * `centralZip64`: "needed" puts a ZIP64 extra in a central header only for
-   * fields that overflow; "mirror" also adds it (with both sizes) whenever
-   * the local header used ZIP64.
-   * `localSizes`: value of the 32-bit size fields in a ZIP64 local header.
-   */
-  experimental?: { centralZip64?: "needed" | "mirror"; localSizes?: "ffffffff" | "zero" };
 }
 
 /** Extensions whose contents are already compressed; deflating them wastes CPU for ~0% gain. */
@@ -141,6 +129,11 @@ export function isCompressedPath(path: string): boolean {
  * Create a ZIP archive as a byte stream. Entries are consumed lazily, one at a
  * time, as the returned stream is read; nothing is buffered beyond the chunk
  * in flight and one central-directory record (~100 bytes) per entry.
+ *
+ * The stream errors on an invalid or duplicate path, a source error, or a
+ * size that does not match `entry.size`. Output written before the error is
+ * a truncated archive: callers must discard it (the CLI aborts the upload).
+ * Cancelling the stream cancels the current entry's source.
  */
 export function createZip(
   entries: AsyncIterable<ZipEntry> | Iterable<ZipEntry>,
@@ -159,15 +152,50 @@ export function createZip(
   });
 }
 
+/**
+ * The exact size of the archive `createZip(entries, options)` writes, when
+ * that is known up front: every file entry is stored (not deflated) and
+ * declares its `size`. Otherwise undefined (deflated output has no size
+ * until it is written). Lets an uploader announce the size before streaming.
+ * Validates paths like createZip, except for duplicates (createZip throws on
+ * those when it gets there).
+ */
+export function storedZipSize(
+  entries: Iterable<ZipEntry>,
+  options: ZipOptions = {},
+): number | undefined {
+  const encoder = new TextEncoder();
+  let offset = 0;
+  let centralSize = 0;
+  let count = 0;
+  for (const entry of entries) {
+    const path = normalizePath(entry.path);
+    const nameLength = encoder.encode(path).length;
+    const directory = path.endsWith("/");
+    const size = directory ? 0 : entry.size;
+    if (size === undefined || resolveCompress(entry, path, directory, options)) return undefined;
+    const zip64Local = !directory && size >= ZIP64_SIZE_THRESHOLD;
+    const localOffset = offset;
+    offset += 30 + nameLength + UT_LENGTH + (zip64Local ? 20 : 0) + size;
+    if (!directory) offset += zip64Local ? 24 : 16;
+    // Stored: compressed size = size.
+    const zip64Fields = (size >= MAX32 ? 16 : 0) + (localOffset >= MAX32 ? 8 : 0);
+    centralSize += 46 + nameLength + UT_LENGTH + (zip64Fields ? 4 + zip64Fields : 0);
+    count++;
+  }
+  const zip64End = count >= MAX16 || offset >= MAX32 || centralSize >= MAX32;
+  return offset + centralSize + (zip64End ? 56 + 20 : 0) + 22;
+}
+
 // ---------------------------------------------------------------------------
 
 const MAX16 = 0xffff;
 const MAX32 = 0xffffffff;
 // A deflate stream can be slightly larger than its input (stored blocks:
-// 5 bytes per 64 KiB, plus a few bytes). Entries whose declared size is
-// within this margin of 4 GiB are written as ZIP64 so the compressed size
-// cannot overflow a 32-bit field unexpectedly.
-const ZIP64_SIZE_THRESHOLD = MAX32 - 0x1000000; // 4 GiB - 16 MiB
+// 5 bytes per 64 KiB, plus a few bytes; measured +0.03 % on random data).
+// Entries whose declared size is within this margin of 4 GiB are written
+// as ZIP64 so the compressed size cannot overflow a 32-bit field.
+const ZIP64_SIZE_THRESHOLD = MAX32 - 0x1000000; // 4 GiB - 16 MiB - 1 (0xFEFFFFFF)
 
 const FLAG_DATA_DESCRIPTOR = 0x0008;
 const FLAG_UTF8 = 0x0800;
@@ -178,6 +206,7 @@ const VERSION_ZIP64 = 45; // 4.5: ZIP64
 const MADE_BY_UNIX = 3 << 8;
 const EXTRA_ZIP64 = 0x0001;
 const EXTRA_UT = 0x5455; // Info-ZIP extended timestamp (UTC mtime)
+const UT_LENGTH = 9; // 4-byte extra header + flags + mtime
 
 interface Record {
   name: Uint8Array;
@@ -194,15 +223,22 @@ interface Record {
   directory: boolean;
 }
 
+function resolveCompress(
+  entry: ZipEntry,
+  path: string,
+  directory: boolean,
+  options: ZipOptions,
+): boolean {
+  if (directory) return false;
+  return entry.compress ?? (options.compress === false ? false : !isCompressedPath(path));
+}
+
 async function* generate(
   entries: AsyncIterable<ZipEntry> | Iterable<ZipEntry>,
   options: ZipOptions,
 ): AsyncGenerator<Uint8Array, void, undefined> {
   const crc32 = options.crc32 ?? crc32Js;
   const deflateRaw = options.deflateRaw ?? defaultDeflateRaw;
-  const always = options.zip64 === "always";
-  const mirror = options.experimental?.centralZip64 === "mirror";
-  const zeroLocalSizes = options.experimental?.localSizes === "zero";
   const encoder = new TextEncoder();
   const records: Record[] = [];
   const seen = new Set<string>();
@@ -221,14 +257,12 @@ async function* generate(
     if (name.length > MAX16) throw new Error(`zip: path too long ${JSON.stringify(path)}`);
 
     const directory = path.endsWith("/");
-    const compress =
-      !directory &&
-      (entry.compress ?? (options.compress === false ? false : !isCompressedPath(path)));
+    const compress = resolveCompress(entry, path, directory, options);
     const hint = entry.size;
     if (hint !== undefined && !(Number.isSafeInteger(hint) && hint >= 0)) {
       throw new Error(`zip: invalid size for ${JSON.stringify(path)}`);
     }
-    const zip64Local = !directory && (always || hint === undefined || hint >= ZIP64_SIZE_THRESHOLD);
+    const zip64Local = !directory && (hint === undefined || hint >= ZIP64_SIZE_THRESHOLD);
     const mtime = entry.lastModified ?? Date.now();
     const offsetMinutes = options.timeZoneOffset ?? -new Date(mtime).getTimezoneOffset();
     const [dosTime, dosDate] = toDosDateTime(new Date(mtime + offsetMinutes * 60_000));
@@ -248,22 +282,27 @@ async function* generate(
       directory,
     };
 
-    const header = localHeader(record, zeroLocalSizes);
+    if (!directory && !entry.stream) {
+      throw new Error(`zip: entry ${JSON.stringify(path)} has no stream()`);
+    }
+    const header = localHeader(record);
     offset += header.length;
     yield header;
 
     if (!directory) {
-      if (!entry.stream) throw new Error(`zip: entry ${JSON.stringify(path)} has no stream()`);
       let crc = 0;
       let size = 0;
       let compressedSize = 0;
-      const source = entry.stream();
+      const source = entry.stream!();
       let output: ReadableStream<Uint8Array>;
       if (compress) {
         output = source
           .pipeThrough(
             new TransformStream<Uint8Array, Uint8Array>({
               transform(chunk, controller) {
+                if (!(chunk instanceof Uint8Array)) {
+                  throw new TypeError("zip: stream must yield Uint8Array chunks");
+                }
                 crc = crc32(chunk, crc);
                 size += chunk.length;
                 controller.enqueue(chunk);
@@ -280,8 +319,9 @@ async function* generate(
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
-          if (!(value instanceof Uint8Array))
+          if (!(value instanceof Uint8Array)) {
             throw new TypeError("zip: stream must yield Uint8Array chunks");
+          }
           if (value.length === 0) continue;
           if (!compress) {
             crc = crc32(value, crc);
@@ -301,6 +341,9 @@ async function* generate(
           `zip: ${JSON.stringify(path)} yielded ${size} bytes, expected ${hint} (changed while reading?)`,
         );
       }
+      // Unreachable with an honest size hint and a real deflater (see
+      // ZIP64_SIZE_THRESHOLD), but a 32-bit descriptor would silently
+      // truncate the sizes, so refuse rather than write a corrupt archive.
       if (!zip64Local && (size >= MAX32 || compressedSize >= MAX32)) {
         throw new Error(`zip: ${JSON.stringify(path)} exceeds 4 GiB without ZIP64 local header`);
       }
@@ -317,15 +360,13 @@ async function* generate(
   const centralOffset = offset;
   let centralSize = 0;
   for (const record of records) {
-    const header = centralHeader(record, always || (mirror && record.zip64Local));
+    const header = centralHeader(record);
     centralSize += header.length;
     yield header;
   }
   const centralEnd = centralOffset + centralSize;
 
-  const needZip64End =
-    always || records.length >= MAX16 || centralOffset >= MAX32 || centralSize >= MAX32;
-  if (needZip64End) {
+  if (records.length >= MAX16 || centralOffset >= MAX32 || centralSize >= MAX32) {
     yield zip64EndRecord(records.length, centralSize, centralOffset);
     yield zip64EndLocator(centralEnd);
   }
@@ -360,10 +401,11 @@ const WINDOWS_RESERVED = /^(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³])(\.|$)
 /**
  * Make a "/"-separated path extractable by Windows Explorer: replaces
  * < > : " \ | ? * and control characters with "_", strips trailing dots and
- * spaces from each segment, and prefixes reserved device names (CON, NUL,
- * COM1, LPT1, also with an extension) with "_". Not applied by createZip;
- * callers opt in. Collisions it creates are caught by createZip's duplicate
- * check. Paths of 260+ characters are left alone (report them instead).
+ * spaces from each segment (a segment left empty becomes "_"), and prefixes
+ * reserved device names (CON, NUL, COM1, LPT1, also with an extension) with
+ * "_". Not applied by createZip; callers opt in. Collisions it creates are
+ * caught by createZip's duplicate check. Paths of 260+ characters are left
+ * alone (callers should warn about them instead).
  */
 export function sanitizeForWindows(path: string): string {
   const directory = path.endsWith("/");
@@ -395,8 +437,8 @@ function utcSeconds(mtime: number): number {
   return Math.min(Math.max(Math.floor(mtime / 1000), 0), 0x7fffffff);
 }
 
-function localHeader(r: Record, zeroSizes: boolean): Uint8Array {
-  const extraLength = 9 + (r.zip64Local ? 20 : 0);
+function localHeader(r: Record): Uint8Array {
+  const extraLength = UT_LENGTH + (r.zip64Local ? 20 : 0);
   const out = new Uint8Array(30 + r.name.length + extraLength);
   const v = new DataView(out.buffer);
   v.setUint32(0, 0x04034b50, true);
@@ -407,7 +449,7 @@ function localHeader(r: Record, zeroSizes: boolean): Uint8Array {
   v.setUint16(12, r.dosDate, true);
   // crc32 (14), compressed size (18), size (22): zero with a data descriptor,
   // except ZIP64 entries where 0xFFFFFFFF points readers at the ZIP64 extra.
-  if (r.zip64Local && !zeroSizes) {
+  if (r.zip64Local) {
     v.setUint32(18, MAX32, true);
     v.setUint32(22, MAX32, true);
   }
@@ -426,14 +468,14 @@ function localHeader(r: Record, zeroSizes: boolean): Uint8Array {
   return out;
 }
 
-function writeUt(v: DataView, p: number, mtime: number): number {
+function writeUt(v: DataView, p: number, mtime: number): void {
   v.setUint16(p, EXTRA_UT, true);
   v.setUint16(p + 2, 5, true);
   v.setUint8(p + 4, 1); // flags: mtime present
   v.setUint32(p + 5, utcSeconds(mtime), true);
-  return p + 9;
 }
 
+/** Descriptor with signature; 8-byte sizes iff the local header has a ZIP64 extra (APPNOTE 4.3.9). */
 function dataDescriptor(r: Record): Uint8Array {
   const out = new Uint8Array(r.zip64Local ? 24 : 16);
   const v = new DataView(out.buffer);
@@ -449,11 +491,14 @@ function dataDescriptor(r: Record): Uint8Array {
   return out;
 }
 
-function centralHeader(r: Record, forceZip64Sizes: boolean): Uint8Array {
-  const sizeOver = forceZip64Sizes || r.size >= MAX32 || r.compressedSize >= MAX32;
+function centralHeader(r: Record): Uint8Array {
+  // Only the fields that overflow go into the ZIP64 extra (APPNOTE 4.5.3);
+  // ditto rejects stored entries with unneeded ZIP64 sizes.
+  const sizeOver = r.size >= MAX32;
+  const compressedOver = r.compressedSize >= MAX32;
   const offsetOver = r.offset >= MAX32;
-  const zip64Length = (sizeOver ? 16 : 0) + (offsetOver ? 8 : 0);
-  const extraLength = 9 + (zip64Length ? 4 + zip64Length : 0);
+  const zip64Length = (sizeOver ? 8 : 0) + (compressedOver ? 8 : 0) + (offsetOver ? 8 : 0);
+  const extraLength = UT_LENGTH + (zip64Length ? 4 + zip64Length : 0);
   const out = new Uint8Array(46 + r.name.length + extraLength);
   const v = new DataView(out.buffer);
   const version = zip64Length || r.zip64Local ? VERSION_ZIP64 : VERSION_DEFAULT;
@@ -465,7 +510,7 @@ function centralHeader(r: Record, forceZip64Sizes: boolean): Uint8Array {
   v.setUint16(12, r.dosTime, true);
   v.setUint16(14, r.dosDate, true);
   v.setUint32(16, r.crc, true);
-  v.setUint32(20, sizeOver ? MAX32 : r.compressedSize, true);
+  v.setUint32(20, compressedOver ? MAX32 : r.compressedSize, true);
   v.setUint32(24, sizeOver ? MAX32 : r.size, true);
   v.setUint16(28, r.name.length, true);
   v.setUint16(30, extraLength, true);
@@ -480,11 +525,14 @@ function centralHeader(r: Record, forceZip64Sizes: boolean): Uint8Array {
     v.setUint16(p, EXTRA_ZIP64, true);
     v.setUint16(p + 2, zip64Length, true);
     p += 4;
-    // Only fields whose 32-bit counterpart is 0xFFFFFFFF, in spec order.
+    // In spec order: size, compressed size, offset.
     if (sizeOver) {
       setUint64(v, p, r.size);
-      setUint64(v, p + 8, r.compressedSize);
-      p += 16;
+      p += 8;
+    }
+    if (compressedOver) {
+      setUint64(v, p, r.compressedSize);
+      p += 8;
     }
     if (offsetOver) {
       setUint64(v, p, r.offset);
@@ -548,8 +596,8 @@ const CRC_TABLE = /* @__PURE__ */ (() => {
   }
   for (let n = 0; n < 256; n++) {
     for (let s = 1; s < 8; s++) {
-      const prev = t[(s - 1) * 256 + n];
-      t[s * 256 + n] = (prev >>> 8) ^ t[prev & 0xff];
+      const prev = t[(s - 1) * 256 + n]!;
+      t[s * 256 + n] = (prev >>> 8) ^ t[prev & 0xff]!;
     }
   }
   return t;
@@ -563,18 +611,18 @@ export function crc32Js(data: Uint8Array, previous = 0): number {
   const n = data.length;
   const end8 = n - (n % 8);
   while (i < end8) {
-    c ^= data[i] | (data[i + 1] << 8) | (data[i + 2] << 16) | (data[i + 3] << 24);
+    c ^= data[i]! | (data[i + 1]! << 8) | (data[i + 2]! << 16) | (data[i + 3]! << 24);
     c =
-      t[1792 + (c & 0xff)] ^
-      t[1536 + ((c >>> 8) & 0xff)] ^
-      t[1280 + ((c >>> 16) & 0xff)] ^
-      t[1024 + (c >>> 24)] ^
-      t[768 + data[i + 4]] ^
-      t[512 + data[i + 5]] ^
-      t[256 + data[i + 6]] ^
-      t[data[i + 7]];
+      t[1792 + (c & 0xff)]! ^
+      t[1536 + ((c >>> 8) & 0xff)]! ^
+      t[1280 + ((c >>> 16) & 0xff)]! ^
+      t[1024 + (c >>> 24)]! ^
+      t[768 + data[i + 4]!]! ^
+      t[512 + data[i + 5]!]! ^
+      t[256 + data[i + 6]!]! ^
+      t[data[i + 7]!]!;
     i += 8;
   }
-  while (i < n) c = t[(c ^ data[i++]) & 0xff] ^ (c >>> 8);
+  while (i < n) c = t[(c ^ data[i++]!) & 0xff]! ^ (c >>> 8);
   return ~c >>> 0;
 }

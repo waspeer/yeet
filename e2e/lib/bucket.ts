@@ -39,8 +39,11 @@ function objectPath(key: string): string {
   return `/objects/${encodeURIComponent(key)}`;
 }
 
-/** Every object whose key starts with `prefix`. */
-export async function listObjects(prefix = `${server.uploadsPrefix}/`): Promise<BucketObject[]> {
+/** Every object whose key starts with `prefix` (`baseURL`: another server's bucket, see servers.ts). */
+export async function listObjects(
+  prefix = `${server.uploadsPrefix}/`,
+  { baseURL }: { baseURL?: string } = {},
+): Promise<BucketObject[]> {
   const objects: BucketObject[] = [];
   let cursor: string | undefined;
   do {
@@ -49,7 +52,7 @@ export async function listObjects(prefix = `${server.uploadsPrefix}/`): Promise<
     const page = await explorerJson<{
       result: BucketObject[];
       result_info?: { cursor?: string; is_truncated?: string | boolean };
-    }>(`/objects?${query}`);
+    }>(`/objects?${query}`, undefined, baseURL);
     objects.push(...page.result);
     const truncated = String(page.result_info?.is_truncated) === "true";
     cursor = truncated ? page.result_info?.cursor : undefined;

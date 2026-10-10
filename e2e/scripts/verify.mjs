@@ -485,6 +485,8 @@ async function main() {
   rmSync(SUMMARY_PATH, { force: true });
 
   await step("prepare", async () => {
+    // The CLI and Worker copies of zip.ts must be identical (docs/design/zip.md).
+    run(process.execPath, [join(REPO_DIR, "scripts", "check-zip-copies.mjs")], REPO_DIR);
     ensureDependencies(E2E_DIR);
     ensureDependencies(CLI_DIR);
     ensureDependencies(WORKER_DIR);
