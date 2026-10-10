@@ -502,7 +502,11 @@ api.post("/uploads/:id/complete", async (c) => {
     );
   }
 
-  await uploads.finishUpload(id, meta, read.etag, object.size);
+  // Conditional on the sidecar read above: a DELETE since then wins
+  // (see Uploads.finishUpload()).
+  if ((await uploads.finishUpload(id, meta, read.etag, object.size)) === "deleted") {
+    return c.json({ error: "No upload in progress: it was deleted" }, 404);
+  }
   if (partRecords.length > 0) await uploads.deleteKeys(partRecords);
   return c.json({ id, url: shareUrl(new URL(c.req.url).origin, id, meta.filename) });
 });

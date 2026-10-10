@@ -458,6 +458,22 @@ Numbers that are signed or used as keys must be spelled one way only:
     wrong once a higher one exists. That would cost a bucket listing on every
     `PUT`.
 
+- **Completing an upload** (round 2C). `complete` reads the pending
+  sidecar with its etag (`readMetaVersion()`), and after R2's multipart
+  complete writes the finished sidecar **only over that version**
+  (`Uploads.finishUpload()`, `onlyIf: { etagMatches }`). If the write
+  fails, a `DELETE` ran in between (it deleted the sidecar, or marked it
+  as a deletion under way): the upload stays deleted, the file R2 just
+  made is deleted too (1 delete call; the `DELETE` may have listed the
+  upload before the file existed), and the answer is
+  `404 {"error": "No upload in progress: it was deleted"}`. If the
+  sidecar is by then a finished one (two `complete`s at once), that one
+  stands and the answer is the usual `200`. R2 calls: the same as before
+  when nothing interferes (the read and one put, now conditional); a
+  failed write adds a read and the delete. Tests:
+  `e2e/tests/node/complete-race.spec.ts` (step by step on the in-memory
+  bucket, with at most and more than `DELETE_LIMIT` objects, and both
+  requests at once on `wrangler dev`) and `verify-1l-units.spec.ts`.
 - **Errors R2 raises at `complete`** (e.g. a wrong etag): `400` with
   "Could not complete the upload; check that every part was uploaded and its
   etag is right (…)" instead of a 500.
@@ -1105,19 +1121,25 @@ Found by the independent verifiers of rounds 1H–1L and left as they are:
 none affects the CLI or the upload page in normal use, and fixing them
 would cost more than they do.
 
-- **A `complete` that lands after a `DELETE` can bring the upload back.**
-  `complete` writes the finished sidecar unconditionally (`writeMeta()`
-  without `etagMatches`, after `multipart.complete()`). If a `DELETE`
-  aborts after R2 completed the multipart upload and writes its marker
-  before that write, the marker is overwritten: with more than
-  `DELETE_LIMIT` objects (an upload of unknown size with about 100 to 150
-  part records) the file is still there and the upload is back whole.
-  With fewer, the `DELETE` deletes everything, the file included, and the
-  write leaves a sidecar without its file: listed, its download a `404`.
-  Either way it takes a concurrent `DELETE` in that short window, and the
-  next `DELETE` removes it. The first case also needs an upload of
-  unknown size, which the CLI and the upload page never make: they always
-  send the size.
+- **A `complete` racing a `DELETE` (fixed in round 2C, no longer a
+  limitation).** Until then `complete` wrote the finished sidecar
+  unconditionally after `multipart.complete()`, so a `DELETE` in between
+  was undone: with more than `DELETE_LIMIT` objects its marker was
+  overwritten and the upload was back whole; with fewer, everything was
+  deleted, the file included, and the write left a sidecar without its
+  file (listed, its download a `404`). Now the write is conditional on the
+  sidecar `complete` read (`onlyIf: { etagMatches }`,
+  `Uploads.finishUpload()`, see "Completing an upload" below), so the
+  `DELETE` wins either way: the sidecar stays deleted or stays the
+  deletion marker, the file R2 has just made is deleted as well, and
+  `complete` answers `404 {"error": "No upload in progress: it was deleted"}`.
+  What remains: a `DELETE` whose own sidecar read failed (it then skips
+  the multipart abort) and that lists the upload before R2 has created
+  the file could, if `complete`'s write lands before the `DELETE`'s
+  sidecar delete, leave the file without a sidecar. Not seen; it needs a
+  failed read and two requests in a window of a few milliseconds.
+  The upload page also never sends its cleanup `DELETE` once it has sent
+  `complete` (see "Upload page module").
 - **A late part record can be left behind.** A part `PUT` whose
   `uploadPart()` succeeded before a `DELETE` aborted the multipart upload
   writes its empty `.parts/<n>` record (`writePartSize()`, uploads of
