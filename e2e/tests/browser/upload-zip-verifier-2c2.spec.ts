@@ -21,6 +21,7 @@ import {
   MiB,
   randomFile,
   serverLog,
+  setFolder,
   shareLink,
   sleep,
   test,
@@ -132,7 +133,7 @@ test("verifier 2C+2: a stored zip of exactly part_size bytes is one part, whole"
   const a = await randomFile(root, PART_SIZE - overhead, "a.mp3");
   await logIn(page);
   const id = createdId(page);
-  await page.locator("#folder-input").setInputFiles(root);
+  await setFolder(page.locator("#folder-input"), root);
   const url = await shareLink(page, 90_000);
   const uploadId = await id;
   const puts = (await serverLog())
@@ -227,7 +228,7 @@ test("verifier 2C+2: after a cancel the DELETE is repeated on 202, at most 5 tim
     });
   });
   const id = createdId(page);
-  await page.locator("#folder-input").setInputFiles(root);
+  await setFolder(page.locator("#folder-input"), root);
   await eventually(() => held.length > 0, { message: "part 2 in flight", timeoutMs: 60_000 });
   await page.getByRole("button", { name: "Cancel" }).click();
   await expect(page.locator("#idle-note")).toHaveText("Upload cancelled.");

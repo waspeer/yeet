@@ -16,6 +16,7 @@ import {
   logIn,
   MiB,
   randomFile,
+  setFolder,
   shareLink,
   test,
 } from "../../lib/index.js";
@@ -116,7 +117,7 @@ test("screenshots of the zip states", async ({ page, tmp, browserName }) => {
   await randomFile(root, 40 * MiB, "Final mix (master) v3.wav");
   await randomFile(join(root, "drums"), 15 * MiB, "kick.wav");
   await randomFile(join(root, "drums"), 5 * MiB, "snare.wav");
-  await page.locator("#folder-input").setInputFiles(root);
+  await setFolder(page.locator("#folder-input"), root);
   await expect(page.getByRole("button", { name: "Upload anyway" })).toBeVisible();
   await shoot("3-too-large-warning");
 
@@ -140,7 +141,7 @@ test("screenshots of the zip states", async ({ page, tmp, browserName }) => {
   await rename(`${snare}.away`, snare);
   await shoot("5-choose-folder-again");
 
-  await page.locator("#folder-input").setInputFiles(root);
+  await setFolder(page.locator("#folder-input"), root);
   await shareLink(page, 60_000);
   await shoot("6-done");
 });

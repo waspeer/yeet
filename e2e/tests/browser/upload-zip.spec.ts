@@ -36,6 +36,7 @@ import {
   randomFile,
   readUploadMeta,
   serverLog,
+  setFolder,
   shareLink,
   silentWavFile,
   sleep,
@@ -196,7 +197,7 @@ test.describe("upload page: several files or a folder", () => {
     await expect(page.getByRole("button", { name: "Choose folder" })).toBeVisible();
     const create = createBody(page);
     const complete = completeBody(page);
-    await page.locator("#folder-input").setInputFiles(a.root);
+    await setFolder(page.locator("#folder-input"), a.root);
     const url = await shareLink(page);
 
     await expect(page.locator("#done-name")).toHaveText(`${a.name}.zip`.normalize("NFC"));
@@ -295,7 +296,7 @@ test.describe("upload page: several files or a folder", () => {
     await logIn(page);
     const create = createBody(page);
     const complete = completeBody(page);
-    await page.locator("#folder-input").setInputFiles(root);
+    await setFolder(page.locator("#folder-input"), root);
     const url = await shareLink(page);
     const { bytes, central } = await checkZip(
       url,
@@ -320,7 +321,7 @@ test.describe("upload page: several files or a folder", () => {
     await logIn(page);
     const create = createBody(page);
     const id = createdId(page);
-    await page.locator("#folder-input").setInputFiles(root);
+    await setFolder(page.locator("#folder-input"), root);
     const url = await shareLink(page, 90_000);
     expect(await create).not.toHaveProperty("size");
     const puts = (await serverRequests(await id)).filter((line) => line.includes("PUT"));
@@ -358,7 +359,7 @@ test.describe("upload page: several files or a folder", () => {
     const notes = await fileWith(root, "notes.txt", "bpm 120");
     await logIn(page);
     const creates = countCreates(page);
-    await page.locator("#folder-input").setInputFiles(root);
+    await setFolder(page.locator("#folder-input"), root);
 
     const message = page.locator("#confirm-message");
     await expect(message).toHaveText(
@@ -375,7 +376,7 @@ test.describe("upload page: several files or a folder", () => {
     // Choose again: back to the start, then the same folder once more.
     await page.getByRole("button", { name: "Choose again" }).click();
     await expect(page.getByRole("button", { name: "Choose files" })).toBeVisible();
-    await page.locator("#folder-input").setInputFiles(root);
+    await setFolder(page.locator("#folder-input"), root);
     await expect(message).toBeVisible();
     const create = createBody(page);
     await page.getByRole("button", { name: "Upload anyway" }).click();
@@ -400,7 +401,7 @@ test.describe("upload page: several files or a folder", () => {
     const clip = await randomFile(root, 51 * MiB, "clip.mp4");
     await logIn(page);
     const create = createBody(page);
-    await page.locator("#folder-input").setInputFiles(root);
+    await setFolder(page.locator("#folder-input"), root);
     await expect(page.locator("#state-uploading")).toBeVisible();
     await expect(page.locator("#state-confirm")).toBeHidden();
     const url = await shareLink(page, 90_000);
@@ -477,7 +478,7 @@ test.describe("upload page: several files or a folder", () => {
     });
     const id = createdId(page);
     const part1 = page.waitForResponse((res) => isPart(res.request(), 1) && res.ok());
-    await page.locator("#folder-input").setInputFiles(root);
+    await setFolder(page.locator("#folder-input"), root);
     await part1;
     await eventually(() => held.length > 0, { message: "part 2 in flight" });
     // Part 1 left its size record (an upload of unknown size).
@@ -504,7 +505,7 @@ test.describe("upload page: several files or a folder", () => {
     const held: Route[] = [];
     await page.route("**/api/uploads/*/complete", (route) => void held.push(route));
     const id = createdId(page);
-    await page.locator("#folder-input").setInputFiles(a.root);
+    await setFolder(page.locator("#folder-input"), a.root);
     await eventually(() => held.length > 0, { message: "the complete request" });
     await expect(page.locator("#up-note")).toHaveText("Finishing…");
     await expect(page.getByRole("button", { name: "Cancel" })).toBeHidden();
@@ -523,7 +524,7 @@ test.describe("upload page: several files or a folder", () => {
     const closed = new Promise<void>((resolve) => {
       page.once("worker", (worker) => worker.once("close", () => resolve()));
     });
-    await page.locator("#folder-input").setInputFiles(a.root);
+    await setFolder(page.locator("#folder-input"), a.root);
     await shareLink(page);
     await Promise.race([
       closed,
@@ -554,7 +555,7 @@ test.describe("upload page: the browser loses access to the files of a zip", () 
       else return route.fallback();
     });
     const created = createdId(page);
-    await page.locator("#folder-input").setInputFiles(root);
+    await setFolder(page.locator("#folder-input"), root);
     const oldId = await created;
     await eventually(() => held.length > 0, { message: "part 1 in flight" });
     await rename(b.path, `${b.path}.away`);
@@ -578,7 +579,7 @@ test.describe("upload page: the browser loses access to the files of a zip", () 
     const next = createdId(page);
     const chooser = page.waitForEvent("filechooser");
     await page.getByRole("button", { name: "Choose the folder again" }).click();
-    await (await chooser).setFiles(root);
+    await setFolder(await chooser, root);
     const newId = await next;
     const url = await shareLink(page);
     expect(newId).not.toBe(oldId);
@@ -605,7 +606,7 @@ test.describe("upload page: the browser loses access to the files of a zip", () 
     });
     const created = createdId(page);
     const part1 = page.waitForResponse((res) => isPart(res.request(), 1) && res.ok());
-    await page.locator("#folder-input").setInputFiles(root);
+    await setFolder(page.locator("#folder-input"), root);
     const id = await created;
     await part1;
     await eventually(() => held.length > 0, { message: "part 2 in flight" });
@@ -624,7 +625,7 @@ test.describe("upload page: the browser loses access to the files of a zip", () 
 
     const chooser = page.waitForEvent("filechooser");
     await page.getByRole("button", { name: "Choose the folder again" }).click();
-    await (await chooser).setFiles(root);
+    await setFolder(await chooser, root);
     const url = await shareLink(page, 90_000);
     expect(url).toContain(`/${id}/`);
     expect(creates).toHaveLength(1);
@@ -649,7 +650,7 @@ test.describe("upload page: the browser loses access to the files of a zip", () 
       else return route.fallback();
     });
     const created = createdId(page);
-    await page.locator("#folder-input").setInputFiles(root);
+    await setFolder(page.locator("#folder-input"), root);
     const oldId = await created;
     await eventually(() => held.length > 0, { message: "part 1 in flight" });
     await rename(a.path, `${a.path}.away`);
@@ -662,7 +663,7 @@ test.describe("upload page: the browser loses access to the files of a zip", () 
     }
     const extra = await randomFile(root, 1 * KiB, "b.mp3");
     const next = createdId(page);
-    await page.locator("#folder-input").setInputFiles(root);
+    await setFolder(page.locator("#folder-input"), root);
     const newId = await next;
     const url = await shareLink(page);
     expect(newId).not.toBe(oldId);
@@ -692,7 +693,7 @@ test.describe("upload page: the browser loses access to the files of a zip", () 
       else return route.fallback();
     });
     const created = createdId(page);
-    await page.locator("#folder-input").setInputFiles(root);
+    await setFolder(page.locator("#folder-input"), root);
     const oldId = await created;
     await eventually(() => held.length > 0, { message: "part 1 in flight" });
     await rename(a.path, `${a.path}.away`);
@@ -723,7 +724,7 @@ test.describe("upload page: the browser loses access to the files of a zip", () 
     const creates = countCreates(page);
     const chooser = page.waitForEvent("filechooser");
     await page.getByRole("button", { name: "Choose the folder again" }).click();
-    await (await chooser).setFiles(root);
+    await setFolder(await chooser, root);
     const url = await shareLink(page);
     expect(url).not.toContain(`/${oldId}/`);
     expect(creates).toHaveLength(1);

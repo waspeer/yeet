@@ -383,8 +383,14 @@ logPath, stop() }`: another `wrangler dev` of the Worker, with its own ports,
   rename makes their reads fail) or made in the page (`text`, e.g. names that cannot exist
   side by side on a case-insensitive disk). `treeOf(dir)` gives a folder on disk as Finder
   drops it, `.DS_Store` included.
-- Folders can also be picked: `page.locator("#folder-input").setInputFiles(dir)` (a
-  `webkitdirectory` input) works in all three engines; it reports no empty folders.
+- Folders can also be picked: `setFolder(page.locator("#folder-input"), dir)`, or
+  `setFolder(await chooser, dir)` for a file chooser the page opened (a
+  `webkitdirectory` input), works in all three engines; it reports no empty folders.
+  Use it rather than `setInputFiles(dir)`: for a folder, Playwright 1.63 waits for the
+  input's `input` event with a listener it adds alongside the files, and when the
+  browser lists a small folder first (seen in WebKit under load: the page had the
+  files and showed the link, the call never returned) it waits forever.
+  `setFolder()` adds its own listener first and does not wait for that call.
 - The page's test hook `window.__yeetE2E = { maxUnsizedParts: n }` (set with
   `page.addInitScript()` before `goto`) lowers its limit for zips of unknown size, so
   `tests/browser/upload-zip.spec.ts` reaches the forced store with 51 MiB instead of 8 GB.

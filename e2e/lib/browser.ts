@@ -2,8 +2,44 @@
 
 import { readdir, stat } from "node:fs/promises";
 import { basename, join } from "node:path";
-import { expect, type Page } from "@playwright/test";
+import {
+  expect,
+  type ElementHandle,
+  type FileChooser,
+  type Locator,
+  type Page,
+} from "@playwright/test";
 import { server } from "./env.js";
+
+/**
+ * Pick a folder on a `webkitdirectory` input (a locator, or the file
+ * chooser the page opened), and resolve once the page has its files.
+ *
+ * Not `setInputFiles(dir)` alone: for a folder, Playwright 1.63 waits for
+ * the input's `input` event with a listener it adds through an evaluate
+ * sent alongside the files, not before them. When the browser lists a
+ * small folder faster than that evaluate arrives (seen in WebKit under
+ * load), the event fires first and setInputFiles never resolves, although
+ * the page got the files (round 2D). So the listener here is in place
+ * before the files are set, and the call that may hang is not waited for.
+ */
+export async function setFolder(target: Locator | FileChooser, dir: string): Promise<void> {
+  const input = (
+    "element" in target && typeof target.element === "function" ? target.element() : target
+  ) as Pick<ElementHandle<HTMLInputElement>, "evaluate" | "setInputFiles">;
+  await input.evaluate((el) => {
+    (el as unknown as { __picked: Promise<void> }).__picked = new Promise((resolve) =>
+      el.addEventListener("input", () => resolve(), { once: true }),
+    );
+  });
+  const setting = input.setInputFiles(dir);
+  // May never settle (see above); it is dropped when the page closes.
+  setting.catch(() => {});
+  await Promise.race([
+    setting,
+    input.evaluate((el) => (el as unknown as { __picked: Promise<void> }).__picked),
+  ]);
+}
 
 /** Log in through the real form on /upload, as a person would. */
 export async function logIn(page: Page): Promise<void> {
