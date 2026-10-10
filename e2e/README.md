@@ -228,7 +228,7 @@ All exported from `lib/index.ts`.
 
 ### CLI — `cli.ts`
 
-- `cli(args, { stdin?, env?, configHome?, auth?, timeoutMs?, cwd? })` →
+- `cli(args, { stdin?, env?, configHome?, auth?, timeoutMs?, cwd?, stubs? })` →
   `{ code, signal, stdout, stderr, configHome, configPath, durationMs }`.
   Runs `node packages/cli/dist/index.js …args`. `HOME` and `XDG_CONFIG_HOME`
   point to a fresh temp directory (or `configHome`, to keep state between calls),
@@ -247,6 +247,21 @@ All exported from `lib/index.ts`.
   child (also from `cli()`) runs in its own process group and is SIGKILLed when its test
   ends (the automatic `reapClis` fixture) or the worker exits, so none outlives a timed-out
   or failed test.
+- `stubs: true` (or `--import CLI_PRELOAD` before the CLI path with `spawnCli`) loads
+  `lib/cli-preload.mjs` into the CLI, whose stubs `YEET_STUB_*` variables in `env` turn on:
+  `YEET_STUB_FREE_BYTES=<n>` makes `fs.statfs` report n free bytes, and
+  `YEET_STUB_SLOW_READ_MS=<ms>` delays each read of a file named `slow*` (so zipping can be
+  interrupted). The CLI's own test hooks: `YEET_TEST_MAX_UNSIZED_PARTS` lowers its 150-part
+  cap for zips of unknown size, `YEET_TEST_ZIP_SIZE_BOUND` replaces its worst-case zip size.
+
+### Stand-in server — `stand-in.ts`
+
+- `standIn(partSize, onRequest?)`: a local stand-in for the upload API that records every
+  request (`requests`, `puts()`, `create()`, `creates()`, `completes()`, `deletes()`,
+  `zip()` for the parts in order) and answers like the Worker with any part size, so a few
+  KB take hundreds of parts. `onRequest` may act on a request and return a status to send
+  instead, or `"hold"` to never answer. Uploads are named `up1`, `up2`, … Pass `env` to
+  `cli()`. Used by `tests/node/cli-zip*.spec.ts`.
 
 ### Zip — `zip/`
 

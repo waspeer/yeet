@@ -102,10 +102,14 @@ Commands:
   login [url]        Connect to your yeet server (asks for the upload token)
   upload <path...> [--expires <duration>] [--password <string>] [--store]
                      Upload a file as it is, or several files or a folder as
-                     one zip (zipped while it uploads), and print its share link
+                     one zip, and print its share link (one link in all). The
+                     zip is made while it uploads; a compressed one that may
+                     come out over 7.8 GB is written to a temporary file in
+                     $TMPDIR first (it needs that much free space)
                      --expires   link lifetime, e.g. 7d, 24h, 90m (default 30d, at most 365d)
                      --password  require this password to download
-                     --store     zip without compressing (faster for audio, video, photos)
+                     --store     zip without compressing (faster for audio, video, photos;
+                                 never needs a temporary file)
   list [--downloads] Show all uploaded files (optionally with download history)
   delete <id|url...> Delete uploads before they expire
 

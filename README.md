@@ -78,18 +78,19 @@ Large files are uploaded in 50 MB parts, three at a time, and failed parts are
 retried. Files can be up to about 500 GB.
 
 A single file is uploaded as it is. Several files, or a folder, become one zip
-that is made while it uploads: nothing is written to disk first. A folder
-keeps its name as the zip's single top-level folder (`stems.zip` unzips to
-`stems/`), `.DS_Store` files are left out, and names are adjusted so Windows
+that is usually made while it uploads, with nothing written to disk first. A
+folder keeps its name as the zip's single top-level folder (`stems.zip` unzips
+to `stems/`), `.DS_Store` files are left out, and names are adjusted so Windows
 can unzip them (e.g. `:` becomes `_`); two files whose names would then clash
 are an error rather than one silently replacing the other. Audio, video,
 photos and archives that are already compressed are stored as they are, the
-rest is compressed. A zip whose size cannot be known in advance (anything
-compressed) can be up to about 7.8 GB; with `--store`, or when everything is
-already compressed, the limit is the same as for a single file. If anything
-goes wrong part-way (a file that cannot be read or changes while it is read, a
-network failure, Ctrl-C), the upload is deleted: a link never points to half a
-zip.
+rest is compressed. A compressed zip that could come out larger than about
+7.8 GB (the most the server accepts without being told the size up front) is
+first written to a temporary file, which needs that much free disk space and
+is always deleted afterwards; `--store` streams any size without one. Zips have
+the same size limit as a single file. If anything goes wrong part-way (a file
+that cannot be read or changes while it is read, a network failure, Ctrl-C),
+the upload is deleted: a link never points to half a zip.
 
 ## Configuration
 
@@ -165,9 +166,10 @@ ones on the free plan, and measured again (see "Measurements (phase 1K)"
 there); the smaller bounds of round 1L are estimated from those
 measurements, not measured yet.
 
-The CLI and the upload page always tell the server a file's size up
-front. A client of the API that does not can complete an upload of at most
-150 parts (about 7.9 GB).
+A client of the API that does not tell the server a file's size up front
+can complete an upload of at most 150 parts (about 7.9 GB). The upload page
+and the CLI always send the size, except for a CLI zip that is certain to
+stay below that (a compressed zip's size is only known once it is written).
 
 ## Security notes
 

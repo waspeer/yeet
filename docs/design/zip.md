@@ -15,7 +15,7 @@ copied verbatim into `packages/cli` (Node) and `packages/worker` (Worker + brows
 | Copy check                        | `scripts/check-zip-copies.mjs` (`npm run check:zip-copies`; first step of `npm run verify`)        |
 | CLI: what to zip / the upload     | `packages/cli/src/selection.ts`, `packages/cli/src/upload-zip.ts` (see [Callers](#callers))        |
 | Must-test suite                   | `e2e/tests/node/zip-{format,big,runtime,tooling}.spec.ts`, `e2e/tests/browser/zip-runtime.spec.ts` |
-| CLI zip upload tests              | `e2e/tests/node/cli-zip.spec.ts`                                                                   |
+| CLI zip upload tests              | `e2e/tests/node/cli-zip.spec.ts`, `cli-zip-tempfile.spec.ts`, `cli-zip-verifier.spec.ts`           |
 | Oracle and helpers                | `e2e/zip/check.py` (verbatim), `parse.ts`, `validate.ts`, `module.ts`, `fixtures.ts`               |
 | Opt-in tools                      | `e2e/zip/mutate.mjs`, `readers.ts`, `archive-utility.ts`, `bench/`                                 |
 
@@ -554,21 +554,57 @@ above typical uplinks, so the defaults are fine there.
 - `packages/cli/src/selection.ts` (`planUpload()`) walks the selection with `stat`/`readdir`
   only: `<folder>.zip` with the folder as the single top-level entry, or
   `yeet-<YYYYMMDD-HHMMSS>.zip` (local time) for several paths, files at the top level. It
-  skips `.DS_Store`, symbolic links to folders (no cycles) and anything that is neither file
-  nor folder (with a note), keeps empty folders as directory entries, applies NFC and
-  `sanitizeForWindows()` (with a note listing renames), warns about paths of 260+ characters,
-  and refuses names that collide after that (ignoring case; a file and a folder of the same
-  name included) with both sources named, and a selection without any file.
+  skips `.DS_Store`, symbolic links to folders (no cycles), links to nothing, link loops and
+  anything that is neither file nor folder (with a note), keeps empty folders as directory
+  entries, applies NFC and `sanitizeForWindows()` (with a note listing renames), warns about
+  paths of 260+ characters, and refuses names that collide after that (ignoring case; a file and a folder of the same
+  name included) with both sources named, and a selection without any file. A file that is
+  removed while the folder is read is an error naming it (round 2B.1), and so is a
+  top-level argument that is a link loop.
 - `packages/cli/src/upload-zip.ts` (`uploadZip()`) zips with `zlib.createDeflateRaw({ level: 1 })`
   via `Duplex.toWeb` and `zlib.crc32` when present (`compress: false` with `--store`), opens
-  each file only when the zip reaches it, cuts the output into parts of exactly `part_size`
-  (the last shorter), three in flight, the zip paused while they are (at most four 50 MiB
-  buffers). Size: at create when `storedZipSize()` knows it, else at `complete`. Of unknown
-  size the server completes at most 150 parts ([api.md](api.md)): the CLI stops before part
-  151, or before the first when the stored files alone exceed that. On any error (a source
-  error, a size that changed while read, a part failed after its retries, Ctrl-C) no new part
-  starts, the parts in flight finish (aborted after 30 s), the upload is deleted and
-  `complete` is never sent; exit 1, or 130 for Ctrl-C (a second Ctrl-C quits at once).
+  each file only when the zip reaches it, and cuts the output into parts of exactly
+  `part_size` (the last shorter), three in flight, the zip paused while they are. How the
+  size reaches the server (round 2B.1; until then a compressed zip stopped before part 151):
+  - **Every file stored** (`--store`, or only already-compressed files): `storedZipSize()`
+    knows the exact size, which is sent at create; streamed.
+  - **Compressed, and its worst case fits:** of unknown size the server completes at most
+    150 parts ([api.md](api.md)). `zipSizeBound()` is the most the zip can take: the input,
+    plus 1/1024 of each deflated file and 64 bytes, plus 256 bytes and twice the name per
+    entry (the headers and extras need at most 166 and the name twice), plus 256 for the end
+    records. zlib's own worst case for raw deflate at window 15 / memLevel 8 is about
+    +0.031 % (`deflateBound()`), and level 1 reaches it on random data (measured, Node 24.16
+    with zlib 1.3.1, 1 MiB writes: 64 MiB → +20,485 bytes, +0.0305 %, 4 bytes under the
+    bound); 1/1024 is +0.098 %, over three times that. If the bound is at most 149 parts
+    (a part to spare: 7.81 GB at 50 MiB), the zip is streamed and its size sent at
+    `complete`. The guard stays: a zip of unknown size that reaches part 151 anyway stops
+    with an error that calls it a bug and suggests `--store`, and is deleted.
+  - **Compressed, and it might not fit:** the CLI has created the upload (to learn
+    `part_size`) and deletes it unused. It checks the free space in `os.tmpdir()`
+    (`fs.statfs`, looked up when called; skipped where missing): the bound plus 256 MiB, or
+    it stops with a message that suggests `--store` (streamed, no temporary file), freeing
+    space or another `TMPDIR`. Then it writes the zip once to `upload.zip` (mode 600) in a
+    fresh `mkdtemp` folder (mode 700), with a "Zipping <name>" progress line, creates a new
+    upload with that file's exact size, and uploads the file the same way. A disk that fills
+    up anyway (`ENOSPC`) gives the same advice. The folder is removed in a `finally` (success,
+    any error, the first signal) and by a synchronous `process.on("exit")` handler (the quick
+    exit below). Not on SIGKILL or a crash of the machine: then it stays in the temporary
+    folder until the OS clears it.
+
+  On any error (a source error, a size that changed while read, a part failed after its
+  retries, Ctrl-C, SIGTERM, SIGHUP) no new part starts, the parts in flight finish (aborted
+  after 30 s), the upload is deleted and `complete` is never sent; exit 1, or 130 for Ctrl-C,
+  143 for SIGTERM, 129 for SIGHUP. A signal once the upload has failed (a second Ctrl-C, or
+  a Ctrl-C after any other failure, while the CLI waits for its parts in flight or deletes
+  the upload) quits at once; the server's cleanup removes the upload. (Before round 2B.1 a
+  Ctrl-C after a failure other than Ctrl-C was ignored for up to 30 s.)
+
+- **Memory** (measured, not derived): peak RSS of the CLI is about 0.3–0.5 GB, flat in the
+  input size, more than the four 50 MiB part buffers alone (the request bodies, zlib and
+  V8's heap add to them). The round 2B verifier measured 317–516 MB, from 256 MiB to 4 GiB
+  of input (streamed). Round 2B.1, `/usr/bin/time -l`, random data, 50 MiB parts, a local
+  server that discards the bodies, one run each: 256 MiB streamed 271 MB, through the
+  temporary file 443 MB; 1 GiB streamed 477 MB, through the temporary file 489 MB.
 - Progress: the CLI's usual line (stderr, TTY only), with the input bytes whose output has
   been uploaded as the count and "file k of n" after it.
 
@@ -685,11 +721,12 @@ Also: "compression choice" (M28 inverted heuristic, M29 `--store` ignored) and "
   machine). The validator now checks for it and prints a `chmod +x` hint.
 - **Empty archives** are rejected or warned about by `unzip` and `ditto`; callers must
   refuse an empty selection. The CLI does.
-- **A compressed CLI zip is at most 150 parts (7.86 GB of zip).** Its size is only known at
-  its end, and the server completes an upload of unknown size from at most 150 parts
-  ([api.md](api.md)). The CLI stops before part 151 and says to use `--store` (size known up
-  front, no limit) or smaller groups; it stops before the first part when the stored files
-  alone are larger. A very large compressible folder therefore fails after uploading 7.86 GB.
+- **A compressed CLI zip that might exceed 150 parts goes through a temporary file**
+  (round 2B.1; until then it stopped before part 151, i.e. failed after uploading 7.86 GB).
+  Its size is only known at its end, and the server completes an upload of unknown size
+  from at most 150 parts ([api.md](api.md)). So it needs free disk space for the whole zip
+  (checked first), and the upload only starts once it is zipped. The temporary file is left
+  behind only by SIGKILL or a crash. `--store` streams any size.
 - **`ditto` reads DOS times with the UTC offset in effect when it runs** (measured
   2026-10-10, in CEST, TZ=Europe/Amsterdam): entries from winter time came out 1 h early,
   whatever the zip says. So no zip extracts with correct mtimes in `ditto` on both sides of a

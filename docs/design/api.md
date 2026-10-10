@@ -419,19 +419,25 @@ Numbers that are signed or used as keys must be spelled one way only:
     upload page, and the CLI for a single file, always send the size, 0
     included, so they never take this path (asserted:
     `e2e/tests/node/unsized-complete.spec.ts` for the CLI,
-    `tests/browser/upload.spec.ts` for the page). **The CLI's zip uploads
-    do** (round 2B, `yeet upload <file1> <file2> …` or `<folder>`): a
-    compressed zip's size is only known once it is written, so it is sent
-    at `complete` and the upload is limited to these 150 parts (7.86 GB of
-    zip). The CLI knows the limit (`MAX_UNSIZED_PARTS` in
-    `packages/cli/src/limits.ts`, kept equal to the server's by
-    `cli-zip.spec.ts`) and stops before part 151, or before the first part
-    when the stored files alone are larger; it then deletes the upload. A
-    zip whose size is known up front (every file stored: `--store`, or only
-    already-compressed files; `storedZipSize()` in `zip.ts`) is sent with
-    its size at create and has no such limit. The zip upload never
-    completes after an error: it deletes the upload, after its parts in
-    flight have finished (`cli-zip.spec.ts`). The refusal of 301 records cost p50 9, p90 11 ms (phase
+    `tests/browser/upload.spec.ts` for the page). **The CLI's compressed
+    zip uploads may** (`yeet upload <file1> <file2> …` or `<folder>`): a
+    compressed zip's size is only known once it is written. The CLI knows
+    the limit (`MAX_UNSIZED_PARTS` in `packages/cli/src/limits.ts`, kept
+    equal to the server's by `cli-zip.spec.ts`) and, since round 2B.1,
+    never runs into it: it streams a compressed zip with its size sent at
+    `complete` only when the zip's worst case (`zipSizeBound()` in
+    `upload-zip.ts`) is at most 149 parts (7.81 GB), a part to spare.
+    Otherwise it deletes that upload unused, writes the zip to a
+    temporary file first, and uploads that with its exact size at create,
+    so it has no such limit (docs/design/zip.md, "Callers"). Round 2B
+    instead stopped before part 151 and suggested `--store`; that is now
+    only a guard against a wrong bound (it deletes the upload and never
+    completes it; `cli-zip.spec.ts`). A zip whose size is known up front
+    (every file stored: `--store`, or only already-compressed files;
+    `storedZipSize()` in `zip.ts`) is streamed and sent with its size at
+    create. The zip upload never completes after an error: it deletes the
+    upload, after its parts in flight have finished (`cli-zip.spec.ts`,
+    `cli-zip-tempfile.spec.ts`). The refusal of 301 records cost p50 9, p90 11 ms (phase
     1K, n = 8): it lists 301 records with metadata. _Estimate, not
     measured:_ these imply about 20 µs per record listed (the refusal) to
     33 µs per record listed and deleted (the complete, over a sized
@@ -1140,7 +1146,8 @@ phase 2 adds, not as a separate run.
 
 Found by the independent verifiers of rounds 1H–1L and left as they are:
 none affects the CLI or the upload page in normal use, and fixing them
-would cost more than they do.
+would cost more than they do. The exception is the CLI's temporary zip
+(round 2B.1, below), a cost chosen in place of a size cap.
 
 - **A `complete` racing a `DELETE` (fixed in round 2C, no longer a
   limitation).** Until then `complete` wrote the finished sidecar
@@ -1172,7 +1179,17 @@ would cost more than they do.
   invisible to users. The CLI's zip upload, which makes uploads of unknown
   size, waits for its parts in flight to be answered before it sends the
   `DELETE` of a failed upload (round 2B), so it only meets this when a part
-  takes more than 30 s after the failure (then it aborts the request).
+  takes more than 30 s after the failure (then it aborts the request), or
+  when the user quits at once with a second Ctrl-C (or a Ctrl-C after
+  another failure; round 2B.1).
+- **A CLI zip larger than about 7.8 GB is written to disk first.** Since
+  round 2B.1 a compressed zip whose worst case does not fit in
+  `MAX_UNSIZED_PARTS` goes through a temporary file (see above), so it
+  needs that much free disk space (checked; the CLI suggests `--store`
+  when it is short), and the upload starts only once it is zipped. A
+  SIGKILL or a crash leaves the file in the OS's temporary folder. The
+  first, unused upload it creates and deletes to learn `part_size` costs
+  one create and one `DELETE`.
 - **A hand-edited `expires_at` that is not a date never expires.**
   `parseUploadMeta()` only checks that it is a string, and `isExpired()`
   is false for an invalid date (`NaN <= now`), so the cron keeps it and
