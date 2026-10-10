@@ -15,7 +15,6 @@
 import { rename } from "node:fs/promises";
 import type { Page, Request, Route } from "@playwright/test";
 import {
-  deleteUpload,
   downloadSha256,
   eventually,
   expect,
@@ -27,7 +26,6 @@ import {
   readUploadMeta,
   serverLog,
   shareLink,
-  sleep,
   test,
   uploadObjects,
 } from "../../lib/index.js";
@@ -182,18 +180,15 @@ test.describe("upload page: the browser loses access to the file", () => {
     await expectGone(oldId);
   });
 
-  test("leaving the page then deletes nothing (the cleanup removes it after 24 hours)", async ({
-    page,
-    tmp,
-  }) => {
+  test("leaving the page for good deletes the kept upload", async ({ page, tmp }) => {
+    // Only this page could continue it; Playwright's engines keep no page
+    // in the back-forward cache, so pagehide is not `persisted` here.
     const lost = await randomFile(tmp, 10 * KiB, "left behind.bin");
     await logIn(page);
     const id = await loseFileAt(page, lost.path, 1);
-    await page.goto("/");
-    await sleep(1000);
-    expect((await serverRequests(id)).filter((line) => line.includes("DELETE"))).toEqual([]);
     expect((await readUploadMeta(id))?.pending_upload_id).toBeTruthy();
-    expect((await deleteUpload(id)).status).toBe(200);
+    await page.goto("/");
+    await expectGone(id);
   });
 
   test("Cancel upload gives up and deletes it", async ({ page, tmp }) => {

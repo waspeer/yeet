@@ -1322,8 +1322,12 @@ a normalized header. Following RFC 9110 §14:
   they were when it was first chosen) continues the open multipart
   upload from its first unacknowledged part, with its own expiry and
   password; any other file starts a new upload and the old one is
-  deleted. Leaving the page then deletes nothing; the cron removes it
-  after 24 hours. Only in memory: a reload forgets it.
+  deleted. Only this page can continue it (it is kept in memory), so
+  leaving the page for good deletes it (`pagehide` without `persisted`,
+  a `keepalive` `DELETE`); a page kept in the back-forward cache keeps
+  it. WebKit aborts the upload and the file's reads as a page is left, so
+  a page left mid-upload can reach this state just before `pagehide`;
+  either way the upload is deleted.
 - **Tests:** `e2e/tests/browser/upload.spec.ts`,
   `upload-resume.spec.ts`, `upload-mobile.spec.ts`; screenshots of each
   state in `screenshots.spec.ts` (to `e2e/screenshots/2c/`, git-ignored).

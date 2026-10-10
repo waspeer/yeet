@@ -429,7 +429,21 @@ el("another").addEventListener("click", () => {
 window.addEventListener("beforeunload", (event) => {
   if (state === "uploading") event.preventDefault();
 });
-window.addEventListener("pagehide", () => {
+window.addEventListener("pagehide", (event) => {
+  // An upload kept to continue after a lost file: only this page can
+  // continue it, and only if it comes back from the back-forward cache
+  // (`persisted`). Leaving for good, it is deleted. (WebKit aborts the
+  // upload and the file's reads as the page goes, so a page left mid-upload
+  // may already be in this state.)
+  if (resumable && !event.persisted) {
+    const id = resumable.id;
+    resumable = null;
+    void fetch(`/api/uploads/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      keepalive: true,
+    }).catch(() => {});
+    return;
+  }
   if (state !== "uploading" || !worker || completing) return;
   const id = uploadId;
   worker.terminate();
