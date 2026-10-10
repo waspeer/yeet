@@ -20,3 +20,6 @@ packages/worker/.dev.vars
 # End-to-end harness output
 e2e/results/
 e2e/.verify.lock
+
+# Screenshots for review (tests/browser/screenshots.spec.ts)
+e2e/screenshots/

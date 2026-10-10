@@ -444,6 +444,16 @@ export class Uploads {
   }
 
   /**
+   * readMeta() with the etag of the sidecar read (1 R2 call), for a write
+   * that must only replace that very version (`complete`, finishUpload()).
+   */
+  async readMetaVersion(id: string): Promise<{ meta: UploadMeta; etag: string } | null> {
+    const object = await this.bucket.get(this.dir(id) + ".meta.json");
+    if (!object) return null;
+    return { meta: await object.json<UploadMeta>(), etag: object.etag };
+  }
+
+  /**
    * Read the metadata sidecar (1 R2 call) for code that must not stop on a
    * bad one: `meta` is null if it is missing, not valid JSON, or not shaped
    * like a sidecar (parseUploadMeta()); `etag` is set whenever it exists.
@@ -955,6 +965,43 @@ export class Uploads {
         await this.bucket.delete(batch.slice(i, i + 1000));
       }
     }
+  }
+
+  /**
+   * Turn a pending upload into a finished one once R2 has completed its
+   * multipart upload (`complete`): its sidecar `meta`, as read at version
+   * `etag`, is written back without `pending_upload_id` and with the
+   * stored `fileSize`.
+   *
+   * The write is conditional (`onlyIf: { etagMatches: etag }`), so a
+   * `DELETE` that ran since the read is never undone: if it deleted the
+   * sidecar (at most DELETE_LIMIT objects) or marked it as a deletion
+   * under way (more), the write fails and the upload stays deleted
+   * ("deleted"). The file R2 has just made is then deleted as well (the
+   * `DELETE` may have listed the upload before it existed, and a file
+   * without a sidecar would never be cleaned up). If instead the sidecar
+   * is now a finished one (another `complete` of the same upload won),
+   * that is "finished" too.
+   *
+   * R2 calls: 1 (the conditional put) when nothing interfered; on a
+   * failed write 2 more (a read, and the file's delete when deleted).
+   */
+  async finishUpload(
+    id: string,
+    meta: UploadMeta,
+    etag: string,
+    fileSize: number,
+  ): Promise<"finished" | "deleted"> {
+    const { pending_upload_id: _, ...finished } = meta;
+    if (await this.writeMeta(id, { ...finished, file_size: fileSize }, { etagMatches: etag })) {
+      return "finished";
+    }
+    const now = await this.readSidecar(id);
+    if (now.meta && !now.meta.pending_upload_id && now.meta.filename === meta.filename) {
+      return "finished";
+    }
+    await this.bucket.delete(this.fileKey(id, meta.filename));
+    return "deleted";
   }
 
   /** Abort an unfinished multipart upload. Ignores ones already gone. */

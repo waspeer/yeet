@@ -284,25 +284,24 @@ test.describe("1L verifier: the deletion-under-way sidecar", () => {
     expect(Date.parse(marker.expires_at as string)).toBeLessThanOrEqual(Date.now());
   });
 
-  test("race: a complete that lands after the marker brings the upload back (documented)", async () => {
+  test("race: a complete that lands after the marker does not bring the upload back", async () => {
     // Size unknown, 150 part records: complete reads the sidecar (pending),
     // R2 completes, the DELETE then lists 100 keys and writes the marker, and
-    // complete's own (unconditional) sidecar write lands last.
+    // complete's sidecar write lands last. Until round 2C that write was
+    // unconditional and the upload was listed again; it is now conditional
+    // on the sidecar complete read (Uploads.finishUpload(),
+    // tests/node/complete-race.spec.ts).
     const b = new StrictBucket({ maxCalls: Infinity });
-    const meta = seedUpload(b, "cx", { pendingSince: NOW - 1000, parts: 150 });
-    b.seed(`${P}/cx/f.bin`, "x"); // the object complete() made
+    seedUpload(b, "cx", { pendingSince: NOW - 1000, parts: 150 });
     const uploads = new Uploads(b, P);
-    const del = await uploads.delete("cx", meta);
+    const read = (await uploads.readMetaVersion("cx"))!;
+    b.seed(`${P}/cx/f.bin`, "x"); // the object complete() made
+    const del = await uploads.delete("cx", read.meta);
     expect(del.done).toBe(false);
-    const { pending_upload_id: _, ...finished } = meta;
-    await uploads.writeMeta("cx", { ...finished, file_size: 1 });
+    expect(await uploads.finishUpload("cx", read.meta, read.etag, 1)).toBe("deleted");
     const listed = (await uploads.listPage()).uploads.map((u) => u.id);
-    console.log(
-      `complete after the marker: listed=${JSON.stringify(listed)}, keys left ${b.sorted(`${P}/cx/`).length}`,
-    );
-    // Listed and downloadable again (the file sorts after `.parts/`): the
-    // DELETE answered 202; a client that asks again (yeet delete) removes it.
-    expect(listed).toEqual(["cx"]);
+    expect(listed).toEqual([]);
+    expect(sidecarOf(b, "cx")?.body.pending_upload_id).toBe(DELETED_UPLOAD_ID);
     for (let i = 0; i < 5 && b.sorted(`${P}/cx/`).length > 0; i++) await deleteRequest(b, "cx");
     expect(b.sorted(`${P}/cx/`)).toEqual([]);
   });

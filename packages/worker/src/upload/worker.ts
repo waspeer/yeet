@@ -9,7 +9,7 @@
 // Every request is same-origin and authenticated by the yeet_session cookie,
 // which the browser attaches itself; this code never sees a token.
 
-import type { FailureKind, FromWorker, ToWorker } from "./protocol.js";
+import type { FailureKind, FromWorker, Part, Resume, ToWorker } from "./protocol.js";
 
 declare const self: DedicatedWorkerGlobalScope;
 
@@ -33,7 +33,7 @@ class UploadError extends Error {
     super(message);
   }
 
-  /** Network errors, 5xx, 408 and 429 may go away; everything else will not. */
+  /** Network errors, 5xx, 408 and 429 may go away; everything else (a lost file too) will not. */
   get retryable(): boolean {
     return this.kind === "network" || this.kind === "server";
   }
@@ -81,6 +81,12 @@ class Upload {
   /** Set once the upload failed or was cancelled: nothing new may start. */
   private stopped = false;
   private finished = false;
+  /**
+   * Set once `complete` is sent: from then on the upload may be finished on
+   * the server whatever this worker hears back, so it is never deleted
+   * (a cancel is ignored, a failure leaves it to the hourly cleanup).
+   */
+  private completing = false;
   private parallel = PARALLEL;
   private readonly controller = new AbortController();
   private readonly requests = new Set<XMLHttpRequest>();
@@ -93,49 +99,84 @@ class Upload {
   constructor(
     private readonly file: File,
     private readonly expiresIn: number,
+    private readonly password: string | undefined,
   ) {}
 
-  async run(): Promise<void> {
+  async run(resume?: Resume): Promise<void> {
     const size = this.file.size;
     try {
-      const created = await this.withRetries(0, () =>
-        this.json("POST", "/api/uploads", {
-          filename: this.file.name,
-          size,
-          expires_in: this.expiresIn,
-        }),
-      );
-      const id = created?.["id"];
-      const partSize = created?.["part_size"];
-      if (typeof id !== "string" || !Number.isSafeInteger(partSize) || (partSize as number) <= 0) {
-        throw new UploadError("server", "Unexpected response when starting the upload");
+      let id: string;
+      let partSize: number;
+      const parts: Part[] = [];
+      if (resume) {
+        // The same file again, after its access was lost: continue the
+        // upload that is still open on the server.
+        ({ id, partSize } = resume);
+        parts.push(...resume.parts);
+      } else {
+        const created = await this.withRetries(0, () =>
+          this.json("POST", "/api/uploads", {
+            filename: this.file.name,
+            size,
+            expires_in: this.expiresIn,
+            ...(this.password ? { password: this.password } : {}),
+          }),
+        );
+        const newId = created?.["id"];
+        const newPartSize = created?.["part_size"];
+        if (
+          typeof newId !== "string" ||
+          typeof newPartSize !== "number" ||
+          !Number.isSafeInteger(newPartSize) ||
+          newPartSize <= 0
+        ) {
+          throw new UploadError("server", "Unexpected response when starting the upload");
+        }
+        id = newId;
+        partSize = newPartSize;
       }
       this.id = id;
       this.check();
-      post({ type: "started", id });
+      post({ type: "started", id, partSize });
+
+      const count = Math.max(1, Math.ceil(size / partSize));
+      const bounds = (n: number) => {
+        const start = (n - 1) * partSize;
+        return { start, end: Math.min(start + partSize, size) };
+      };
+      const acknowledged = new Set(parts.map((part) => part.part_number));
+      for (const n of acknowledged) {
+        const { start, end } = bounds(n);
+        this.doneBytes += end - start;
+      }
       this.progress(true);
 
-      const count = Math.max(1, Math.ceil(size / (partSize as number)));
-      const parts: { part_number: number; etag: string }[] = [];
-      let next = 1;
+      // The parts still to send, lowest first: the first unacknowledged one
+      // goes out first when resuming.
+      const todo: number[] = [];
+      for (let n = 1; n <= count; n++) if (!acknowledged.has(n)) todo.push(n);
+      let next = 0;
       const slot = async (index: number): Promise<void> => {
-        while (!this.stopped && index < this.parallel && next <= count) {
-          const n = next++;
-          const start = (n - 1) * (partSize as number);
-          const end = Math.min(start + (partSize as number), size);
-          const etag = await this.withRetries(n, () => this.sendPart(n, start, end));
-          parts.push({ part_number: n, etag });
+        while (!this.stopped && index < this.parallel && next < todo.length) {
+          const n = todo[next++]!;
+          const { start, end } = bounds(n);
+          const etag = await this.withRetries(n, () => this.sendReadablePart(n, start, end));
+          const part = { part_number: n, etag };
+          parts.push(part);
+          post({ type: "part", part });
           this.inFlight.delete(n);
           this.doneBytes += end - start;
           this.progress(true);
         }
       };
-      await Promise.all(Array.from({ length: Math.min(this.parallel, count) }, (_, i) => slot(i)));
+      const slots = Math.max(1, Math.min(this.parallel, todo.length));
+      await Promise.all(Array.from({ length: slots }, (_, i) => slot(i)));
       // Never complete after a failed or cancelled part.
       this.check();
       if (parts.length !== count) throw new UploadError("server", "Not every part was sent");
       parts.sort((a, b) => a.part_number - b.part_number);
 
+      this.completing = true;
       post({ type: "finishing" });
       const completed = await this.withRetries(0, () =>
         this.json("POST", `/api/uploads/${id}/complete`, { parts, size }),
@@ -151,7 +192,10 @@ class Upload {
       this.abortAll();
       const error =
         err instanceof UploadError ? err : new UploadError("server", (err as Error)?.message ?? "");
-      await this.deleteOnServer();
+      // Kept on the server: after `complete` it may be finished; after a
+      // lost file it can go on once the file is chosen again. Otherwise the
+      // hourly cleanup removes what is left after 24 hours.
+      if (!this.completing && error.kind !== "file") await this.deleteOnServer();
       post({
         type: "failed",
         kind: error.kind as FailureKind,
@@ -163,7 +207,8 @@ class Upload {
 
   /** Stop: abort what is in flight, delete the upload on the server, report. */
   async cancel(): Promise<void> {
-    if (this.stopped || this.finished) return;
+    // Too late once complete is sent: the upload goes on and reports "done".
+    if (this.stopped || this.finished || this.completing) return;
     this.stopped = true;
     this.abortAll();
     await this.deleteOnServer();
@@ -240,6 +285,34 @@ class Upload {
     });
   }
 
+  /**
+   * PUT one part, after checking that the file can still be read: iOS
+   * Safari revokes access to a picked file when the screen locks, after
+   * which a read fails (`NotFoundError`; Firefox: `AbortError`) and an
+   * upload of its slice fails like a network error. So the file is read
+   * (1 byte) before each attempt and again after a failed one, and a read
+   * that fails ends the upload as "file", not retried.
+   */
+  private async sendReadablePart(n: number, start: number, end: number): Promise<string> {
+    await this.checkReadable(start, end);
+    try {
+      return await this.sendPart(n, start, end);
+    } catch (err) {
+      if (!this.stopped) await this.checkReadable(start, end);
+      throw err;
+    }
+  }
+
+  private async checkReadable(start: number, end: number): Promise<void> {
+    if (end <= start) return; // an empty file: nothing to read
+    try {
+      await this.file.slice(start, start + 1).arrayBuffer();
+    } catch (err) {
+      const name = err instanceof Error ? err.name : "Error";
+      throw new UploadError("file", `${name}: ${(err as Error)?.message ?? ""}`.trim());
+    }
+  }
+
   /** PUT one part; resolves with its etag. */
   private sendPart(n: number, start: number, end: number): Promise<string> {
     const body = this.file.slice(start, end);
@@ -312,8 +385,8 @@ let current: Upload | null = null;
 self.onmessage = (event: MessageEvent<ToWorker>) => {
   const message = event.data;
   if (message.type === "start" && !current) {
-    current = new Upload(message.file, message.expiresIn);
-    void current.run();
+    current = new Upload(message.file, message.expiresIn, message.password);
+    void current.run(message.resume);
   } else if (message.type === "cancel") {
     if (current) void current.cancel();
     else post({ type: "cancelled" });
