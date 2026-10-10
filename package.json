@@ -5,7 +5,8 @@
     "fmt": "oxfmt",
     "fmt:check": "oxfmt --check",
     "lint": "oxlint",
-    "lint:fix": "oxlint --fix"
+    "lint:fix": "oxlint --fix",
+    "check:zip-copies": "node scripts/check-zip-copies.mjs"
   },
   "devDependencies": {
     "oxfmt": "^0.40.0",
