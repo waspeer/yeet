@@ -1456,7 +1456,15 @@ a normalized header. Following RFC 9110 §14:
 - **Lost files during a zip** (round 2C+2): a zip part is in memory, so
   the worker reads one byte of the file it read last after a failed part
   attempt, and a failed read of a file while zipping stops the zip; both
-  end the upload as `file`, kept on the server. Then:
+  end the upload as `file`, kept on the server. Only that file is probed,
+  not every file read so far (decided in round 2D): the probe only tells
+  a lost file from a network failure, and iOS revokes access to every
+  picked file at once, so the file read last answers for all of them; the
+  bytes of the files before it are already in the parts held in memory,
+  so losing one of them cannot stop this upload; and a folder of 10,000
+  files would cost up to 10,000 reads after every failed attempt. A file
+  lost on its own (renamed on a Mac) is found when it is read: zipping
+  it, or making a stored zip again when continuing. Then:
   - **a stored zip** (size known) is fully determined by its files, so
     choosing the same files again (the same paths, sizes and dates, as
     they were first chosen, and the same empty folders) continues it: the
