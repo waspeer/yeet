@@ -566,6 +566,47 @@ test.describe("yeet upload <folder>: the upload (stand-in server)", () => {
     }
   });
 
+  test("Ctrl-C after another failure quits at once (no wait for the parts in flight)", async ({
+    tmp,
+  }) => {
+    // Regression (round 2B verification): once a part had failed, Ctrl-C was
+    // ignored while the CLI waited up to 30 s for the parts still in flight,
+    // because only a second *Ctrl-C* quit at once. Part 1 fails (400, not
+    // retried), parts 2 and 3 are never answered.
+    const { root } = await album(tmp);
+    const s = await standIn(1000, async (r) => {
+      if (r.path.endsWith("/parts/1")) {
+        await sleep(300);
+        return 400;
+      }
+      if (r.method === "PUT") return "hold";
+    });
+    const home = await newConfigHome();
+    try {
+      const child = spawnCli([server.cliPath, "upload", root], {
+        env: { ...process.env, ...s.env, HOME: home, XDG_CONFIG_HOME: home, NO_COLOR: "1" },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stderr = "";
+      child.stderr!.setEncoding("utf-8").on("data", (c: string) => (stderr += c));
+      const closed = new Promise<number | null>((resolve) => child.on("close", resolve));
+      await eventually(
+        () => s.puts().find((p) => p.path.endsWith("/parts/1"))?.answeredAt !== undefined,
+        { message: "part 1 answered with 400" },
+      );
+      await sleep(200);
+      expect(s.puts().filter((p) => p.answeredAt === undefined).length).toBe(2);
+      const sentAt = performance.now();
+      child.kill("SIGINT");
+      const code = await Promise.race([closed, sleep(5000).then(() => "still running")]);
+      expect(code, `${stderr}\n(exit ${performance.now() - sentAt} ms after Ctrl-C)`).toBe(130);
+      expect(performance.now() - sentAt).toBeLessThan(2000);
+      expect(s.completes()).toEqual([]);
+    } finally {
+      await s.close();
+    }
+  });
+
   test("the server goes away mid-upload: exit 1 within the retry budget, at low CPU", async ({
     tmp,
   }) => {

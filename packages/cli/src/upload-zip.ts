@@ -170,9 +170,11 @@ export async function uploadZip(
       stop.abort(err);
     }
   };
-  // A second Ctrl-C quits at once (the server's cleanup removes the upload).
+  // A Ctrl-C after the upload has already failed (a second Ctrl-C, or one
+  // while a failed upload waits for its parts in flight) quits at once; the
+  // server's cleanup removes the upload.
   const onSigint = () => {
-    if (failure instanceof InterruptedError) process.exit(130);
+    if (failure !== undefined) process.exit(130);
     fail(new InterruptedError());
   };
   process.on("SIGINT", onSigint);
