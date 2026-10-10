@@ -415,10 +415,22 @@ Numbers that are signed or used as keys must be spelled one way only:
 
     150 parts are up to about 7.9 GB at the 50 MiB part size. With the size
     known at create there is no such limit (R2's own 10,000 parts). The
-    CLI and the upload page always send the size, 0 included, so they never
-    take this path (asserted: `e2e/tests/node/unsized-complete.spec.ts` for
-    the CLI, `tests/browser/upload.spec.ts` for the page); only a hand-made
-    client could. The refusal of 301 records cost p50 9, p90 11 ms (phase
+    upload page, and the CLI for a single file, always send the size, 0
+    included, so they never take this path (asserted:
+    `e2e/tests/node/unsized-complete.spec.ts` for the CLI,
+    `tests/browser/upload.spec.ts` for the page). **The CLI's zip uploads
+    do** (round 2B, `yeet upload <file1> <file2> …` or `<folder>`): a
+    compressed zip's size is only known once it is written, so it is sent
+    at `complete` and the upload is limited to these 150 parts (7.86 GB of
+    zip). The CLI knows the limit (`MAX_UNSIZED_PARTS` in
+    `packages/cli/src/limits.ts`, kept equal to the server's by
+    `cli-zip.spec.ts`) and stops before part 151, or before the first part
+    when the stored files alone are larger; it then deletes the upload. A
+    zip whose size is known up front (every file stored: `--store`, or only
+    already-compressed files; `storedZipSize()` in `zip.ts`) is sent with
+    its size at create and has no such limit. The zip upload never
+    completes after an error: it deletes the upload, after its parts in
+    flight have finished (`cli-zip.spec.ts`). The refusal of 301 records cost p50 9, p90 11 ms (phase
     1K, n = 8): it lists 301 records with metadata. _Estimate, not
     measured:_ these imply about 20 µs per record listed (the refusal) to
     33 µs per record listed and deleted (the complete, over a sized
@@ -1116,15 +1128,19 @@ would cost more than they do.
   write leaves a sidecar without its file: listed, its download a `404`.
   Either way it takes a concurrent `DELETE` in that short window, and the
   next `DELETE` removes it. The first case also needs an upload of
-  unknown size, which the CLI and the upload page never make: they always
-  send the size.
+  unknown size, which only the CLI's zip uploads make (round 2B), and they
+  never send `complete` and `DELETE` for the same upload: `complete` only
+  when every part succeeded, `DELETE` only instead of it.
 - **A late part record can be left behind.** A part `PUT` whose
   `uploadPart()` succeeded before a `DELETE` aborted the multipart upload
   writes its empty `.parts/<n>` record (`writePartSize()`, uploads of
   unknown size only) afterwards, possibly after the `DELETE` finished. It
   has no sidecar, and the cron does not treat it as stray (`stray` is only
   legacy `.downloads/` records), so it is never removed. An empty object,
-  invisible to users.
+  invisible to users. The CLI's zip upload, which makes uploads of unknown
+  size, waits for its parts in flight to be answered before it sends the
+  `DELETE` of a failed upload (round 2B), so it only meets this when a part
+  takes more than 30 s after the failure (then it aborts the request).
 - **A hand-edited `expires_at` that is not a date never expires.**
   `parseUploadMeta()` only checks that it is a string, and `isExpired()`
   is false for an invalid date (`NaN <= now`), so the cron keeps it and

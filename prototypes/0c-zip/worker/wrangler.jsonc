@@ -1,8 +1,0 @@
-// Throwaway Worker for the zip prototype. Local only: `npx wrangler dev`.
-// Deliberately no nodejs_compat: the zip module must run on plain workerd.
-{
-  "$schema": "../node_modules/wrangler/config-schema.json",
-  "name": "yeet-zip-prototype",
-  "main": "src/index.ts",
-  "compatibility_date": "2026-10-01",
-}

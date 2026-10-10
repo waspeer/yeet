@@ -243,6 +243,19 @@ All exported from `lib/index.ts`.
   with `auth: true` and fails unless it exits 0 with exactly one URL on stdout
   ("stdout was not exactly one URL: …").
 - `newConfigHome()` → a fresh empty config home.
+- `spawnCli(args, options)`: start the CLI yourself (e.g. to send it SIGINT). Every CLI
+  child (also from `cli()`) runs in its own process group and is SIGKILLed when its test
+  ends (the automatic `reapClis` fixture) or the worker exits, so none outlives a timed-out
+  or failed test.
+
+### Zip — `zip/`
+
+The streaming zip writer's tests (`tests/node/zip-*.spec.ts`, `tests/browser/zip-runtime.spec.ts`)
+use `zip/`: `check.py` (the structural oracle, kept verbatim), `parse.ts`, `validate.ts`
+(every local reader), `module.ts` (the module under test; `YEET_ZIP_MODULE` points it at
+another copy), `fixtures.ts`. Opt-in tools there: `mutate.mjs`, `readers.ts`,
+`archive-utility.ts`, `bench/`; see "Reproduce" in `docs/design/zip.md`. The zip specs also run
+outside `npm run verify` (`npx playwright test --project=node tests/node/zip-format.spec.ts`).
 
 ### HTTP — `api.ts`
 
