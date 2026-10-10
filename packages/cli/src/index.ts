@@ -260,16 +260,23 @@ function tooManyAttempts(seconds: number): string {
   return `Too many wrong upload tokens were tried from this address. Try again ${waitText(seconds)}.`;
 }
 
+/** The most of one unit waitText() says before it uses the next ("90 minutes", then "2 hours"). */
+const MAX_IN_UNIT = 90;
+
 /**
  * When to try again, for a message: "in 45 seconds", "in 15 minutes", "in 3
- * hours" (rounded up), or "later" for no wait known or one over a day (a
- * server may send any Retry-After, 100000000000000000000 included).
+ * hours", or "later" for no wait known or one over a day (a server may send
+ * any Retry-After, 100000000000000000000 included). The count is rounded up
+ * and given in the smallest unit that keeps it at most MAX_IN_UNIT: so at
+ * most two digits, 90 seconds or 2 minutes, 90 minutes or 2 hours.
  */
 function waitText(seconds: number): string {
   const unit = (n: number, name: string) => `in ${n} ${name}${n === 1 ? "" : "s"}`;
   if (!(seconds > 0) || seconds > 86_400) return "later";
-  if (seconds < 120) return unit(seconds, "second");
-  if (seconds < 120 * 60) return unit(Math.ceil(seconds / 60), "minute");
+  const whole = Math.ceil(seconds);
+  if (whole <= MAX_IN_UNIT) return unit(whole, "second");
+  const minutes = Math.ceil(seconds / 60);
+  if (minutes <= MAX_IN_UNIT) return unit(minutes, "minute");
   return unit(Math.ceil(seconds / 3600), "hour");
 }
 
@@ -511,7 +518,8 @@ async function fetchAllUploads(
   const byId = new Map<string, ListedUpload>();
   const fetchedSoFar = (reason: string) => ({
     uploads: [...byId.values()],
-    incomplete: `Could not fetch every page (${reason}); run \`yeet list\` again for the rest.`,
+    // (Without the reason's own final period: "(… in 2 minutes); run".)
+    incomplete: `Could not fetch every page (${reason.replace(/\.$/, "")}); run \`yeet list\` again for the rest.`,
   });
   let cursor: string | null = null;
   for (let pages = 0; ; pages++) {

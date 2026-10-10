@@ -508,7 +508,7 @@ test.describe("1J verifier: Retry-After on list pages", () => {
       expect(r.code).toBe(1);
       expect(r.requests).toBe(2);
       expect(r.stdout).toContain("2 files");
-      expect(note.join("\n")).toContain(`Service unavailable. ${when}`);
+      expect(note.join("\n")).toContain(`Service unavailable. ${when.replace(/\.$/, "")}); run`);
       expect(r.stdout).not.toContain("00000");
     });
   }

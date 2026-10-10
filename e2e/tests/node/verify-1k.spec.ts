@@ -225,9 +225,15 @@ test.describe("1K verifier: CLI Retry-After edges", () => {
   });
 
   for (const [value, when] of [
-    ["119", "Try again in 119 seconds."],
+    // Round 1L: the smallest unit that keeps the count at most 90 (two
+    // digits): before, 119 s read "119 seconds" and 7199 s "120 minutes".
+    ["90", "Try again in 90 seconds."],
+    ["91", "Try again in 2 minutes."],
+    ["119", "Try again in 2 minutes."],
     ["121", "Try again in 3 minutes."],
-    ["7199", "Try again in 120 minutes."],
+    ["5400", "Try again in 90 minutes."],
+    ["5401", "Try again in 2 hours."],
+    ["7199", "Try again in 2 hours."],
     ["86400", "Try again in 24 hours."],
     ["86401", "Try again later."],
     ["9".repeat(400), "Try again later."],
@@ -239,7 +245,9 @@ test.describe("1K verifier: CLI Retry-After edges", () => {
       console.log(`RA ${value.slice(0, 32)}: tries ${r.tries}, ${note.slice(60, 160)}`);
       expect(r.code).toBe(1);
       expect(r.tries).toBe(1);
-      expect(note).toContain(`Service unavailable. ${when}`);
+      // Round 1L: one period, not "(… minutes.); run".
+      expect(note).toContain(`(Service unavailable. ${when.replace(/\.$/, "")}); run`);
+      expect(note).not.toContain(".)");
     });
   }
 
