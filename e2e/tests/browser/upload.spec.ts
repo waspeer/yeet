@@ -22,6 +22,7 @@ import {
   resetStats,
   serverLog,
   shareLink,
+  sha256,
   sleep,
   test,
   uploadObjects,
@@ -108,8 +109,15 @@ test.describe("upload page", () => {
 
       const url = await shareLink(page);
       expect(url).toMatch(new RegExp(`/${await id}/small%20${via}\\.bin$`));
-      expect(await body).toMatchObject({ size: file.size });
+      expect(await body).toMatchObject({ size: file.size, expires_in: 30 * 86_400 });
+      expect(await body).not.toHaveProperty("password");
       await expect(page.locator("#done-name")).toHaveText(file.name);
+      await expect(page.locator("#done-expiry")).toHaveText(
+        /^Works for 30 days, until \w{3} \d+, \d{4}\.$/,
+      );
+      await expect(page.locator("#done-password")).toHaveText(
+        "No password: anyone with the link can download.",
+      );
       expect((await pageStats(page)).progress.at(-1)).toBe(100);
 
       const downloaded = await downloadSha256(url);
@@ -159,6 +167,72 @@ test.describe("upload page", () => {
       },
     );
   }
+
+  test("the expiry choices: 1 day to 1 year, 30 days by default", async ({ page }) => {
+    await logIn(page);
+    const select = page.getByLabel("Link works for");
+    await expect(select).toHaveValue(String(30 * 86_400));
+    const choices = await select
+      .locator("option")
+      .evaluateAll((options: HTMLOptionElement[]) => options.map((o) => [o.value, o.text]));
+    expect(choices).toEqual([
+      ["86400", "1 day"],
+      ["604800", "7 days"],
+      ["2592000", "30 days"],
+      ["7776000", "90 days"],
+      ["31536000", "1 year"], // the API's maximum, 365 days
+    ]);
+  });
+
+  test("the chosen expiry and password reach the upload, and the download page asks for it", async ({
+    page,
+    tmp,
+  }) => {
+    const file = await randomFile(tmp, 20 * KiB, "protected.bin");
+    await logIn(page);
+    await page.getByLabel("Link works for").selectOption({ label: "7 days" });
+    await page.getByLabel("Password (optional)").fill("velvet tractor");
+    const id = createdId(page);
+    const body = createBody(page);
+    await choose(page, "input", file.path);
+    const url = await shareLink(page);
+
+    expect(await body).toMatchObject({ expires_in: 7 * 86_400, password: "velvet tractor" });
+    await expect(page.locator("#done-expiry")).toHaveText(/^Works for 7 days, until /);
+    await expect(page.locator("#done-password")).toHaveText(
+      "Password protected: people need the password to download.",
+    );
+    const meta = (await readUploadMeta(await id))!;
+    const days = (Date.parse(meta.expires_at) - Date.parse(meta.uploaded_at)) / 86_400_000;
+    expect(days).toBeCloseTo(7, 3);
+    expect(meta.password_hash).toMatch(/^pbkdf2-sha256\$/);
+
+    // The download page enforces it.
+    await page.goto(url);
+    await page.getByPlaceholder("Enter password").fill("wrong guess");
+    await page.getByRole("button", { name: "Download" }).click();
+    await expect(page.getByText("Incorrect password. Please try again.")).toBeVisible();
+    await page.getByPlaceholder("Enter password").fill("velvet tractor");
+    const [download] = await Promise.all([
+      page.waitForEvent("download"),
+      page.getByRole("button", { name: "Download" }).click(),
+    ]);
+    expect(await sha256(await download.path())).toBe(file.sha256);
+  });
+
+  test("1 year is sent as 365 days", async ({ page, tmp }) => {
+    const file = await randomFile(tmp, 1 * KiB, "a year.bin");
+    await logIn(page);
+    await page.getByLabel("Link works for").selectOption({ label: "1 year" });
+    const id = createdId(page);
+    await choose(page, "input", file.path);
+    await shareLink(page);
+    await expect(page.locator("#done-expiry")).toHaveText(/^Works for 1 year, until /);
+    const meta = (await readUploadMeta(await id))!;
+    const days = (Date.parse(meta.expires_at) - Date.parse(meta.uploaded_at)) / 86_400_000;
+    expect(days).toBeCloseTo(365, 3);
+    expect(meta.password_hash).toBeUndefined();
+  });
 
   test("an empty file uploads and downloads as 0 bytes", async ({ page, tmp }) => {
     const file = await fileWith(tmp, "empty.txt", "");

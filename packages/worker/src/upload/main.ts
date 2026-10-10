@@ -17,14 +17,17 @@ function el<T extends HTMLElement = HTMLElement>(id: string): T {
   return element as T;
 }
 
-const app = el("upload-app");
-const expiresIn = Number(app.dataset["expiresIn"]) || 30 * 24 * 60 * 60;
+/** Used if the expiry choice is somehow unusable: the guide's 30 days. */
+const DEFAULT_EXPIRES_IN = 30 * 24 * 60 * 60;
+const MAX_EXPIRES_IN = 365 * 24 * 60 * 60;
 const sections: Record<State, HTMLElement> = {
   idle: el("state-idle"),
   uploading: el("state-uploading"),
   done: el("state-done"),
   error: el("state-error"),
 };
+const expiresSelect = el<HTMLSelectElement>("expires");
+const passwordInput = el<HTMLInputElement>("password");
 const drop = el("drop");
 const input = el<HTMLInputElement>("file-input");
 const idleNote = el("idle-note");
@@ -43,12 +46,19 @@ const cancelButton = el<HTMLButtonElement>("cancel");
 let state: State = "idle";
 let worker: Worker | null = null;
 let file: File | null = null;
+/** The options of the current upload, fixed when it starts. */
+let options: { expiresIn: number; password: string } = {
+  expiresIn: DEFAULT_EXPIRES_IN,
+  password: "",
+};
 let uploadId: string | null = null;
 /**
  * Set once the worker has sent `complete`: from then on the upload may be
  * finished on the server, so neither Cancel nor leaving the page deletes it.
  */
 let completing = false;
+/** When the link of the current upload stops working (from its start). */
+let expiresAt = new Date();
 let samples: { at: number; sent: number }[] = [];
 let wakeLock: WakeLockSentinel | null = null;
 
@@ -112,9 +122,20 @@ function idleMessage(text: string): void {
 // Uploading
 // ---------------------------------------------------------------------------
 
-function start(chosen: File): void {
+/** The options as chosen on the page right now. */
+function chosenOptions(): { expiresIn: number; password: string } {
+  const seconds = Number(expiresSelect.value);
+  const expiresIn =
+    Number.isSafeInteger(seconds) && seconds >= 1 && seconds <= MAX_EXPIRES_IN
+      ? seconds
+      : DEFAULT_EXPIRES_IN;
+  return { expiresIn, password: passwordInput.value };
+}
+
+function start(chosen: File, opts = chosenOptions()): void {
   if (state === "uploading") return;
   file = chosen;
+  options = opts;
   uploadId = null;
   completing = false;
   cancelButton.hidden = false;
@@ -140,7 +161,12 @@ function start(chosen: File): void {
       true,
     );
   };
-  w.postMessage({ type: "start", file: chosen, expiresIn } satisfies ToWorker);
+  w.postMessage({
+    type: "start",
+    file: chosen,
+    expiresIn: opts.expiresIn,
+    ...(opts.password ? { password: opts.password } : {}),
+  } satisfies ToWorker);
   void keepAwake();
 }
 
@@ -148,6 +174,7 @@ function onMessage(message: FromWorker): void {
   switch (message.type) {
     case "started":
       uploadId = message.id;
+      expiresAt = new Date(Date.now() + options.expiresIn * 1000);
       break;
     case "progress":
       renderProgress(message.sent, message.total);
@@ -164,6 +191,10 @@ function onMessage(message: FromWorker): void {
     case "done":
       finish();
       el("done-name").textContent = file?.name ?? "";
+      el("done-expiry").textContent = expiryText(options.expiresIn, expiresAt);
+      el("done-password").textContent = options.password
+        ? "Password protected: people need the password to download."
+        : "No password: anyone with the link can download.";
       link.value = message.url;
       copyNote.textContent = "";
       show("done");
@@ -190,6 +221,18 @@ function onMessage(message: FromWorker): void {
     case "cancelled":
       break;
   }
+}
+
+/** "Works for 30 days, until Nov 9, 2026." */
+function expiryText(seconds: number, until: Date): string {
+  const days = Math.round(seconds / 86400);
+  const span = days >= 365 ? "1 year" : days === 1 ? "1 day" : `${days} days`;
+  const date = until.toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
+  return `Works for ${span}, until ${date}.`;
 }
 
 function rejectedMessage(status: number | undefined, detail: string): string {
@@ -260,7 +303,7 @@ cancelButton.addEventListener("click", () => {
 });
 
 retry.addEventListener("click", () => {
-  if (file) start(file);
+  if (file) start(file, options);
 });
 el("error-another").addEventListener("click", () => {
   show("idle");

@@ -30,7 +30,7 @@ body{background:#222;font-family:Geneva,"Lucida Grande",sans-serif;font-size:12p
 .meta{text-align:center;color:#444;line-height:1.8;margin-bottom:16px}
 hr{border:none;border-top:1px solid #000;margin:0 0 16px}
 .center{text-align:center}
-input[type=password],input[type=text]{font-family:inherit;font-size:12px;border:1px solid #000;padding:4px 8px;width:100%;margin-bottom:8px;display:block}
+input[type=password],input[type=text],select{font-family:inherit;font-size:12px;border:1px solid #000;border-radius:0;background:#fff;color:#000;padding:4px 8px;width:100%;margin-bottom:8px;display:block}
 label{display:block;margin-bottom:4px;font-weight:bold}
 button{font-family:inherit;font-size:12px;border:2px solid #000;background:#fff;padding:5px 20px;cursor:pointer;box-shadow:2px 2px 0 #000}
 button:active{box-shadow:none;transform:translate(2px,2px)}

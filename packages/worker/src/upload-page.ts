@@ -6,41 +6,65 @@
 
 import { layout } from "./template.js";
 
+const DAY = 24 * 60 * 60;
+
 /** Default link lifetime for browser uploads: 30 days. */
-export const DEFAULT_EXPIRES_IN_SECONDS = 30 * 24 * 60 * 60;
+export const DEFAULT_EXPIRES_IN_SECONDS = 30 * DAY;
 
-export interface UploadPageOptions {
-  /** Lifetime of the share link in seconds. Default 30 days. */
-  expiresInSeconds?: number;
-}
+/**
+ * The link lifetimes the page offers, in seconds. The longest is the API's
+ * limit, 365 days (`expires_in`, see docs/design/api.md).
+ */
+export const EXPIRY_CHOICES: readonly { seconds: number; label: string }[] = [
+  { seconds: DAY, label: "1 day" },
+  { seconds: 7 * DAY, label: "7 days" },
+  { seconds: 30 * DAY, label: "30 days" },
+  { seconds: 90 * DAY, label: "90 days" },
+  { seconds: 365 * DAY, label: "1 year" },
+];
 
-// Only what the existing layout has no class for: the drop zone, the progress
-// bar and the link field. Kept bare on purpose (styling is phase 2).
+// Only what the shared layout has no class for: the options, the drop zone,
+// the progress bar and the link field, in the layout's style.
 const PAGE_CSS = `
+.field{margin-bottom:12px}
+.field input{margin-bottom:0}
+.hint{color:#444;font-weight:normal;font-size:11px;margin-top:4px}
 .drop{border:2px dashed #000;padding:24px 12px;text-align:center;line-height:2;margin-bottom:12px}
 .drop.over{background:#eee}
 .row{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-top:12px}
 progress{width:100%;height:16px;margin-bottom:8px}
-input[readonly]{font-family:inherit;font-size:12px;border:1px solid #000;padding:4px 8px;width:100%;display:block}
+input[readonly]{background:#fff}
 .note{text-align:center;color:#444;margin-top:8px;min-height:1em}
+.summary{text-align:center;line-height:1.8;margin-bottom:12px}
 .logout{text-align:center;margin-top:20px}
 .logout button{box-shadow:none;border-width:1px;padding:2px 10px;font-size:11px}
 [hidden]{display:none!important}
 `.trim();
 
-export function uploadPage(opts: UploadPageOptions = {}): string {
-  const expiresIn = opts.expiresInSeconds ?? DEFAULT_EXPIRES_IN_SECONDS;
-  const days = Math.round(expiresIn / 86400);
+export function uploadPage(): string {
+  const options = EXPIRY_CHOICES.map(
+    ({ seconds, label }) =>
+      `<option value="${seconds}"${seconds === DEFAULT_EXPIRES_IN_SECONDS ? " selected" : ""}>${label}</option>`,
+  ).join("");
   const body = `
     <style>${PAGE_CSS}</style>
-    <div id="upload-app" data-expires-in="${expiresIn}">
+    <div id="upload-app">
       <section id="state-idle">
+        <div class="field">
+          <label for="expires">Link works for</label>
+          <select id="expires">${options}</select>
+        </div>
+        <div class="field">
+          <label for="password">Password <span class="hint">(optional)</span></label>
+          <input type="text" id="password" autocomplete="off" autocapitalize="off"
+            autocorrect="off" spellcheck="false" placeholder="No password">
+          <div class="hint">If you set one, people need it to download the file.</div>
+        </div>
         <div id="drop" class="drop">
-          Drag a file here<br>or<br>
+          <span class="drag-hint">Drag a file here<br>or<br></span>
           <button type="button" id="choose" class="primary" disabled>Choose file</button>
           <input type="file" id="file-input" hidden>
         </div>
-        <div class="meta">The link works for ${days} days.</div>
         <div id="idle-note" class="note" role="status"></div>
       </section>
 
@@ -54,6 +78,10 @@ export function uploadPage(opts: UploadPageOptions = {}): string {
 
       <section id="state-done" hidden>
         <div id="done-name" class="filename"></div>
+        <div class="summary">
+          <div id="done-expiry"></div>
+          <div id="done-password"></div>
+        </div>
         <label for="link">Share this link</label>
         <input type="text" id="link" readonly>
         <div class="row">

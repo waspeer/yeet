@@ -99,6 +99,7 @@ class Upload {
   constructor(
     private readonly file: File,
     private readonly expiresIn: number,
+    private readonly password: string | undefined,
   ) {}
 
   async run(): Promise<void> {
@@ -109,6 +110,7 @@ class Upload {
           filename: this.file.name,
           size,
           expires_in: this.expiresIn,
+          ...(this.password ? { password: this.password } : {}),
         }),
       );
       const id = created?.["id"];
@@ -320,7 +322,7 @@ let current: Upload | null = null;
 self.onmessage = (event: MessageEvent<ToWorker>) => {
   const message = event.data;
   if (message.type === "start" && !current) {
-    current = new Upload(message.file, message.expiresIn);
+    current = new Upload(message.file, message.expiresIn, message.password);
     void current.run();
   } else if (message.type === "cancel") {
     if (current) void current.cancel();

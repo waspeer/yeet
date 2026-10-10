@@ -2,7 +2,14 @@
 
 /** Page → worker. */
 export type ToWorker =
-  | { type: "start"; file: File; expiresIn: number }
+  | {
+      type: "start";
+      file: File;
+      /** `expires_in` for POST /api/uploads, in seconds. */
+      expiresIn: number;
+      /** The download password, if the user set one. */
+      password?: string;
+    }
   /** Stop: abort requests in flight and delete the upload on the server. */
   | { type: "cancel" };
 
