@@ -5,7 +5,9 @@ import { open } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
+import { api, ApiError, withRetries, type Config } from "./api.js";
 import { MAX_DELETE_ROUNDS, MAX_LIST_PAGES } from "./limits.js";
+import { CONCURRENCY, countingStream, formatSize, Progress } from "./transfer.js";
 
 const README_URL = "https://github.com/waspeer/yeet#readme";
 
@@ -18,11 +20,6 @@ interface StoredConfig {
   url?: string;
   token?: string;
   defaultExpires?: string;
-}
-
-interface Config {
-  url: string;
-  token: string;
 }
 
 function configPath(): string {
@@ -211,176 +208,6 @@ function die(msg: string): never {
   process.exit(1);
 }
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-class ApiError extends Error {
-  constructor(
-    message: string,
-    readonly status: number,
-    /** The message without advice to run `yeet login`, for `yeet login` itself. */
-    readonly forLogin = message,
-    /** Seconds the server asked to wait before trying again (Retry-After), if it said. */
-    readonly retryAfter?: number,
-  ) {
-    super(message);
-  }
-}
-
-/**
- * The three spellings of an HTTP date (RFC 9110 §5.6.7): IMF-fixdate
- * ("Sun, 06 Nov 1994 08:49:37 GMT"), RFC 850 ("Sunday, 06-Nov-94 08:49:37
- * GMT") and asctime ("Sun Nov  6 08:49:37 1994"). Checked before Date.parse(),
- * which also reads "-5", "+5" or "1.5" as dates (in 2001, so "retry now").
- */
-const IMF_FIXDATE = /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/;
-const RFC_850_DATE = /^[A-Z][a-z]+day, \d{2}-[A-Z][a-z]{2}-\d{2} \d{2}:\d{2}:\d{2} GMT$/;
-const ASCTIME_DATE = /^[A-Z][a-z]{2} [A-Z][a-z]{2} [ \d]\d \d{2}:\d{2}:\d{2} \d{4}$/;
-
-/**
- * Seconds to wait from a Retry-After header: delta-seconds (digits only) or
- * an HTTP date. Undefined if there is none or it is anything else ("-5",
- * "1.5", "1e3"), so the caller's own backoff applies.
- */
-function retryAfterSeconds(res: Response): number | undefined {
-  const value = res.headers.get("Retry-After")?.trim();
-  if (!value) return undefined;
-  if (/^\d+$/.test(value)) return Number(value);
-  let at: number;
-  if (IMF_FIXDATE.test(value) || RFC_850_DATE.test(value)) at = Date.parse(value);
-  // asctime carries no zone but means GMT; Date.parse() would take local time.
-  else if (ASCTIME_DATE.test(value)) at = Date.parse(`${value} GMT`);
-  else return undefined;
-  return Number.isNaN(at) ? undefined : Math.max(0, Math.ceil((at - Date.now()) / 1000));
-}
-
-/**
- * The server refuses every token from this address for a while after too many
- * wrong ones (429). Seconds to wait come from Retry-After, or the error text.
- */
-function tooManyAttempts(seconds: number): string {
-  return `Too many wrong upload tokens were tried from this address. Try again ${waitText(seconds)}.`;
-}
-
-/** The most of one unit waitText() says before it uses the next ("90 minutes", then "2 hours"). */
-const MAX_IN_UNIT = 90;
-
-/**
- * When to try again, for a message: "in 45 seconds", "in 15 minutes", "in 3
- * hours", or "later" for no wait known or one over a day (a server may send
- * any Retry-After, 100000000000000000000 included). The count is rounded up
- * and given in the smallest unit that keeps it at most MAX_IN_UNIT: so at
- * most two digits, 90 seconds or 2 minutes, 90 minutes or 2 hours.
- */
-function waitText(seconds: number): string {
-  const unit = (n: number, name: string) => `in ${n} ${name}${n === 1 ? "" : "s"}`;
-  if (!(seconds > 0) || seconds > 86_400) return "later";
-  const whole = Math.ceil(seconds);
-  if (whole <= MAX_IN_UNIT) return unit(whole, "second");
-  const minutes = Math.ceil(seconds / 60);
-  if (minutes <= MAX_IN_UNIT) return unit(minutes, "minute");
-  return unit(Math.ceil(seconds / 3600), "hour");
-}
-
-/** Call the server API and parse the JSON response, with readable errors. */
-async function api<T>(
-  config: Config,
-  method: string,
-  path: string,
-  body?: unknown,
-  init: RequestInit = {},
-): Promise<T> {
-  let res: Response;
-  try {
-    res = await fetch(`${config.url}/api${path}`, {
-      method,
-      ...init,
-      headers: {
-        Authorization: `Bearer ${config.token}`,
-        ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
-        ...init.headers,
-      },
-      body: body !== undefined ? JSON.stringify(body) : init.body,
-    });
-  } catch (err) {
-    const cause =
-      err instanceof Error && err.cause instanceof Error ? `: ${err.cause.message}` : "";
-    throw new ApiError(`Could not reach ${config.url}${cause}`, 0);
-  }
-
-  const text = await res.text();
-  let data: unknown;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    data = undefined;
-  }
-
-  if (!res.ok) {
-    const message = (data as { error?: string } | undefined)?.error;
-    const retryAfter = retryAfterSeconds(res);
-    // `yeet login` words these two without the advice to run itself (see login()).
-    if (res.status === 401) {
-      throw new ApiError("The server rejected the upload token. Run `yeet login` again.", 401);
-    }
-    if (res.status === 429) {
-      const seconds = retryAfter || Number(message?.match(/(\d+)\s*s\b/)?.[1]) || 0;
-      const tooMany = tooManyAttempts(seconds);
-      throw new ApiError(
-        `${tooMany} If your token is wrong, run \`yeet login\` again after that.`,
-        429,
-        tooMany,
-        seconds || undefined,
-      );
-    }
-    if (res.status === 404 && message === undefined) {
-      throw new ApiError(`${config.url} does not look like a yeet server (404 on ${path})`, 404);
-    }
-    throw new ApiError(
-      message ?? `Server returned ${res.status}`,
-      res.status,
-      undefined,
-      retryAfter,
-    );
-  }
-  return data as T;
-}
-
-/**
- * The longest Retry-After withRetries() waits for. A server that asks for
- * longer (e.g. 429 after too many wrong tokens, for up to a minute or more)
- * gets no retry: the error says when to try again instead.
- */
-const MAX_RETRY_AFTER_S = 10;
-
-/**
- * Retry transient failures (network errors, 5xx and 429) with backoff (1, 2
- * and 4 s), or after the server's Retry-After if it sent one, unless that is
- * longer than MAX_RETRY_AFTER_S.
- */
-async function withRetries<T>(attempt: () => Promise<T>, tries = 4): Promise<T> {
-  for (let i = 1; ; i++) {
-    try {
-      return await attempt();
-    } catch (err) {
-      const status = err instanceof ApiError ? err.status : 0;
-      const transient = status === 0 || status >= 500 || status === 429;
-      if (!transient || i >= tries) throw err;
-      const retryAfter = err instanceof ApiError ? err.retryAfter : undefined;
-      if (retryAfter !== undefined && retryAfter > MAX_RETRY_AFTER_S) {
-        // Say when to try again (a 429's message already does).
-        if (!(err instanceof ApiError) || status === 429) throw err;
-        throw new ApiError(
-          `${err.message.replace(/\.$/, "")}. Try again ${waitText(retryAfter)}.`,
-          status,
-          err.forLogin,
-          retryAfter,
-        );
-      }
-      await sleep(retryAfter !== undefined ? retryAfter * 1000 : 1000 * 2 ** (i - 1));
-    }
-  }
-}
-
 // ---------------------------------------------------------------------------
 // ANSI formatting
 // ---------------------------------------------------------------------------
@@ -398,13 +225,6 @@ function cyan(s: string): string {
 }
 function yellow(s: string): string {
   return isTTY ? `\x1b[33m${s}\x1b[39m` : s;
-}
-
-function formatSize(bytes: number): string {
-  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
-  if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`;
-  if (bytes >= 1e3) return `${(bytes / 1e3).toFixed(1)} KB`;
-  return `${bytes} B`;
 }
 
 function formatDate(iso: string): string {
@@ -661,59 +481,6 @@ async function deleteUploads(ids: string[]): Promise<void> {
 // ---------------------------------------------------------------------------
 // Upload command
 // ---------------------------------------------------------------------------
-
-/** Parts uploaded at the same time. Each holds one part (up to 50 MiB) in memory. */
-const CONCURRENCY = 3;
-
-class Progress {
-  private sent = 0;
-  private readonly started = Date.now();
-  private lastDraw = 0;
-  private readonly enabled = process.stderr.isTTY;
-
-  constructor(
-    private readonly label: string,
-    private readonly total: number,
-  ) {}
-
-  add(bytes: number): void {
-    this.sent += bytes;
-    if (Date.now() - this.lastDraw > 100) this.draw();
-  }
-
-  draw(): void {
-    if (!this.enabled) return;
-    this.lastDraw = Date.now();
-    const pct = this.total ? Math.min(100, (this.sent / this.total) * 100) : 100;
-    const seconds = Math.max((Date.now() - this.started) / 1000, 0.001);
-    const rate = formatSize(this.sent / seconds);
-    process.stderr.write(
-      `\r\x1b[K${this.label}  ${pct.toFixed(0).padStart(3)}%  ${formatSize(this.sent)} / ${formatSize(this.total)}  ${rate}/s`,
-    );
-  }
-
-  done(): void {
-    if (this.enabled) process.stderr.write("\r\x1b[K");
-  }
-}
-
-/** Wrap a buffer in a stream that reports bytes as fetch pulls them. */
-function countingStream(buffer: Uint8Array, onChunk: (bytes: number) => void): ReadableStream {
-  const CHUNK = 256 * 1024;
-  let offset = 0;
-  return new ReadableStream({
-    pull(controller) {
-      if (offset >= buffer.length) {
-        controller.close();
-        return;
-      }
-      const chunk = buffer.subarray(offset, offset + CHUNK);
-      offset += chunk.length;
-      onChunk(chunk.length);
-      controller.enqueue(chunk);
-    },
-  });
-}
 
 async function uploadFile(
   config: Config,
