@@ -32,26 +32,46 @@ import {
 
 const run = promisify(execFile);
 
-/** RSS in KiB of every process below `root` (not `root` itself). */
-async function treeRss(root: number): Promise<{ kib: number; processes: number }> {
-  const { stdout } = await run("ps", ["-A", "-o", "pid=,ppid=,rss="]);
+/**
+ * RSS in KiB of every process below `root` (not `root` itself), plus every
+ * process run from `browserDir` (WebKit's WebContent and Networking
+ * processes are XPC services started by launchd, not children of the
+ * browser). Only one Playwright run may be active (the harness's rule).
+ */
+async function treeRss(
+  root: number,
+  browserDir: string,
+): Promise<{ kib: number; processes: number; largest: string }> {
+  const { stdout } = await run("ps", ["-A", "-o", "pid=,ppid=,rss=,command="], {
+    maxBuffer: 16 * 1024 * 1024,
+  });
   const children = new Map<number, number[]>();
   const rss = new Map<number, number>();
+  const names = new Map<number, string>();
+  const counted = new Set<number>();
   for (const line of stdout.trim().split("\n")) {
-    const [pid, ppid, kib] = line.trim().split(/\s+/).map(Number) as [number, number, number];
+    const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(.*)$/);
+    if (!match) continue;
+    const [pid, ppid, kib] = [Number(match[1]), Number(match[2]), Number(match[3])];
     rss.set(pid, kib);
+    names.set(pid, match[4]!.split(" ")[0]!.split("/").pop()!);
     children.set(ppid, [...(children.get(ppid) ?? []), pid]);
+    if (match[4]!.startsWith(browserDir)) counted.add(pid);
   }
-  let kib = 0;
-  let processes = 0;
   const stack = [...(children.get(root) ?? [])];
   while (stack.length) {
     const pid = stack.pop()!;
-    kib += rss.get(pid) ?? 0;
-    processes++;
+    counted.add(pid);
     stack.push(...(children.get(pid) ?? []));
   }
-  return { kib, processes };
+  let kib = 0;
+  for (const pid of counted) kib += rss.get(pid) ?? 0;
+  const largest = [...counted]
+    .sort((a, b) => (rss.get(b) ?? 0) - (rss.get(a) ?? 0))
+    .slice(0, 3)
+    .map((pid) => `${names.get(pid)} ${Math.round((rss.get(pid) ?? 0) / 1024)}`)
+    .join(", ");
+  return { kib, processes: counted.size, largest };
 }
 
 const MiBof = (kib: number) => Math.round(kib / 1024);
@@ -72,14 +92,21 @@ for (const kind of ["compressed", "stored"] as const) {
       else if (i % 2) await randomFile(root, 128 * MiB, `noise ${i}.wav`);
       else await silentWavFile(root, (128 * MiB - 44) / 176_400, { name: `quiet ${i}.wav` });
     }
+    // The browser's install directory, e.g. ~/Library/Caches/ms-playwright/webkit-2293/.
+    const executable = page.context().browser()!.browserType().executablePath();
+    const browserDir = executable.slice(
+      0,
+      executable.indexOf("/", executable.indexOf("ms-playwright/") + 14) + 1,
+    );
+    const rssNow = () => treeRss(process.pid, browserDir);
     await logIn(page);
     await page.waitForTimeout(2000);
-    const before = await treeRss(process.pid);
+    const before = await rssNow();
     let peak = before;
     let sampling = true;
     const sampler = (async () => {
       while (sampling) {
-        const now = await treeRss(process.pid);
+        const now = await rssNow();
         if (now.kib > peak.kib) peak = now;
         await new Promise((r) => setTimeout(r, 100));
       }
@@ -91,13 +118,13 @@ for (const kind of ["compressed", "stored"] as const) {
     await page.waitForTimeout(10_000);
     sampling = false;
     await sampler;
-    const after = await treeRss(process.pid);
+    const after = await rssNow();
     const { size } = await downloadSha256(url);
     const report =
       `${browserName} ${kind} 1 GiB folder: ${seconds.toFixed(1)} s, zip ${size} bytes; ` +
       `RSS of ${after.processes} browser processes: before ${MiBof(before.kib)} MiB, ` +
       `peak ${MiBof(peak.kib)} MiB (+${MiBof(peak.kib - before.kib)}), ` +
-      `10 s after ${MiBof(after.kib)} MiB`;
+      `10 s after ${MiBof(after.kib)} MiB; largest at the peak: ${peak.largest} MiB`;
     console.log(report);
     info.annotations.push({ type: "measurement", description: report });
     expect((await deleteUploadFully(idFromUrl(url))).status).toBe(200);
