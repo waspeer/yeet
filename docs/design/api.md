@@ -495,7 +495,29 @@ Numbers that are signed or used as keys must be spelled one way only:
   upload, or one being deleted, still gets the `404`.
 - **Errors R2 raises at `complete`** (e.g. a wrong etag): `400` with
   "Could not complete the upload; check that every part was uploaded and its
-  etag is right (…)" instead of a 500.
+  etag is right (…)" instead of a 500. Since round 2C+2 the route first
+  checks whether the refusal has another cause (1 `head` of the file, and
+  without a file 1 sidecar read; only on this error path, so a `complete`
+  that works makes no extra call):
+  - **The file exists:** another request completed this multipart upload
+    meanwhile (the upload page sends `complete` again when it lost the
+    answer to the first, and the first may still be running). This request
+    goes on as if its own R2 complete had worked, with the file's size: the
+    sidecar write is conditional (`finishUpload()`), so only one request
+    writes it and both answer `200` with the same link.
+  - **The sidecar is gone or the deletion marker:** a `DELETE` aborted the
+    multipart upload after `complete` read the sidecar. `404 {"error": "No
+upload in progress: it was deleted"}`, as when the `DELETE` lands after
+    R2's complete (before, a misleading `400`).
+  - **The sidecar is a finished one:** `200` with its link.
+  - Otherwise the `400` above.
+
+  What real R2 does with a second `complete` of one multipart upload
+  (refuse it, or answer like the first) is **not measured**; both are
+  handled. Tests: `e2e/tests/node/complete-route-race.spec.ts` ("complete
+  after R2 refused it"), on the in-memory bucket, with an R2 that refuses a
+  second complete.
+
 - **`422` body:**
   `{"error": "Size mismatch: expected X bytes, stored Y", "expected_size": X, "stored_size": Y}`.
 - **Size `0`:** a zero-length part (`Content-Length: 0`) is accepted, so an
