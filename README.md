@@ -63,7 +63,9 @@ yeet upload song.wav
 yeet upload song.wav                         # link valid for 30 days
 yeet upload stems.zip --expires 7d           # or 24h, 90m; at most 365d
 yeet upload demo.mp3 --password hunter2      # recipient needs the password
-yeet upload *.wav                            # one link per file
+yeet upload stems/                           # a folder: one link to stems.zip
+yeet upload *.wav                            # several files: one link to yeet-<date>-<time>.zip
+yeet upload footage/ --store                 # zip without compressing (faster for media)
 yeet list                                    # all uploads, newest first
 yeet list --downloads                        # include recent download times
 yeet delete <link or id>                     # remove before it expires
@@ -74,6 +76,20 @@ pipes cleanly, e.g. `yeet upload song.wav | pbcopy` on macOS.
 
 Large files are uploaded in 50 MB parts, three at a time, and failed parts are
 retried. Files can be up to about 500 GB.
+
+A single file is uploaded as it is. Several files, or a folder, become one zip
+that is made while it uploads: nothing is written to disk first. A folder
+keeps its name as the zip's single top-level folder (`stems.zip` unzips to
+`stems/`), `.DS_Store` files are left out, and names are adjusted so Windows
+can unzip them (e.g. `:` becomes `_`); two files whose names would then clash
+are an error rather than one silently replacing the other. Audio, video,
+photos and archives that are already compressed are stored as they are, the
+rest is compressed. A zip whose size cannot be known in advance (anything
+compressed) can be up to about 7.8 GB; with `--store`, or when everything is
+already compressed, the limit is the same as for a single file. If anything
+goes wrong part-way (a file that cannot be read or changes while it is read, a
+network failure, Ctrl-C), the upload is deleted: a link never points to half a
+zip.
 
 ## Configuration
 

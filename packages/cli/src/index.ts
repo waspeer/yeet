@@ -7,7 +7,9 @@ import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { api, ApiError, withRetries, type Config } from "./api.js";
 import { MAX_DELETE_ROUNDS, MAX_LIST_PAGES } from "./limits.js";
+import { planUpload, SelectionError } from "./selection.js";
 import { CONCURRENCY, countingStream, formatSize, Progress } from "./transfer.js";
+import { InterruptedError, uploadZip } from "./upload-zip.js";
 
 const README_URL = "https://github.com/waspeer/yeet#readme";
 
@@ -84,7 +86,13 @@ function defaultExpiresDays(): number {
 
 type Args =
   | { command: "login"; url: string | undefined }
-  | { command: "upload"; filepaths: string[]; expires: number; password: string | undefined }
+  | {
+      command: "upload";
+      filepaths: string[];
+      expires: number;
+      password: string | undefined;
+      store: boolean;
+    }
   | { command: "list"; showDownloads: boolean }
   | { command: "delete"; ids: string[] };
 
@@ -92,10 +100,12 @@ const USAGE = `Usage: yeet <command>
 
 Commands:
   login [url]        Connect to your yeet server (asks for the upload token)
-  upload <file...> [--expires <duration>] [--password <string>]
-                     Upload files and print one share link per file
+  upload <path...> [--expires <duration>] [--password <string>] [--store]
+                     Upload a file as it is, or several files or a folder as
+                     one zip (zipped while it uploads), and print its share link
                      --expires   link lifetime, e.g. 7d, 24h, 90m (default 30d, at most 365d)
                      --password  require this password to download
+                     --store     zip without compressing (faster for audio, video, photos)
   list [--downloads] Show all uploaded files (optionally with download history)
   delete <id|url...> Delete uploads before they expire
 
@@ -148,6 +158,7 @@ function parseArgs(argv: string[]): Args {
   const filepaths: string[] = [];
   let expires: number | undefined;
   let password: string | undefined;
+  let store = false;
 
   for (let i = 1; i < args.length; i++) {
     const arg = args[i];
@@ -159,6 +170,8 @@ function parseArgs(argv: string[]): Args {
       const val = args[++i];
       if (!val) die("--password requires a value");
       password = val;
+    } else if (arg === "--store") {
+      store = true;
     } else if (!arg.startsWith("--")) {
       filepaths.push(arg);
     } else {
@@ -167,9 +180,15 @@ function parseArgs(argv: string[]): Args {
   }
 
   if (filepaths.length === 0) {
-    die("Usage: yeet upload <file...> [--expires <duration>] [--password <string>]");
+    die("Usage: yeet upload <path...> [--expires <duration>] [--password <string>] [--store]");
   }
-  return { command: "upload", filepaths, expires: expires ?? defaultExpiresDays(), password };
+  return {
+    command: "upload",
+    filepaths,
+    expires: expires ?? defaultExpiresDays(),
+    password,
+    store,
+  };
 }
 
 /** The longest link lifetime the server accepts. */
@@ -562,25 +581,53 @@ async function uploadFile(
   }
 }
 
+/**
+ * One file is uploaded as it is; several paths, or a folder, as one zip
+ * (see selection.ts and upload-zip.ts). Either way: one share link.
+ */
 async function upload(
   filepaths: string[],
   expiresDays: number,
   password: string | undefined,
+  store: boolean,
 ): Promise<void> {
   const config = loadConfig();
-  let failed = false;
-  for (const filepath of filepaths) {
+  let plan;
+  try {
+    plan = await planUpload(filepaths);
+  } catch (err) {
+    die(err instanceof SelectionError ? err.message : String(err));
+  }
+  if (plan.kind === "file") {
     try {
-      const url = await uploadFile(config, filepath, expiresDays, password);
+      const url = await uploadFile(config, plan.source, expiresDays, password);
       process.stdout.write(url + "\n");
     } catch (err) {
-      failed = true;
-      process.stderr.write(
-        `Upload of ${filepath} failed: ${err instanceof Error ? err.message : err}\n`,
-      );
+      die(`Upload of ${filepaths[0]} failed: ${err instanceof Error ? err.message : err}`);
     }
+    return;
   }
-  if (failed) process.exit(1);
+
+  for (const warning of plan.warnings) process.stderr.write(yellow(`Note: ${warning}`) + "\n");
+  const count = `${plan.files.length} file${plan.files.length === 1 ? "" : "s"}`;
+  process.stderr.write(
+    `Zipping ${count} (${formatSize(plan.totalSize)}) into ${plan.name}` +
+      (store ? " without compression" : "") +
+      "\n",
+  );
+  try {
+    const url = await uploadZip(config, plan, { expiresDays, password, store });
+    process.stdout.write(url + "\n");
+  } catch (err) {
+    if (err instanceof InterruptedError) {
+      process.stderr.write(`Upload of ${plan.name} cancelled; nothing was kept.\n`);
+      process.exit(130);
+    }
+    die(
+      `Upload of ${plan.name} failed: ${err instanceof Error ? err.message : err}\n` +
+        "Nothing was kept on the server.",
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -593,7 +640,7 @@ async function main() {
   if (args.command === "login") await login(args.url);
   else if (args.command === "list") await listFiles(args.showDownloads);
   else if (args.command === "delete") await deleteUploads(args.ids);
-  else await upload(args.filepaths, args.expires, args.password);
+  else await upload(args.filepaths, args.expires, args.password, args.store);
 }
 
 main().catch((err: unknown) => {
