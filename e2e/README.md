@@ -251,7 +251,8 @@ All exported from `lib/index.ts`.
   `lib/cli-preload.mjs` into the CLI, whose stubs `YEET_STUB_*` variables in `env` turn on:
   `YEET_STUB_FREE_BYTES=<n>` makes `fs.statfs` report n free bytes, and
   `YEET_STUB_SLOW_READ_MS=<ms>` delays each read of a file named `slow*` (so zipping can be
-  interrupted). The CLI's own test hooks: `YEET_TEST_MAX_UNSIZED_PARTS` lowers its 150-part
+  interrupted), and `YEET_STUB_ENOSPC_AFTER=<n>` makes writes to the temporary
+  `upload.zip` fail with `ENOSPC` after n bytes. The CLI's own test hooks: `YEET_TEST_MAX_UNSIZED_PARTS` lowers its 150-part
   cap for zips of unknown size, `YEET_TEST_ZIP_SIZE_BOUND` replaces its worst-case zip size.
 
 ### Stand-in server — `stand-in.ts`
