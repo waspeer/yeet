@@ -75,6 +75,29 @@ export async function manifestOf(
   return manifest;
 }
 
+/**
+ * The manifest of a zip the CLI made from files on disk: each file's SHA-256,
+ * size and mtime read here, independently of the CLI. `dirs` are the empty
+ * directories the zip should hold ("a/empty/").
+ */
+export async function manifestOfFiles(
+  files: { path: string; source: string }[],
+  dirs: { path: string; source: string }[] = [],
+): Promise<Manifest> {
+  const manifest: Manifest = new Map();
+  manifest.meta = new Map();
+  for (const f of files) {
+    const st = await stat(f.source);
+    manifest.set(f.path, { sha256: await sha256File(f.source), size: st.size });
+    manifest.meta.set(f.path, { sizeKnown: true, mtime: st.mtimeMs });
+  }
+  for (const d of dirs) {
+    manifest.set(d.path, "dir");
+    manifest.meta.set(d.path, { sizeKnown: true, mtime: (await stat(d.source)).mtimeMs });
+  }
+  return manifest;
+}
+
 /** The manifest format check.py reads: {path: {sha256, size, sizeKnown, mtime}}, dirs {mtime}. */
 export function checkManifest(manifest: Manifest): Record<string, unknown> {
   const out: Record<string, unknown> = {};
