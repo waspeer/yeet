@@ -96,10 +96,16 @@ export function zipSizeBound(plan: ZipPlan, store: boolean): number {
   return total;
 }
 
-/** Test hook (e2e only): YEET_TEST_ZIP_SIZE_BOUND replaces zipSizeBound(), to reach the guard. */
-function testBound(): number | undefined {
-  const n = Number(process.env.YEET_TEST_ZIP_SIZE_BOUND);
-  return process.env.YEET_TEST_ZIP_SIZE_BOUND && Number.isSafeInteger(n) && n >= 0 ? n : undefined;
+/**
+ * `bound`, or less for the e2e tests: YEET_TEST_ZIP_SIZE_BOUND (an integer
+ * from 0) lowers it, so the guard against a zip outgrowing its estimate can
+ * be reached (0 streams any zip). Higher or malformed values are ignored, so
+ * the hook can never send a zip to the temporary file that would stream.
+ */
+export function testZipSizeBound(bound: number): number {
+  const raw = process.env.YEET_TEST_ZIP_SIZE_BOUND;
+  const n = Number(raw);
+  return raw && Number.isSafeInteger(n) && n >= 0 ? Math.min(n, bound) : bound;
 }
 
 /** The error code of a failed file-system call ("ENOSPC", …), if any. */
@@ -575,7 +581,7 @@ export async function uploadZip(
 
     const target = await create(undefined);
     const maxParts = maxUnsizedParts();
-    const bound = testBound() ?? zipSizeBound(plan, store);
+    const bound = testZipSizeBound(zipSizeBound(plan, store));
     // A part to spare: the bound is already a worst case (see zipSizeBound()).
     if (bound <= (maxParts - 1) * target.partSize) return await stream(target, undefined);
 

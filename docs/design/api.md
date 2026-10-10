@@ -1237,7 +1237,8 @@ would cost more than they do. The exception is the CLI's temporary zip
 - **A CLI zip larger than about 7.8 GB is written to disk first.** Since
   round 2B.1 a compressed zip whose worst case does not fit in
   `MAX_UNSIZED_PARTS` goes through a temporary file (see above), so it
-  needs that much free disk space (checked; the CLI suggests `--store`
+  needs free disk space for its worst case, about the input plus 256 MiB
+  (`zipSizeBound()` + `FREE_SPACE_MARGIN`; checked; the CLI suggests `--store`
   when it is short), and the upload starts only once it is zipped. A
   SIGKILL or a crash leaves the file in the OS's temporary folder. The
   first, unused upload it creates and deletes to learn `part_size` costs

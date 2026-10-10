@@ -32,8 +32,8 @@ printed one link per file.
   in the zip (ignoring case) are an error naming both.
 - No size cap: a compressed zip that could come out larger than about 7.8 GB
   (the most the server accepts without knowing the size up front) is written
-  to a temporary file in `$TMPDIR` first, then uploaded. It needs that much
-  free disk space (checked first; the message suggests `--store` when it is
+  to a temporary file in `$TMPDIR` first, then uploaded. It needs free disk
+  space for about the size of the files plus 256 MB (checked first; the message suggests `--store` when it is
   short), and the file is always deleted: on success, on an error, on Ctrl-C,
   SIGTERM or SIGHUP. `--store` never needs a temporary file.
 - If anything goes wrong part-way (a file that cannot be read or changes while

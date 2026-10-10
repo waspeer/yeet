@@ -258,7 +258,7 @@ All exported from `lib/index.ts`.
   `YEET_STUB_SLOW_READ_MS=<ms>` delays each read of a file named `slow*` (so zipping can be
   interrupted), and `YEET_STUB_ENOSPC_AFTER=<n>` makes writes to the temporary
   `upload.zip` fail with `ENOSPC` after n bytes. The CLI's own test hooks: `YEET_TEST_MAX_UNSIZED_PARTS` lowers its 150-part
-  cap for zips of unknown size, `YEET_TEST_ZIP_SIZE_BOUND` replaces its worst-case zip size.
+  cap for zips of unknown size, `YEET_TEST_ZIP_SIZE_BOUND` lowers its worst-case zip size (never raises it).
 
 ### Stand-in server — `stand-in.ts`
 
