@@ -37,6 +37,9 @@ export class SelectionError extends Error {}
 /** Never zipped: Finder's folder view settings. */
 const SKIPPED_NAMES = new Set([".DS_Store"]);
 
+/** The error code of a failed file-system call ("ENOENT", "ELOOP", …), if any. */
+const codeOf = (err: unknown) => (err as NodeJS.ErrnoException | undefined)?.code;
+
 /** Windows Explorer cannot extract longer paths (MAX_PATH) without help. */
 const LONG_PATH = 260;
 
@@ -75,8 +78,16 @@ export async function planUpload(paths: string[], now = new Date()): Promise<Pla
     let st;
     try {
       st = await stat(abs);
-    } catch {
-      throw new SelectionError(`File not found: ${arg}`);
+    } catch (err) {
+      if (codeOf(err) === "ELOOP") {
+        throw new SelectionError(
+          `Cannot upload ${arg}: ${arg} is a symbolic link loop (following it leads back to itself).`,
+        );
+      }
+      if (codeOf(err) === "ENOENT" || codeOf(err) === "ENOTDIR") {
+        throw new SelectionError(`File not found: ${arg}`);
+      }
+      throw new SelectionError(`Cannot read ${arg}: ${(err as Error).message}`);
     }
     if (!st.isFile() && !st.isDirectory()) {
       throw new SelectionError(`Not a file or folder: ${arg}`);
@@ -120,6 +131,14 @@ export async function planUpload(paths: string[], now = new Date()): Promise<Pla
     return path;
   };
 
+  /** A file-system error for something readdir() listed a moment ago, as a selection error. */
+  const vanished = (shown: string, err: unknown) =>
+    new SelectionError(
+      codeOf(err) === "ENOENT"
+        ? `Cannot read ${shown}: it was removed or renamed while yeet read the folder. Try again.`
+        : `Cannot read ${shown}: ${(err as Error).message}`,
+    );
+
   const walk = async (dir: string, zipDir: string, label: string): Promise<void> => {
     let names: string[];
     try {
@@ -132,13 +151,24 @@ export async function planUpload(paths: string[], now = new Date()): Promise<Pla
       if (SKIPPED_NAMES.has(name)) continue;
       const source = join(dir, name);
       const shown = `${label}/${name}`;
-      const link = await lstat(source);
+      let link;
+      try {
+        link = await lstat(source);
+      } catch (err) {
+        throw vanished(shown, err);
+      }
       let st = link;
       if (link.isSymbolicLink()) {
         try {
           st = await stat(source);
-        } catch {
-          warnings.push(`Skipped ${shown}: a symbolic link to nothing.`);
+        } catch (err) {
+          warnings.push(
+            codeOf(err) === "ELOOP"
+              ? `Skipped ${shown}: a symbolic link loop.`
+              : codeOf(err) === "ENOENT" || codeOf(err) === "ENOTDIR"
+                ? `Skipped ${shown}: a symbolic link to nothing.`
+                : `Skipped ${shown}: a symbolic link that cannot be followed (${codeOf(err) ?? (err as Error).message}).`,
+          );
           continue;
         }
         if (st.isDirectory()) {
@@ -162,7 +192,15 @@ export async function planUpload(paths: string[], now = new Date()): Promise<Pla
         warnings.push(`Skipped ${shown}: not a file or folder.`);
       }
     }
-    if (kept === 0) dirs.push({ path: `${zipDir}/`, mtimeMs: (await stat(dir)).mtimeMs });
+    if (kept === 0) {
+      let mtimeMs;
+      try {
+        mtimeMs = (await stat(dir)).mtimeMs;
+      } catch (err) {
+        throw vanished(label, err);
+      }
+      dirs.push({ path: `${zipDir}/`, mtimeMs });
+    }
   };
 
   for (const top of tops) {

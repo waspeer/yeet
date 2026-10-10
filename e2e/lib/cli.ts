@@ -6,7 +6,14 @@ import { expect } from "@playwright/test";
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { mkdtemp } from "node:fs/promises";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { server } from "./env.js";
+
+/**
+ * `node --import` this to stub file-system calls in a CLI child (statfs,
+ * slow reads; see the file). cli() adds it with `stubs: true`.
+ */
+export const CLI_PRELOAD = fileURLToPath(new URL("cli-preload.mjs", import.meta.url));
 
 export interface CliOptions {
   /** Written to stdin, which is then closed. Default: empty stdin. */
@@ -19,6 +26,8 @@ export interface CliOptions {
   auth?: boolean;
   timeoutMs?: number;
   cwd?: string;
+  /** Load CLI_PRELOAD, whose stubs the YEET_STUB_* variables in `env` turn on. */
+  stubs?: boolean;
 }
 
 export interface CliResult {
@@ -98,7 +107,8 @@ export async function cli(args: string[], opts: CliOptions = {}): Promise<CliRes
   }
 
   const started = Date.now();
-  const child = spawnCli([server.cliPath, ...args], {
+  const nodeArgs = opts.stubs ? ["--import", CLI_PRELOAD] : [];
+  const child = spawnCli([...nodeArgs, server.cliPath, ...args], {
     cwd: opts.cwd,
     env,
     stdio: ["pipe", "pipe", "pipe"],

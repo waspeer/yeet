@@ -5,15 +5,15 @@
 // 2. the upload against a stand-in server that records every request, with
 //    tiny part sizes so small files take many parts: exact part sizes, the
 //    size at complete, and every failure path (unreadable file, a file that
-//    changes while it is read, a part that keeps failing, Ctrl-C, the
-//    150-part limit of uploads of unknown size): DELETE, never complete;
+//    changes while it is read, a part that keeps failing, Ctrl-C, the guard
+//    on the 150-part limit of uploads of unknown size): DELETE, never
+//    complete (the temporary-file path for larger zips is in
+//    cli-zip-tempfile.spec.ts);
 // 3. the real Worker (wrangler dev): zips of several files and of a folder
 //    downloaded and checked with check.py and per-entry SHA-256, and a failed
 //    upload that leaves nothing in the bucket.
 
 import { spawn } from "node:child_process";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import type { AddressInfo } from "node:net";
 import {
   appendFile,
   chmod,
@@ -48,6 +48,7 @@ import {
   server,
   sleep,
   spawnCli,
+  standIn,
   startServer,
   test,
 } from "../../lib/index.js";
@@ -104,6 +105,77 @@ test.describe("yeet upload: what gets zipped", () => {
     // A trailing slash and "." name the same folder.
     expect((await plan([root + "/"])).name).toBe("Stems v2.zip");
     expect((await plan(["."].map((d) => join(root, d)))).name).toBe("Stems v2.zip");
+  });
+
+  test("a symbolic link loop inside a folder is skipped as a loop, not as a link to nothing", async ({
+    tmp,
+  }) => {
+    // Regression (round 2B verification): ELOOP was reported as "a symbolic link to nothing".
+    const root = join(tmp, "loops");
+    await mkdir(root);
+    await writeFile(join(root, "a.txt"), "a");
+    await symlink("self", join(root, "self")); // points at itself
+    await symlink("pong", join(root, "ping"));
+    await symlink("ping", join(root, "pong"));
+    const p = await plan([root]);
+    expect(p.files.map((f) => f.path)).toEqual(["loops/a.txt"]);
+    const warnings = p.warnings.join("\n");
+    for (const name of ["self", "ping", "pong"]) {
+      expect(warnings).toContain(`Skipped ${root}/${name}: a symbolic link loop.`);
+    }
+    expect(warnings).not.toMatch(/to nothing/);
+  });
+
+  test("a top-level symbolic link loop is named as one, not as a missing file", async ({ tmp }) => {
+    // Regression (round 2B verification): it said "File not found".
+    const loop = join(tmp, "loop");
+    await symlink("loop", loop);
+    const other = await fileWith(tmp, "other.txt", "x");
+    for (const paths of [[loop], [other.path, loop]]) {
+      const err = await planUpload(paths).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(SelectionError);
+      expect(String(err)).toMatch(
+        /: .*loop is a symbolic link loop \(following it leads back to itself\)\./,
+      );
+      expect(String(err)).not.toMatch(/not found/);
+    }
+    // A link to a file that does not exist is still "not found".
+    await symlink(join(tmp, "gone"), join(tmp, "dangling"));
+    await expect(planUpload([join(tmp, "dangling")])).rejects.toThrow(/File not found: .*dangling/);
+  });
+
+  test("a file deleted while its folder is read: a selection error, not a raw ENOENT", async ({
+    tmp,
+  }) => {
+    // Regression (round 2B verification): the lstat() after readdir() threw
+    // ENOENT unwrapped. The race is forced by deleting the file right after
+    // readdir() lists the folder.
+    const root = join(tmp, "racy");
+    await mkdir(root);
+    await writeFile(join(root, "a.txt"), "a");
+    await writeFile(join(root, "b.txt"), "b");
+    const fsp = (await import("node:fs/promises")).default as unknown as Record<
+      string,
+      (...args: unknown[]) => Promise<unknown>
+    >;
+    const { syncBuiltinESMExports } = await import("node:module");
+    const realReaddir = fsp.readdir!;
+    fsp.readdir = async (...args: unknown[]) => {
+      const names = await realReaddir(...args);
+      if (args[0] === root) await fsp.rm!(join(root, "b.txt"));
+      return names;
+    };
+    syncBuiltinESMExports();
+    try {
+      const err = await planUpload([root]).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(SelectionError);
+      expect(String(err)).toContain(
+        `Cannot read ${root}/b.txt: it was removed or renamed while yeet read the folder. Try again.`,
+      );
+    } finally {
+      fsp.readdir = realReaddir;
+      syncBuiltinESMExports();
+    }
   });
 
   test("several paths: yeet-<timestamp>.zip, files at the top level, folders as entries", async ({
@@ -196,88 +268,6 @@ test.describe("yeet upload: what gets zipped", () => {
 // ---------------------------------------------------------------------------
 // 2. Against a stand-in server
 // ---------------------------------------------------------------------------
-
-interface Recorded {
-  method: string;
-  path: string;
-  body: Buffer;
-  json?: Record<string, unknown>;
-  /** When the whole request had arrived, and when it was answered (performance.now()). */
-  receivedAt: number;
-  answeredAt?: number;
-}
-
-/**
- * A stand-in yeet server with a tiny part size. `onRequest` may act on a
- * request (change a file, hold the answer) and return a status to send
- * instead of the normal answer.
- */
-async function standIn(
-  partSize: number,
-  onRequest?: (
-    r: Recorded,
-  ) => Promise<number | "hold" | undefined | void> | number | "hold" | undefined | void,
-) {
-  const requests: Recorded[] = [];
-  const srv = createServer((req: IncomingMessage, res: ServerResponse) => {
-    const chunks: Buffer[] = [];
-    req.on("data", (c: Buffer) => chunks.push(c));
-    req.on("error", () => {});
-    req.on("end", async () => {
-      const path = new URL(req.url!, "http://x").pathname;
-      const body = Buffer.concat(chunks);
-      const r: Recorded = { method: req.method!, path, body, receivedAt: performance.now() };
-      if (req.headers["content-type"] === "application/json" && body.length)
-        r.json = JSON.parse(body.toString());
-      requests.push(r);
-      const override = await onRequest?.(r);
-      if (override === "hold") return;
-      const part = path.match(/\/parts\/(\d+)$/);
-      const status =
-        typeof override === "number"
-          ? override
-          : req.method === "POST" && path === "/api/uploads"
-            ? 201
-            : 200;
-      const reply =
-        status >= 400
-          ? { error: "stand-in error" }
-          : req.method === "POST" && path === "/api/uploads"
-            ? { id: "up1", part_size: partSize }
-            : part
-              ? { part_number: Number(part[1]), etag: `e${part[1]}` }
-              : path.endsWith("/complete")
-                ? { url: "http://127.0.0.1/up1/stand-in.zip" }
-                : { deleted: "up1" };
-      res.writeHead(status, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(reply));
-      r.answeredAt = performance.now();
-    });
-  });
-  await new Promise<void>((resolve) => srv.listen(0, "127.0.0.1", resolve));
-  const url = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
-  return {
-    url,
-    requests,
-    env: { YEET_URL: url, YEET_TOKEN: "a-token-of-16-chars-or-more" },
-    puts: () => requests.filter((r) => r.method === "PUT"),
-    create: () => requests.find((r) => r.method === "POST" && r.path === "/api/uploads"),
-    completes: () => requests.filter((r) => r.path.endsWith("/complete")),
-    deletes: () => requests.filter((r) => r.method === "DELETE"),
-    /** The parts in order, concatenated: the zip as the server would store it. */
-    zip: () =>
-      Buffer.concat(
-        requests
-          .filter((r) => r.method === "PUT")
-          .sort((a, b) => Number(a.path.split("/").pop()) - Number(b.path.split("/").pop()))
-          .map((r) => r.body),
-      ),
-    close: async () => {
-      srv.closeAllConnections();
-      await new Promise((resolve) => srv.close(resolve));
-    },
-  };
-}
 
 /** A folder `<tmp>/album` with a mix of compressible, incompressible and stored files. */
 async function album(tmp: string) {
@@ -457,34 +447,30 @@ test.describe("yeet upload <folder>: the upload (stand-in server)", () => {
     }
   });
 
-  test("a zip of unknown size past 150 parts: stopped before part 151, deleted", async ({
+  test("the guard: a zip of unknown size that outgrows its estimate stops before part 151", async ({
     tmp,
   }) => {
-    // 20 KB of noise deflates to about 20 KB: about 200 parts of 100 bytes.
+    // The bound (zipSizeBound()) is a worst case, so this cannot happen in
+    // normal use; YEET_TEST_ZIP_SIZE_BOUND=0 makes the CLI stream a zip of
+    // about 200 parts of 100 bytes (20 KB of noise) as if it fitted in 150.
     const root = join(tmp, "big");
     await mkdir(root);
     await randomFile(root, 20 * KiB, "noise.bin");
     const s = await standIn(100);
     try {
-      const r = await cli(["upload", root], { env: s.env, timeoutMs: 120_000 });
-      expectAborted(s, r, /The zip would be larger than 15\.0 KB \(150 parts of 100 B\).*--store/);
+      const r = await cli(["upload", root], {
+        env: { ...s.env, YEET_TEST_ZIP_SIZE_BOUND: "0" },
+        timeoutMs: 120_000,
+      });
+      expectAborted(
+        s,
+        r,
+        /The zip grew past 15\.0 KB \(150 parts of 100 B\).*a bug in yeet.*--store/,
+      );
+      expect(s.creates()).toHaveLength(1);
+      expect(s.create()!.json).not.toHaveProperty("size");
       const numbers = s.puts().map((p) => Number(p.path.split("/").pop()));
-      expect(Math.max(...numbers)).toBeLessThanOrEqual(CLI_MAX_UNSIZED_PARTS);
-    } finally {
-      await s.close();
-    }
-  });
-
-  test("stored files alone over the limit: refused before any part is sent", async ({ tmp }) => {
-    const root = join(tmp, "photos");
-    await mkdir(root);
-    await randomFile(root, 20 * KiB, "IMG_0001.JPG"); // stored by its extension
-    await fileWith(root, "notes.txt", "deflated");
-    const s = await standIn(100);
-    try {
-      const r = await cli(["upload", root], { env: s.env });
-      expectAborted(s, r, /The zip would be larger than/);
-      expect(s.puts()).toEqual([]);
+      expect(Math.max(...numbers)).toBe(CLI_MAX_UNSIZED_PARTS);
     } finally {
       await s.close();
     }
@@ -561,6 +547,47 @@ test.describe("yeet upload <folder>: the upload (stand-in server)", () => {
       deletedAfterParts(s);
       // No part was started after Ctrl-C.
       expect(s.puts().length).toBeLessThanOrEqual(3);
+    } finally {
+      await s.close();
+    }
+  });
+
+  test("Ctrl-C after another failure quits at once (no wait for the parts in flight)", async ({
+    tmp,
+  }) => {
+    // Regression (round 2B verification): once a part had failed, Ctrl-C was
+    // ignored while the CLI waited up to 30 s for the parts still in flight,
+    // because only a second *Ctrl-C* quit at once. Part 1 fails (400, not
+    // retried), parts 2 and 3 are never answered.
+    const { root } = await album(tmp);
+    const s = await standIn(1000, async (r) => {
+      if (r.path.endsWith("/parts/1")) {
+        await sleep(300);
+        return 400;
+      }
+      if (r.method === "PUT") return "hold";
+    });
+    const home = await newConfigHome();
+    try {
+      const child = spawnCli([server.cliPath, "upload", root], {
+        env: { ...process.env, ...s.env, HOME: home, XDG_CONFIG_HOME: home, NO_COLOR: "1" },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stderr = "";
+      child.stderr!.setEncoding("utf-8").on("data", (c: string) => (stderr += c));
+      const closed = new Promise<number | null>((resolve) => child.on("close", resolve));
+      await eventually(
+        () => s.puts().find((p) => p.path.endsWith("/parts/1"))?.answeredAt !== undefined,
+        { message: "part 1 answered with 400" },
+      );
+      await sleep(200);
+      expect(s.puts().filter((p) => p.answeredAt === undefined).length).toBe(2);
+      const sentAt = performance.now();
+      child.kill("SIGINT");
+      const code = await Promise.race([closed, sleep(5000).then(() => "still running")]);
+      expect(code, `${stderr}\n(exit ${performance.now() - sentAt} ms after Ctrl-C)`).toBe(130);
+      expect(performance.now() - sentAt).toBeLessThan(2000);
+      expect(s.completes()).toEqual([]);
     } finally {
       await s.close();
     }
