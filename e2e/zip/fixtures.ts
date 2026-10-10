@@ -1,8 +1,8 @@
-// Deterministic test content, isomorphic (Node, workerd, browsers).
+// Deterministic zip test content, isomorphic (Node, workerd, browsers).
 // The same fixture set is zipped in every runtime; Node recomputes the
 // expected SHA-256 of each entry independently and compares after extraction.
 
-import type { ZipEntry } from "./zip.ts";
+import type { ZipEntry } from "../../packages/cli/src/zip.js";
 
 const CHUNK = 64 * 1024;
 
@@ -77,7 +77,7 @@ export function wavFill(totalSize: number, seed = 7): (chunk: Uint8Array, offset
     for (let i = 0; i < chunk.length; i++) {
       const pos = offset + i;
       if (pos < 44) {
-        chunk[i] = header[pos];
+        chunk[i] = header[pos]!;
         continue;
       }
       // One 16-bit little-endian sample per 2 bytes; compute on the low byte.

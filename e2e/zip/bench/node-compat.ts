@@ -1,16 +1,20 @@
 // Run the zip module under older Node versions. Pass paths to node binaries:
-//   node scripts/node-compat.ts /path/to/node-v20.11.1/bin/node ...
+//   node e2e/zip/bench/node-compat.ts /path/to/node-v20.11.1/bin/node ...
 // Each binary runs a bundled node-compat-runner; its zips are validated here.
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import * as esbuild from "esbuild";
+import { createRequire } from "node:module";
 import { fixtureEntries } from "../fixtures.ts";
-import { manifestOf, printResults, validateZip } from "./validate.ts";
+import { manifestOf, printResults, validateZip } from "../validate.ts";
 
 const here = new URL(".", import.meta.url).pathname;
+// esbuild from packages/worker (installed by `npm run verify`).
+const esbuild = createRequire(new URL("../../../packages/worker/package.json", import.meta.url))(
+  "esbuild",
+) as typeof import("esbuild");
 const dir = await mkdtemp(join(tmpdir(), "yeet-zip-compat-"));
 try {
   const runner = join(dir, "runner.mjs");
@@ -33,7 +37,7 @@ try {
     for (const [label, path] of [
       ["default (CompressionStream)", a],
       ["zlib injected", b],
-    ]) {
+    ] as const) {
       if (!existsSync(path)) continue;
       const results = await validateZip(path, manifest, {
         readers: ["unzip -t", "python zipfile", "ditto -x -k", "7za t"],

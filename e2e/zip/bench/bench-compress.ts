@@ -6,7 +6,7 @@
 //   random     64 MiB xorshift noise
 //   synth-wav  64 MiB synthetic 16-bit stereo WAV, ~50% digital silence
 //   stems      the real stems folder (read-only), if present
-// Usage: node scripts/bench-compress.ts [runs=3] [--e2e]   (--e2e: only the end-to-end stems section)
+// Usage: node e2e/zip/bench/bench-compress.ts [runs=3] [--e2e]   (--e2e: only the end-to-end stems section)
 import { createReadStream } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import os from "node:os";
@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { Duplex, Readable } from "node:stream";
 import zlib from "node:zlib";
 import { generatedStream, noise, wavFill } from "../fixtures.ts";
-import { createZip, crc32Js, type ByteTransform } from "../zip.ts";
+import { createZip, crc32Js, type ByteTransform } from "../../../packages/cli/src/zip.ts";
 
 const RUNS = Number(process.argv.slice(2).find((a) => /^\d+$/.test(a)) ?? 3);
 const E2E_ONLY = process.argv.includes("--e2e");
@@ -93,11 +93,11 @@ async function inputs(): Promise<Input[]> {
 
 function median(xs: number[]): number {
   const s = [...xs].sort((a, b) => a - b);
-  return s[Math.floor(s.length / 2)];
+  return s[Math.floor(s.length / 2)]!;
 }
 
 console.log(
-  `${process.version}, ${os.cpus()[0].model}, ${os.cpus().length} cores, zlib ${process.versions.zlib}; median of ${RUNS} runs; MB = 1e6 bytes of input`,
+  `${process.version}, ${os.cpus()[0]!.model}, ${os.cpus().length} cores, zlib ${process.versions.zlib}; median of ${RUNS} runs; MB = 1e6 bytes of input`,
 );
 for (const input of E2E_ONLY ? [] : await inputs()) {
   console.log(`\n## ${input.label}`);
@@ -181,7 +181,7 @@ try {
     ["defaults (CompressionStream, crc32Js)", {}],
     [
       "zlib level 1 + zlib.crc32 (CLI proposal)",
-      { deflateRaw: compressors[1][1], crc32: nativeCrc },
+      { deflateRaw: compressors[1]![1], crc32: nativeCrc },
     ],
     ["store + zlib.crc32 (--store)", { compress: false, crc32: nativeCrc }],
   ];

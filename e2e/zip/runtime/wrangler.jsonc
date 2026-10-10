@@ -1,0 +1,7 @@
+// Throwaway Worker for the zip cross-runtime test (tests/node/zip-runtime.spec.ts).
+// Local only. Deliberately no nodejs_compat: zip.ts must run on plain workerd.
+{
+  "name": "yeet-zip-runtime-test",
+  "main": "worker.ts",
+  "compatibility_date": "2026-09-01",
+}

@@ -1,34 +1,44 @@
-// Validate a zip with every reader available on this Mac and compare the
+// Validate a zip with the readers available on this Mac and compare the
 // extracted contents against an expected manifest (path -> sha256).
 //
 // Readers: Info-ZIP unzip (test + extract), Python zipfile (testzip + read),
-// ditto -x -k (Apple's Bom-based extractor, same engine family as Archive
-// Utility), bsdtar (libarchive; streaming reader that walks local headers and
-// data descriptors), 7-Zip (7za 16.02 from the 7zip-bin npm package), and
-// "structural": the verifier's strict parser scripts/check.py.
-// A wrong mtime after extraction is a failure.
+// ditto -x -k (Apple's Bom-based extractor; NOT a stand-in for Archive
+// Utility past 4 GiB, see docs/design/zip.md), bsdtar (libarchive, also as a
+// pure streaming reader from stdin), 7-Zip (7za 16.02 from the 7zip-bin npm
+// package) and "structural": the independent verifier's strict parser
+// check.py (kept verbatim). A wrong mtime after extraction is a failure.
 
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants, createReadStream } from "node:fs";
 import { access, mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import type { ZipEntry } from "../zip.ts";
+import type { ZipEntry } from "../../packages/cli/src/zip.js";
 
 const run = promisify(execFile);
-const here = new URL(".", import.meta.url).pathname;
-const SEVEN_ZIP = join(here, "../node_modules/7zip-bin/mac/arm64/7za");
-const CHECK_PY = join(here, "check.py");
+export const CHECK_PY = fileURLToPath(new URL("check.py", import.meta.url));
 
-/** The 7zip-bin binary ships without the exec bit when npm install scripts are blocked. */
-async function assertSevenZip(): Promise<void> {
+/** Path of the 7za binary of the 7zip-bin package (a dev dependency of e2e/). */
+export function sevenZipPath(): string {
+  const require = createRequire(import.meta.url);
+  return (require("7zip-bin") as { path7za: string }).path7za;
+}
+
+/**
+ * The 7zip-bin binary ships without the exec bit when npm install scripts are
+ * blocked (npm 12's default). Fail with the fix instead of a cryptic EACCES.
+ */
+export async function assertSevenZip(path = sevenZipPath()): Promise<string> {
   try {
-    await access(SEVEN_ZIP, constants.X_OK);
+    await access(path, constants.X_OK);
   } catch {
-    throw new Error(`${SEVEN_ZIP} is missing or not executable; run: chmod +x "${SEVEN_ZIP}"`);
+    throw new Error(`${path} is missing or not executable; run: chmod +x "${path}"`);
   }
+  return path;
 }
 
 export type Manifest = Map<string, { sha256: string; size: number } | "dir"> & {
@@ -41,14 +51,17 @@ export interface ReaderResult {
   detail: string;
 }
 
-/** Compute the expected manifest by reading each entry's stream once. */
-export async function manifestOf(entries: Iterable<ZipEntry>): Promise<Manifest> {
+/** Compute the expected manifest by reading each entry's stream once (independently of zip.ts). */
+export async function manifestOf(
+  entries: Iterable<ZipEntry> | AsyncIterable<ZipEntry>,
+): Promise<Manifest> {
   const manifest: Manifest = new Map();
   manifest.meta = new Map();
-  for (const e of entries) {
-    manifest.meta.set(e.path, { sizeKnown: e.size !== undefined, mtime: e.lastModified });
-    if (e.path.endsWith("/")) {
-      manifest.set(e.path, "dir");
+  for await (const e of entries) {
+    const path = e.path.normalize("NFC");
+    manifest.meta.set(path, { sizeKnown: e.size !== undefined, mtime: e.lastModified });
+    if (path.endsWith("/")) {
+      manifest.set(path, "dir");
       continue;
     }
     const hash = createHash("sha256");
@@ -57,14 +70,71 @@ export async function manifestOf(entries: Iterable<ZipEntry>): Promise<Manifest>
       hash.update(chunk);
       size += chunk.length;
     }
-    manifest.set(e.path, { sha256: hash.digest("hex"), size });
+    manifest.set(path, { sha256: hash.digest("hex"), size });
   }
   return manifest;
 }
 
+/** The manifest format check.py reads: {path: {sha256, size, sizeKnown, mtime}}, dirs {mtime}. */
+export function checkManifest(manifest: Manifest): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [path, value] of manifest) {
+    const meta = manifest.meta?.get(path);
+    out[path] =
+      value === "dir"
+        ? { mtime: meta?.mtime }
+        : { ...value, sizeKnown: meta?.sizeKnown ?? true, mtime: meta?.mtime };
+  }
+  return out;
+}
+
+export interface StructureResult {
+  ok: boolean;
+  /** check.py's output (one summary line, then up to 15 errors). */
+  output: string;
+}
+
+/**
+ * Run check.py on a zip, with a manifest (then it also checks SHA-256, the
+ * ZIP64 policy, UT and DOS times) or without. `tzMinutes`: the zone the DOS
+ * times were written in; default: the zone of the Python process, which
+ * `env.TZ` sets.
+ */
+export async function checkStructure(
+  zipPath: string,
+  manifest?: Manifest,
+  opts: { tzMinutes?: number; env?: Record<string, string> } = {},
+): Promise<StructureResult> {
+  const args = ["-I", CHECK_PY, zipPath];
+  let dir: string | undefined;
+  try {
+    if (manifest) {
+      dir = await mkdtemp(join(tmpdir(), "yeet-zip-check-"));
+      const manifestPath = join(dir, "manifest.json");
+      await writeFile(manifestPath, JSON.stringify(checkManifest(manifest)));
+      args.push(manifestPath);
+    }
+    if (opts.tzMinutes !== undefined) args.push("--tz-minutes", String(opts.tzMinutes));
+    try {
+      const { stdout } = await run("python3", args, {
+        maxBuffer: 64 * 1024 * 1024,
+        env: { ...process.env, ...opts.env },
+      });
+      return { ok: true, output: stdout.trim() };
+    } catch (error) {
+      const e = error as { stdout?: string; stderr?: string; message: string };
+      return { ok: false, output: `${e.stdout ?? ""}${e.stderr ?? ""}`.trim() || e.message };
+    }
+  } finally {
+    if (dir) await rm(dir, { recursive: true, force: true });
+  }
+}
+
 async function sha256File(path: string): Promise<string> {
   const hash = createHash("sha256");
-  for await (const chunk of createReadStream(path, { highWaterMark: 1 << 20 })) hash.update(chunk);
+  for await (const chunk of createReadStream(path, { highWaterMark: 1 << 20 })) {
+    hash.update(chunk as Buffer);
+  }
   return hash.digest("hex");
 }
 
@@ -100,8 +170,9 @@ export async function compareDir(
     const st = await stat(file);
     if (st.size !== want.size) problems.push(`size ${path}: ${st.size} != ${want.size}`);
     else if ((await sha256File(file)) !== want.sha256) problems.push(`sha256 mismatch ${path}`);
-    if (mtime !== undefined && Math.abs(st.mtimeMs - mtime) > 2000) {
-      skew.push(`${path}: ${((st.mtimeMs - mtime) / 3_600_000).toFixed(2)} h`);
+    const expected = mtime ?? manifest.meta?.get(path)?.mtime;
+    if (expected !== undefined && Math.abs(st.mtimeMs - expected) > 2000) {
+      skew.push(`${path}: ${((st.mtimeMs - expected) / 3_600_000).toFixed(2)} h`);
     }
   }
   // Intermediate directories are created implicitly; only report unexpected files.
@@ -121,14 +192,28 @@ async function attempt(fn: () => Promise<string>): Promise<ReaderResult> {
   }
 }
 
+export const ALL_READERS = [
+  "unzip -t",
+  "unzip -x",
+  "python zipfile",
+  "ditto -x -k",
+  "bsdtar",
+  "bsdtar (stdin)",
+  "7za t",
+  "7za x",
+  "structural",
+] as const;
+
 export interface ValidateOptions {
-  /** Expected mtime for extracted files (ms); checked for extractors that set it. */
+  /** Expected mtime for extracted files (ms); default: each entry's own mtime from the manifest. */
   mtime?: number;
-  /** Skip extraction-based checks (for huge archives, compare via streaming hash instead). */
+  /** Skip extraction-based checks. */
   extract?: boolean;
-  readers?: string[];
+  readers?: readonly string[];
   /** Zone (minutes east of UTC) the DOS times were written in; default: this machine's. */
   tzMinutes?: number;
+  /** Environment for the readers (e.g. TZ). */
+  env?: Record<string, string>;
 }
 
 const PY_CHECK = `
@@ -161,12 +246,12 @@ export async function validateZip(
   const want = (name: string) => !opts.readers || opts.readers.includes(name);
   const work = await mkdtemp(join(tmpdir(), "yeet-zip-validate-"));
   const results: Record<string, ReaderResult> = {};
-  const big = { maxBuffer: 64 * 1024 * 1024 };
+  const big = { maxBuffer: 64 * 1024 * 1024, env: { ...process.env, ...opts.env } };
   const checkDir = async (dir: string) => {
     const { problems, skew } = await compareDir(dir, manifest, opts.mtime);
     if (skew.length) problems.push(`MTIME SKEW on ${skew.length} files (e.g. ${skew[0]})`);
     if (problems.length) throw new Error(problems.slice(0, 5).join("; "));
-    return `${manifest.size} entries match${opts.mtime ? ", mtimes ok" : ""}`;
+    return `${manifest.size} entries match, mtimes ok`;
   };
   try {
     if (want("unzip -t")) {
@@ -186,9 +271,8 @@ export async function validateZip(
     if (want("python zipfile")) {
       results["python zipfile"] = await attempt(async () => {
         const manifestPath = join(work, "manifest.json");
-        const obj = Object.fromEntries([...manifest].map(([k, v]) => [k, v]));
-        await writeFile(manifestPath, JSON.stringify(obj));
-        const { stdout } = await run("python3", ["-c", PY_CHECK, zipPath, manifestPath], big);
+        await writeFile(manifestPath, JSON.stringify(Object.fromEntries(manifest)));
+        const { stdout } = await run("python3", ["-I", "-c", PY_CHECK, zipPath, manifestPath], big);
         return stdout.trim();
       });
     }
@@ -219,8 +303,8 @@ export async function validateZip(
     }
     if (want("7za t")) {
       results["7za t"] = await attempt(async () => {
-        await assertSevenZip();
-        const { stdout } = await run(SEVEN_ZIP, ["t", zipPath], big);
+        const sevenZip = await assertSevenZip();
+        const { stdout } = await run(sevenZip, ["t", zipPath], big);
         if (!/Everything is Ok/.test(stdout)) throw new Error(stdout.slice(-300));
         const warn = /Warnings?:\s*\d+/.exec(stdout);
         return "Everything is Ok" + (warn ? ` (${warn[0]})` : "");
@@ -228,28 +312,20 @@ export async function validateZip(
     }
     if (extract && want("7za x")) {
       results["7za x"] = await attempt(async () => {
-        await assertSevenZip();
+        const sevenZip = await assertSevenZip();
         const dir = join(work, "7za");
-        await run(SEVEN_ZIP, ["x", "-y", `-o${dir}`, zipPath], big);
+        await run(sevenZip, ["x", "-y", `-o${dir}`, zipPath], big);
         return checkDir(dir);
       });
     }
     if (want("structural")) {
       results["structural"] = await attempt(async () => {
-        const checkManifest: Record<string, unknown> = {};
-        for (const [path, value] of manifest) {
-          const meta = manifest.meta?.get(path);
-          checkManifest[path] =
-            value === "dir"
-              ? { mtime: meta?.mtime }
-              : { ...value, sizeKnown: meta?.sizeKnown ?? true, mtime: meta?.mtime };
-        }
-        const manifestPath = join(work, "check-manifest.json");
-        await writeFile(manifestPath, JSON.stringify(checkManifest));
-        const args = [CHECK_PY, zipPath, manifestPath];
-        if (opts.tzMinutes !== undefined) args.push("--tz-minutes", String(opts.tzMinutes));
-        const { stdout } = await run("python3", args, big);
-        return stdout.trim().split("\n").join(" | ");
+        const r = await checkStructure(zipPath, manifest, {
+          tzMinutes: opts.tzMinutes,
+          env: opts.env,
+        });
+        if (!r.ok) throw new Error(r.output);
+        return r.output.split("\n").join(" | ");
       });
     }
   } finally {
@@ -262,7 +338,7 @@ export async function validateZip(
 export function printResults(
   label: string,
   results: Record<string, ReaderResult>,
-  expectFail: string[] = [],
+  expectFail: readonly string[] = [],
 ): boolean {
   let all = true;
   console.log(`\n## ${label}`);
@@ -273,4 +349,11 @@ export function printResults(
     console.log(`  ${status.padEnd(5)} ${reader.padEnd(16)} ${r.detail}`);
   }
   return all;
+}
+
+/** Failed readers as "reader: detail" lines (empty when all passed), for assertion messages. */
+export function failures(results: Record<string, ReaderResult>): string[] {
+  return Object.entries(results)
+    .filter(([, r]) => !r.ok)
+    .map(([reader, r]) => `${reader}: ${r.detail}`);
 }
