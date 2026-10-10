@@ -1096,6 +1096,50 @@ same kind of deploy and in the same way, against the estimates above
   `r2-capacity.spec.ts` check that this file states their values and the
   numbers derived from them.
 
+The maintainer decided to take this measurement together with the routes
+phase 2 adds, not as a separate run.
+
+### Known limitations (accepted)
+
+Found by the independent verifiers of rounds 1H–1L and left as they are:
+none affects the CLI or the upload page in normal use, and fixing them
+would cost more than they do.
+
+- **A `complete` that lands after a `DELETE` can bring the upload back.**
+  `complete` writes the finished sidecar unconditionally (`writeMeta()`
+  without `etagMatches`, after `multipart.complete()`). If a `DELETE`
+  aborts after R2 completed the multipart upload and writes its marker
+  before that write, the marker is overwritten: with more than
+  `DELETE_LIMIT` objects (an upload of unknown size with about 100 to 150
+  part records) the file is still there and the upload is back whole.
+  With fewer, the `DELETE` deletes everything, the file included, and the
+  write leaves a sidecar without its file: listed, its download a `404`.
+  Either way it takes a concurrent `DELETE` in that short window, and the
+  next `DELETE` removes it. The first case also needs an upload of
+  unknown size, which the CLI and the upload page never make: they always
+  send the size.
+- **A late part record can be left behind.** A part `PUT` whose
+  `uploadPart()` succeeded before a `DELETE` aborted the multipart upload
+  writes its empty `.parts/<n>` record (`writePartSize()`, uploads of
+  unknown size only) afterwards, possibly after the `DELETE` finished. It
+  has no sidecar, and the cron does not treat it as stray (`stray` is only
+  legacy `.downloads/` records), so it is never removed. An empty object,
+  invisible to users.
+- **A hand-edited `expires_at` that is not a date never expires.**
+  `parseUploadMeta()` only checks that it is a string, and `isExpired()`
+  is false for an invalid date (`NaN <= now`), so the cron keeps it and
+  the download page serves it. No yeet version writes such a value.
+- **A sidecar whose read fails every time can stall the listing at that
+  upload.** Only on the path where a page ended inside an upload's
+  `.downloads/` or `.parts/` run before reaching its sidecar and `listAll()`
+  reads the sidecar to return it: if that read throws, nothing is
+  returned and the next page starts at the same place, so nothing is
+  skipped and `yeet list` stops at `MAX_LIST_PAGES` with its "only part of
+  your uploads is shown" note. A sidecar that is read but is not valid
+  JSON, or one read on the usual path, does not stall it (left out of the
+  page instead). Needs an object R2 never serves; not seen in any
+  measurement.
+
 ### Migrating a bucket of yeet < 0.2 (one-time)
 
 `packages/worker/scripts/backfill-summaries.mjs` gives every sidecar
