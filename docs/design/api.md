@@ -537,7 +537,12 @@ Numbers that are signed or used as keys must be spelled one way only:
     multipart upload after `complete` read the sidecar. `404 {"error": "No
 upload in progress: it was deleted"}`, as when the `DELETE` lands after
     R2's complete (before, a misleading `400`).
-  - **The sidecar is a finished one:** `200` with its link.
+  - **The sidecar is a finished one, but there is no file:** the same
+    `404` (round 2D; until then `200` with its link). A `complete` that
+    won would have left its file, so this is a `DELETE` that has deleted
+    the file and not yet the sidecar (it deletes the sidecar last), and
+    the link would be dead. A genuine second `complete` finds the file
+    (the case above) and still gets `200`.
   - Otherwise the `400` above.
 
   What real R2 does with a second `complete` of one multipart upload
