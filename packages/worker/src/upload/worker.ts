@@ -81,6 +81,12 @@ class Upload {
   /** Set once the upload failed or was cancelled: nothing new may start. */
   private stopped = false;
   private finished = false;
+  /**
+   * Set once `complete` is sent: from then on the upload may be finished on
+   * the server whatever this worker hears back, so it is never deleted
+   * (a cancel is ignored, a failure leaves it to the hourly cleanup).
+   */
+  private completing = false;
   private parallel = PARALLEL;
   private readonly controller = new AbortController();
   private readonly requests = new Set<XMLHttpRequest>();
@@ -136,6 +142,7 @@ class Upload {
       if (parts.length !== count) throw new UploadError("server", "Not every part was sent");
       parts.sort((a, b) => a.part_number - b.part_number);
 
+      this.completing = true;
       post({ type: "finishing" });
       const completed = await this.withRetries(0, () =>
         this.json("POST", `/api/uploads/${id}/complete`, { parts, size }),
@@ -151,7 +158,7 @@ class Upload {
       this.abortAll();
       const error =
         err instanceof UploadError ? err : new UploadError("server", (err as Error)?.message ?? "");
-      await this.deleteOnServer();
+      if (!this.completing) await this.deleteOnServer();
       post({
         type: "failed",
         kind: error.kind as FailureKind,
@@ -163,7 +170,8 @@ class Upload {
 
   /** Stop: abort what is in flight, delete the upload on the server, report. */
   async cancel(): Promise<void> {
-    if (this.stopped || this.finished) return;
+    // Too late once complete is sent: the upload goes on and reports "done".
+    if (this.stopped || this.finished || this.completing) return;
     this.stopped = true;
     this.abortAll();
     await this.deleteOnServer();

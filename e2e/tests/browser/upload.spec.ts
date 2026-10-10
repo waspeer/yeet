@@ -264,6 +264,57 @@ test.describe("upload page", () => {
     },
   );
 
+  // Once `complete` is sent the upload may already be finished on the
+  // server: a cleanup DELETE then would destroy it (round 2C).
+  test("once complete is sent, neither Cancel nor leaving the page deletes the upload", async ({
+    page,
+    context,
+    tmp,
+  }) => {
+    const file = await randomFile(tmp, 10 * KiB, "completing.bin");
+    await logIn(page);
+    const deletes: string[] = [];
+    context.on("request", (request) => {
+      if (request.method() === "DELETE") deletes.push(request.url());
+    });
+    const held: Route[] = [];
+    await page.route("**/api/uploads/*/complete", (route) => void held.push(route));
+    const created = createdId(page);
+    await choose(page, "input", file.path);
+    const id = await created;
+    await eventually(() => held.length > 0, { message: "the complete request" });
+
+    await expect(page.locator("#up-note")).toHaveText("Finishing…");
+    await expect.soft(page.getByRole("button", { name: "Cancel" })).toBeHidden({ timeout: 2000 });
+    page.once("dialog", (dialog) => void dialog.accept());
+    await page.goto("/");
+    await sleep(1500);
+    expect.soft(deletes).toEqual([]);
+    expect(await serverLog()).not.toContain(`DELETE /api/uploads/${id}`);
+    // The complete never reached the server: clean up the pending upload.
+    expect((await deleteUpload(id)).status).toBe(200);
+  });
+
+  test("a complete whose answer is lost is sent again and still shows the link", async ({
+    page,
+    tmp,
+  }) => {
+    const file = await randomFile(tmp, 10 * KiB, "answer lost.bin");
+    await logIn(page);
+    let completes = 0;
+    await page.route("**/api/uploads/*/complete", async (route) => {
+      if (completes++ > 0) return route.fallback();
+      // The server completes the upload, but its answer never arrives.
+      const response = await route.fetch();
+      await response.body();
+      return route.abort("connectionreset");
+    });
+    await choose(page, "input", file.path);
+    const url = await shareLink(page);
+    expect(completes).toBe(2);
+    expect(await downloadSha256(url)).toEqual({ sha256: file.sha256, size: file.size });
+  });
+
   test("a part that fails once (network error) is sent again", async ({ page, tmp }) => {
     const file = await randomFile(tmp, 300 * KiB, "retry network.bin");
     await logIn(page);

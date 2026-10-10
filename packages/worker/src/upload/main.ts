@@ -38,11 +38,17 @@ const copyNote = el("copy-note");
 const errorMessage = el("error-message");
 const loginAgain = el("login-again");
 const retry = el<HTMLButtonElement>("retry");
+const cancelButton = el<HTMLButtonElement>("cancel");
 
 let state: State = "idle";
 let worker: Worker | null = null;
 let file: File | null = null;
 let uploadId: string | null = null;
+/**
+ * Set once the worker has sent `complete`: from then on the upload may be
+ * finished on the server, so neither Cancel nor leaving the page deletes it.
+ */
+let completing = false;
 let samples: { at: number; sent: number }[] = [];
 let wakeLock: WakeLockSentinel | null = null;
 
@@ -110,6 +116,8 @@ function start(chosen: File): void {
   if (state === "uploading") return;
   file = chosen;
   uploadId = null;
+  completing = false;
+  cancelButton.hidden = false;
   samples = [{ at: performance.now(), sent: 0 }];
   idleNote.textContent = "";
   upNote.textContent = "";
@@ -148,6 +156,8 @@ function onMessage(message: FromWorker): void {
       upNote.textContent = "The connection hiccupped. Trying again…";
       break;
     case "finishing":
+      completing = true;
+      cancelButton.hidden = true;
       renderProgress(file?.size ?? 0, file?.size ?? 0);
       upNote.textContent = "Finishing…";
       break;
@@ -235,9 +245,9 @@ function finish(): void {
   wakeLock = null;
 }
 
-el("cancel").addEventListener("click", () => {
+cancelButton.addEventListener("click", () => {
   const w = worker;
-  if (!w) return;
+  if (!w || completing) return;
   // The worker aborts its requests, deletes the upload and then reports
   // "cancelled", whereupon it is terminated (see start()).
   w.postMessage({ type: "cancel" } satisfies ToWorker);
@@ -268,7 +278,7 @@ window.addEventListener("beforeunload", (event) => {
   if (state === "uploading") event.preventDefault();
 });
 window.addEventListener("pagehide", () => {
-  if (state !== "uploading" || !worker) return;
+  if (state !== "uploading" || !worker || completing) return;
   const id = uploadId;
   worker.terminate();
   worker = null;
