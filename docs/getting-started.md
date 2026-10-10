@@ -61,13 +61,24 @@ your yeet and delete them, so treat it like a password.
    you change it, at most 1 year). If you want, type a **Password**: people
    then need it to download the file, so send it to them too (best not in
    the same message as the link).
-4. Drag a file onto the page, or click **Choose file** (on an iPhone: tap
-   **Choose file**).
+4. Drag a file, several files or a folder onto the page, or click
+   **Choose files** or **Choose folder** (on an iPhone: tap **Choose
+   files**; you can pick several files there). Several files or a folder
+   become one zip file: a folder is called `<folder name>.zip`, loose
+   files `yeet-<date>-<time>.zip`. If the selection is more than about
+   7.8 GB, the page first says it will upload it without compressing it,
+   and you choose **Upload anyway** or **Choose again**.
 5. Wait until the upload finishes. Keep the page open meanwhile; on a
    phone, keep the screen on. If the page says the browser lost access to
-   the file (this happens on an iPhone when the screen locks), click
-   **Choose the file again** and pick the same file: the upload continues
-   where it stopped.
+   the file (this happens on an iPhone when the screen locks or you
+   switch apps), click **Choose the file again** (for several files or a
+   folder: **Choose the files again**, **Choose the folder again**; on an
+   iPhone: tap it) and pick the same again. This works only while the
+   page still shows that message; if the browser has reloaded the page
+   in the meantime, start the upload again. A single file continues
+   where it stopped. Several files or a folder continue where they
+   stopped if they were uploaded uncompressed; a compressed zip starts
+   over from the beginning (the page tells you which).
 6. Click **Copy link**. The page shows how long the link works and whether
    it needs a password.
 7. Send the link to whoever needs the file. When the time is up, the file

@@ -92,10 +92,11 @@ about half the page memory of `Uint8Array` bodies in WebKit.
    Behaviour in a hidden tab or a backgrounded iOS page is untested.
 5. **iOS suspension.** A deflate stream cannot be resumed part-way. Decide
    between restarting (simplest), checkpointing at file boundaries, or store
-   mode (deterministic offsets).
+   mode (deterministic offsets). Decided in round 2C+2: a stored zip
+   continues, a compressed one restarts (see "Round 2C+2").
 6. **Zip details.** Use `File.lastModified` for entry times. Apply the filename
    policy from [zip.md](zip.md) (NFC, duplicates, Windows sanitising). Keep
-   folder paths from `webkitRelativePath`.
+   folder paths from `webkitRelativePath`. Done in round 2C+2.
 
 ### Seen on a real iPhone (Safari 26.6.1, prototype)
 
@@ -194,7 +195,113 @@ What the page now does, besides phase 1B (details in [api.md](api.md),
   cancel or `pagehide` during `complete` could destroy a finished
   upload), and the server's `complete` no longer undoes a concurrent
   `DELETE`.
-- **Zipping** (several files, folders) is a later round.
+- **Zipping** (several files, folders): round 2C+2, below.
+
+## Round 2C+2: several files or a folder, zipped while uploading
+
+What the page does now (details in [api.md](api.md), "Upload page
+module", and [zip.md](zip.md), "Callers"):
+
+- **Choosing:** **Choose files** takes several files, **Choose folder**
+  a folder (`webkitdirectory`; hidden on a touch screen, where the drop
+  hint is hidden too), and a drop takes either: folders are read with
+  `webkitGetAsEntry()` and `readEntries()` until it returns none. One
+  file (not in a folder) is uploaded as before, without a zip.
+- **What is zipped:** `src/upload/selection.ts` (`planSelection()`),
+  the CLI's rules: `<folder>.zip` with the folder as the single top
+  entry, or `yeet-<timestamp>.zip`; `.DS_Store` skipped; empty folders
+  kept (a drop reports them, the folder picker does not); NFC and
+  `sanitizeForWindows()` with a note; refused with a clear message:
+  nothing but `.DS_Store` and empty folders, or two names that would be
+  one in the zip, a file and a folder of the same name included. An e2e
+  test plans the same folder with this and the CLI and compares.
+- **Zipping** (item 6 above, done): in the upload's Web Worker with
+  `zip.ts`'s browser defaults, store or deflate per entry by extension
+  (empty files stored), 4 MiB `slice().arrayBuffer()` reads, entry
+  times from `File.lastModified` in the browser's zone, the output cut
+  into 50 MiB parts sent as Blobs, two in flight, the same retries,
+  backoff and progress ("File k of n" as the zip reaches each file). The
+  worker is terminated after every upload.
+- **Size and the 150-part limit:** every file stored → the exact size
+  (`storedZipSize()`) at create, no limit. Otherwise the size goes with
+  `complete`, which the server allows for 150 parts (7.86 GB), so the
+  page deflates only if an upper bound of the zip fits (each deflated
+  file at its size + 4 × zlib's stored-block overhead + 1 KiB, in the
+  stored layout, + 64 KiB: at most 0.13 % over the input). A larger
+  selection is stored completely, so its size is known again and there
+  is no limit; it can therefore never fail halfway on the limit. If some
+  of its files would have compressed, the page first shows a warning
+  (more than about 7.8 GB, so uploaded uncompressed; for a smaller
+  download zip it first, on a Mac right-click → Compress) with **Upload
+  anyway** and **Choose again**. Not when nothing would compress anyway.
+- **iOS suspension** (item 5 above, decided): a single file continues
+  (round 2C). A **stored zip** is deterministic, so choosing the same
+  files again (paths, sizes, dates as first chosen, the same empty
+  folders) continues it: the zip is made again from the start (the files
+  are read once more up to there, locally) and the parts the server
+  already has are not sent again. A **compressed zip** cannot continue
+  part-way: the page says choosing the files again starts the upload
+  over, and deletes the old upload when the new one starts. Nothing
+  deletes an upload once `complete` is sent.
+- **Lost-file detection for zips:** a zip part is in memory, so a lost
+  file shows first as a failed part (iOS: status 0); after each failed
+  attempt the worker reads one byte of the file it read last, and a
+  failed read while zipping stops the zip. Both end as "file", kept.
+- **`complete` again** (2C+ verifier, item b): sent again at the
+  earliest 5 s after an attempt whose answer was lost, because the first
+  may still run on the server; the server also copes with a second one
+  meanwhile ([api.md](api.md), "Errors R2 raises at `complete`"). What
+  real R2 does with a second complete is not measured.
+
+### Measured (Apple M5 Pro, macOS 26.6.2, local `wrangler dev`, Playwright 1.63)
+
+**Browser memory, 1 GiB folder** (`tests/measure/zip-memory.spec.ts`,
+opt-in, one run per engine and kind): RSS summed over every process
+below the Playwright worker plus every process run from the browser's
+install directory (WebKit's WebContent and Networking processes are
+XPC services, not children), sampled every 100 ms with `ps`, from just
+before the folder is chosen until 10 s after the link shows. 8 × 128
+MiB: "compressed" is 4 noise WAVs and 4 mostly silent WAVs (zip 563 MB),
+"stored" is 8 noise MP3s (zip 1,073,743,094 bytes).
+
+| Engine       | Kind       | Time  | Before   | Peak     | Growth    | 10 s after | Largest processes at the peak (MiB)   |
+| ------------ | ---------- | ----- | -------- | -------- | --------- | ---------- | ------------------------------------- |
+| Chromium 153 | compressed | 8.7 s | 489 MiB  | 818 MiB  | +329 MiB  | 677 MiB    | 392, 195, 184 (chrome-headless-shell) |
+| Chromium 153 | stored     | 7.1 s | 498 MiB  | 882 MiB  | +384 MiB  | 539 MiB    | 348, 299, 185                         |
+| WebKit 26.6  | compressed | 9.1 s | 591 MiB  | 2023 MiB | +1432 MiB | 1982 MiB   | WebContent 939, Networking 736        |
+| WebKit 26.6  | stored     | 6.7 s | 659 MiB  | 2671 MiB | +2012 MiB | 2568 MiB   | Networking 1352, WebContent 932       |
+| Firefox 155  | compressed | 6.9 s | 1135 MiB | 2397 MiB | +1263 MiB | 1573 MiB   | plugin-container 1151, firefox 903    |
+| Firefox 155  | stored     | 6.4 s | 1577 MiB | 2815 MiB | +1238 MiB | 1266 MiB   | plugin-container 1262, firefox 1211   |
+
+- **Chromium** stays bounded (+329 to +384 MiB for 0.56 and 1.07 GB of
+  zip), and comes back down after the upload.
+- **WebKit's Networking process grows with the zip** (736 MiB for 0.56
+  GB, 1352 MiB for 1.07 GB) and keeps it afterwards: the trap measured
+  in phase 0b (Playwright's WebKit keeps every in-memory upload body; not
+  Safari). Its WebContent process (the page and the worker) reached about
+  935 MiB in both runs, so it does not grow with the zip, but it is far
+  above the 278 MiB the 0b prototype measured in a WKWebView. Whether
+  that is Playwright's build, a garbage collector in no hurry, or the
+  page, is not known; **a real Safari / iPhone measurement is needed**.
+- **Firefox:** not usable for memory (Playwright's instrumentation, as in
+  0b); +1.24 to +1.26 GB for both sizes, released afterwards.
+- **Not measured:** the kernel's lifetime peak (`vmmap`), real Safari,
+  an iPhone, real uplinks. Throughput here is local (8 parts to
+  `wrangler dev`); the silent WAVs compress quickly, so these times are
+  not a deflate benchmark.
+
+**Tests** (`npm run verify`, all three engines; see the report of round
+2C+2 for the run): `tests/browser/upload-zip.spec.ts` (pickers and
+drops, the folder's and the timestamp zip, `.DS_Store`, an empty folder,
+FILENAMES names, nested folders, the stored path with the size at create,
+the compressed path with the size at complete across two parts and below
+its bound, the forced store and its warning with the limit lowered by the
+page's test hook, no warning when nothing would compress, an empty
+selection, collisions, Cancel with part records, no `DELETE` after
+`complete`, lost files for both kinds, the 5 s wait before `complete`
+again, the worker terminated), each zip checked with `check.py`, Python
+and `unzip -t` and per-entry SHA-256; `tests/node/upload-selection.spec.ts`
+(`planSelection()`); screenshots in `e2e/screenshots/2c2/<engine>/`.
 
 ## Untested
 
@@ -202,6 +309,12 @@ What the page now does, besides phase 1B (details in [api.md](api.md),
   below.
 - **Real internet uplinks** (parts in flight, backpressure, slow-link progress).
 - **Hidden or background tabs** on desktop.
+- **A real folder drop** (round 2C+2): the tests drop stand-ins for the
+  browser's `FileSystemEntry` objects around real files; a folder
+  dragged from Finder (or the Files app) into a real browser is a human
+  test. So is the folder picker on a phone (hidden there), picking
+  several files in the iPhone's picker, and the forced store with a real
+  8 GB selection (tested with the limit lowered to 1 part).
 
 ## iPhone test (human, about 20 min)
 

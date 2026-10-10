@@ -437,7 +437,9 @@ character path).
 - Real Safari (Playwright WebKit is not Safari) and mobile browsers.
 - **Production** Cloudflare Workers (only local `wrangler dev`); CPU limits there.
 - Browser zipping of large real files read from disk via `File.stream()`. Tested: in-memory
-  `File`s, plus stems served over localhost for the deflate benchmark only.
+  `File`s, plus stems served over localhost for the deflate benchmark only. (The upload page
+  reads with `slice().arrayBuffer()` instead; its zips of files on disk are tested in
+  Playwright's three engines, round 2C+2, `upload-zip.spec.ts`.)
 - Archive Utility on the two ">4 GiB" rows marked "not run". The Archive Utility GUI with
   error dialogs was only observed indirectly: on failure the script would see no output and
   kill the app, and no failures occurred.
@@ -572,8 +574,33 @@ above typical uplinks, so the defaults are fine there.
 - Progress: the CLI's usual line (stderr, TTY only), with the input bytes whose output has
   been uploaded as the count and "file k of n" after it.
 
-**Browser:** entries from `FileList` / drag-and-drop with `webkitRelativePath`, then defaults
-(round 2C, not part of this round).
+**Browser upload page (implemented, round 2C+2).** One file is uploaded as it is; several files
+or a folder become one zip (details in [browser-upload.md](browser-upload.md), "Round 2C+2"):
+
+- `packages/worker/src/upload/selection.ts` (`planSelection()`) follows the CLI's rules: the
+  same names (`<folder>.zip`, `yeet-<YYYYMMDD-HHMMSS>.zip`), `.DS_Store` skipped, empty folders
+  kept as directory entries (from a drop; the folder picker reports none), NFC and
+  `sanitizeForWindows()` with a note, a note for paths of 260+ characters, and collisions
+  refused with both names, **including a file and a folder that differ only in case** (`a` and
+  `A/…`, which `createZip` lets through, see Known limitations). An e2e test plans a folder on
+  disk with both and compares (`upload-selection.spec.ts`).
+- The files come from the file picker (`multiple`), the folder picker (`webkitdirectory`,
+  paths from `webkitRelativePath`) or a drop (`DataTransferItem.webkitGetAsEntry()`, folders
+  read with `createReader().readEntries()` until it returns none; a folder's date from
+  Chromium's `getMetadata()`, else the time it was chosen). Entry times are `File.lastModified`,
+  DOS times in the browser's zone.
+- `src/upload/worker.ts` zips in the upload's Web Worker with the defaults
+  (`CompressionStream("deflate-raw")`, `crc32Js`), store or deflate per entry as planned
+  (`compress` set on every entry: deflate unless the extension is in the store list or the
+  file is empty), reads each file in 4 MiB `slice().arrayBuffer()` chunks, cuts the output into
+  parts of exactly `part_size` sent as Blobs, two in flight, the zip paused while they are.
+- **Size:** at create when every entry is stored (`storedZipSize()`); otherwise at `complete`,
+  and then only if an upper bound of the zip (each deflated file at `deflateBound()`, 4 ×
+  zlib's stored-block overhead plus 1 KiB, in the stored layout, plus 64 KiB) fits 150 parts.
+  A larger selection is stored completely, so its size is known again (after a warning when
+  some files would have compressed). So a browser zip never stops at part 151; the CLI's still
+  can (see Known limitations).
+- `zip.ts` itself is unchanged.
 
 **Copies:** `zip.ts` lives byte-identical in `packages/cli/src/zip.ts` and
 `packages/worker/src/zip.ts`. `scripts/check-zip-copies.mjs` (`npm run check:zip-copies` at the
@@ -690,6 +717,9 @@ Also: "compression choice" (M28 inverted heuristic, M29 `--store` ignored) and "
   ([api.md](api.md)). The CLI stops before part 151 and says to use `--store` (size known up
   front, no limit) or smaller groups; it stops before the first part when the stored files
   alone are larger. A very large compressible folder therefore fails after uploading 7.86 GB.
+  The upload page does not have this limitation: it decides before the first part, from an
+  upper bound of the deflated size, and stores everything when that could exceed 150 parts
+  (round 2C+2, see Callers).
 - **`ditto` reads DOS times with the UTC offset in effect when it runs** (measured
   2026-10-10, in CEST, TZ=Europe/Amsterdam): entries from winter time came out 1 h early,
   whatever the zip says. So no zip extracts with correct mtimes in `ditto` on both sides of a
@@ -697,7 +727,7 @@ Also: "compression choice" (M28 inverted heuristic, M29 `--store` ignored) and "
   The tests that extract with `ditto` use an mtime of a minute ago for that reason.
 - **A file and a folder whose names differ only in case** (`a` and `A/…`) collide on
   extraction, but `createZip` compares whole paths only and lets them through. The CLI's
-  pre-flight check catches it; another caller would have to.
+  pre-flight check catches it, and so does the upload page's (`planSelection()`, round 2C+2).
 
 ## Risks and open questions
 
