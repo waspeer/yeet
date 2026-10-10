@@ -359,6 +359,14 @@ errors with `page.route()`. Exception: while any route is active, Playwright's
 WebKit cancels a `keepalive` fetch sent from `pagehide`, so the "leaving the
 page" test uses no route.
 
+Losing access to the picked file (as iOS does when the screen locks) is
+simulated by renaming the file away on disk while a part is held, then
+aborting that part (`tests/browser/upload-resume.spec.ts`): Playwright gives
+the page a `File` backed by the path in all three engines, so its reads then
+fail (WebKit and Chromium `NotFoundError`, Firefox `AbortError`).
+`tests/browser/screenshots.spec.ts` saves every page state at desktop and
+phone width to `e2e/screenshots/2c/<engine>/` (git-ignored) for review.
+
 ### Utilities — `util.ts`
 
 `eventually(check, { timeoutMs?, intervalMs?, message? })` polls until `check`

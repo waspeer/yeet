@@ -57,10 +57,21 @@ your yeet and delete them, so treat it like a password.
    followed by `/upload`). Bookmark it.
 2. Paste your upload token and click **Log in**. This browser stays logged in
    for 90 days.
-3. Drag a file onto the page, or click **Choose file**.
-4. Wait until the upload finishes, then click **Copy link**.
-5. Send the link to whoever needs the file. It works for 30 days, then the
-   file is deleted automatically.
+3. Choose how long the link works under **Link works for** (30 days unless
+   you change it, at most 1 year). If you want, type a **Password**: people
+   then need it to download the file, so send it to them too (best not in
+   the same message as the link).
+4. Drag a file onto the page, or click **Choose file** (on an iPhone: tap
+   **Choose file**).
+5. Wait until the upload finishes. Keep the page open meanwhile; on a
+   phone, keep the screen on. If the page says the browser lost access to
+   the file (this happens on an iPhone when the screen locks), click
+   **Choose the file again** and pick the same file: the upload continues
+   where it stopped.
+6. Click **Copy link**. The page shows how long the link works and whether
+   it needs a password.
+7. Send the link to whoever needs the file. When the time is up, the file
+   is deleted automatically.
 
 ## Changing your upload token
 

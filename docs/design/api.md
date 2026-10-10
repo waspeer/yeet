@@ -171,7 +171,8 @@ stays the same as today; the CLI and the tests depend on it.
     passed the check and failed with a 500 after `createMultipartUpload`,
     leaving a multipart upload no sidecar pointed to, which the cleanup never
     saw. The CLI refuses `--expires` (and `YEET_DEFAULT_EXPIRES`) above
-    `365d` itself; the upload page always asks for 30 days.
+    `365d` itself; the upload page offers 1, 7, 30 (the default), 90 days
+    and 1 year (365 days).
   - `part_size` stays 52,428,800 (50 MiB).
 - **`PUT /api/uploads/:id/parts/:n`**
   - **Required:** a `Content-Length` header (`411` without it).
@@ -470,6 +471,28 @@ Numbers that are signed or used as keys must be spelled one way only:
     wrong once a higher one exists. That would cost a bucket listing on every
     `PUT`.
 
+- **Completing an upload** (round 2C). `complete` reads the pending
+  sidecar with its etag (`readMetaVersion()`), and after R2's multipart
+  complete writes the finished sidecar **only over that version**
+  (`Uploads.finishUpload()`, `onlyIf: { etagMatches }`). If the write
+  fails, a `DELETE` ran in between (it deleted the sidecar, or marked it
+  as a deletion under way): the upload stays deleted, the file R2 just
+  made is deleted too (1 delete call; the `DELETE` may have listed the
+  upload before the file existed), and the answer is
+  `404 {"error": "No upload in progress: it was deleted"}`. If the
+  sidecar is by then a finished one (two `complete`s at once), that one
+  stands and the answer is the usual `200`. R2 calls: the same as before
+  when nothing interferes (the read and one put, now conditional); a
+  failed write adds a read and the delete. Tests:
+  `e2e/tests/node/complete-race.spec.ts` (step by step on the in-memory
+  bucket, with at most and more than `DELETE_LIMIT` objects, and both
+  requests at once on `wrangler dev`) and `verify-1l-units.spec.ts`.
+- **`complete` of a finished upload** (round 2C): `200` with the same
+  `{ id, url }` as the first, without touching anything (no R2 call
+  beyond the sidecar read). The upload page retries a `complete` whose
+  answer was lost (a network error, a `5xx`); before, the retry got
+  `404 "No upload in progress"` for an upload that had worked. A deleted
+  upload, or one being deleted, still gets the `404`.
 - **Errors R2 raises at `complete`** (e.g. a wrong etag): `400` with
   "Could not complete the upload; check that every part was uploaded and its
   etag is right (…)" instead of a 500.
@@ -571,7 +594,9 @@ request could list and delete about 10,000 objects.
 - **The upload page** deletes only uploads it created itself, with their
   size, so with no part records: 1 or 2 objects, always done in one
   request (the cancel and the `pagehide` `keepalive` request need no
-  loop).
+  loop). It never sends that `DELETE` once it has sent `complete`, nor
+  for an upload it keeps to continue after losing access to the file
+  (see "Upload page module").
 - **An older CLI** sends one `DELETE` and takes any `2xx` as success: it
   prints "Deleted" after a `202` too, and that is true for users (see
   above); the rest goes with the cron.
@@ -1117,20 +1142,27 @@ Found by the independent verifiers of rounds 1H–1L and left as they are:
 none affects the CLI or the upload page in normal use, and fixing them
 would cost more than they do.
 
-- **A `complete` that lands after a `DELETE` can bring the upload back.**
-  `complete` writes the finished sidecar unconditionally (`writeMeta()`
-  without `etagMatches`, after `multipart.complete()`). If a `DELETE`
-  aborts after R2 completed the multipart upload and writes its marker
-  before that write, the marker is overwritten: with more than
-  `DELETE_LIMIT` objects (an upload of unknown size with about 100 to 150
-  part records) the file is still there and the upload is back whole.
-  With fewer, the `DELETE` deletes everything, the file included, and the
-  write leaves a sidecar without its file: listed, its download a `404`.
-  Either way it takes a concurrent `DELETE` in that short window, and the
-  next `DELETE` removes it. The first case also needs an upload of
-  unknown size, which only the CLI's zip uploads make (round 2B), and they
-  never send `complete` and `DELETE` for the same upload: `complete` only
-  when every part succeeded, `DELETE` only instead of it.
+- **A `complete` racing a `DELETE` (fixed in round 2C, no longer a
+  limitation).** Until then `complete` wrote the finished sidecar
+  unconditionally after `multipart.complete()`, so a `DELETE` in between
+  was undone: with more than `DELETE_LIMIT` objects its marker was
+  overwritten and the upload was back whole; with fewer, everything was
+  deleted, the file included, and the write left a sidecar without its
+  file (listed, its download a `404`). Now the write is conditional on the
+  sidecar `complete` read (`onlyIf: { etagMatches }`,
+  `Uploads.finishUpload()`, see "Completing an upload" below), so the
+  `DELETE` wins either way: the sidecar stays deleted or stays the
+  deletion marker, the file R2 has just made is deleted as well, and
+  `complete` answers `404 {"error": "No upload in progress: it was deleted"}`.
+  What remains: a `DELETE` whose own sidecar read failed (it then skips
+  the multipart abort) and that lists the upload before R2 has created
+  the file could, if `complete`'s write lands before the `DELETE`'s
+  sidecar delete, leave the file without a sidecar. Not seen; it needs a
+  failed read and two requests in a window of a few milliseconds.
+  The upload page also never sends its cleanup `DELETE` once it has sent
+  `complete` (see "Upload page module"), and the CLI's zip upload sends
+  `complete` only when every part succeeded and `DELETE` only instead of
+  it (round 2B).
 - **A late part record can be left behind.** A part `PUT` whose
   `uploadPart()` succeeded before a `DELETE` aborted the multipart upload
   writes its empty `.parts/<n>` record (`writePartSize()`, uploads of
@@ -1270,7 +1302,49 @@ a normalized header. Following RFC 9110 §14:
 ### Upload page module
 
 - **Where:** `GET /upload` with a valid session returns `uploadPage()` from
-  `packages/worker/src/upload-page.ts`, a placeholder with a logout form.
-- **Replacing it:** keep the function, which takes no arguments and returns the
-  full HTML document. It may use `layout()` and `escHtml()` from
-  `template.ts`. `index.ts` adds `Cache-Control: no-store`.
+  `packages/worker/src/upload-page.ts` (the markup, built from `layout()`
+  in `template.ts`, so it looks like the download and login pages). The
+  page script is `src/upload/main.ts` (`public/upload.js`), the upload
+  runs in a Web Worker, `src/upload/worker.ts` (`public/upload-worker.js`),
+  and their messages are typed in `src/upload/protocol.ts`. `index.ts`
+  adds `Cache-Control: no-store`.
+- **Options** (round 2C): before a file is chosen, "Link works for"
+  (`EXPIRY_CHOICES`: 1 day, 7 days, 30 days by default, 90 days, 1 year
+  = the 365-day maximum of `expires_in`) and an optional download
+  password (`password` of `POST /api/uploads`; a plain text field without
+  autocomplete, so the person sees what they pass on and no password
+  manager fills in the upload token). The done state shows how long the
+  link works and until when, and whether it needs a password, next to
+  **Copy link**.
+- **Phone width:** below 480 px or on a touch screen, buttons and fields
+  are at least 44 px high and fields 16 px (iOS Safari zooms into smaller
+  ones); on a touch screen the drop zone drops "Drag a file here". The
+  screen is kept awake with a Wake Lock while uploading, where the browser
+  has one.
+- **No cleanup after `complete`:** once the worker has sent `complete`
+  the upload may be finished on the server, so the page hides Cancel,
+  sends no `DELETE` on `pagehide`, and the worker ignores a cancel and
+  never deletes it, even if `complete` fails (the cron removes an upload
+  still pending after 24 hours). A retried `complete` of a finished
+  upload gets its `200` again (see "Completing an upload").
+- **Lost file access** (iOS revokes access to a picked file when the
+  screen locks; see docs/design/browser-upload.md): the worker reads one
+  byte of the file before each part attempt and after a failed one. If
+  that read fails (`NotFoundError`; Firefox: `AbortError`) the upload
+  stops as `file`: not retried, not deleted. The page says "The browser
+  lost access to the file. On an iPhone this happens when the screen
+  locks or you switch apps. Choose the same file again to continue where
+  it stopped." with **Choose the file again** and **Cancel upload**
+  (which deletes it). The same file (name, size and `lastModified`, as
+  they were when it was first chosen) continues the open multipart
+  upload from its first unacknowledged part, with its own expiry and
+  password; any other file starts a new upload and the old one is
+  deleted. Only this page can continue it (it is kept in memory), so
+  leaving the page for good deletes it (`pagehide` without `persisted`,
+  a `keepalive` `DELETE`); a page kept in the back-forward cache keeps
+  it. WebKit aborts the upload and the file's reads as a page is left, so
+  a page left mid-upload can reach this state just before `pagehide`;
+  either way the upload is deleted.
+- **Tests:** `e2e/tests/browser/upload.spec.ts`,
+  `upload-resume.spec.ts`, `upload-mobile.spec.ts`; screenshots of each
+  state in `screenshots.spec.ts` (to `e2e/screenshots/2c/`, git-ignored).

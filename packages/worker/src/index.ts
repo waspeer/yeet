@@ -411,9 +411,15 @@ api.post("/uploads/:id/complete", async (c) => {
   }
 
   const uploads = c.get("uploads");
-  const meta = await uploads.readMeta(id);
+  const read = await uploads.readMetaVersion(id);
+  const meta = read?.meta;
+  // Already finished: a client sending complete again because the answer
+  // to its first one was lost (the upload page retries) gets that answer.
+  if (read && !meta?.pending_upload_id && typeof meta?.filename === "string") {
+    return c.json({ id, url: shareUrl(new URL(c.req.url).origin, id, meta.filename) });
+  }
   // (An upload whose deletion is under way is none, see Uploads.delete().)
-  if (!isUploading(meta)) return c.json({ error: "No upload in progress" }, 404);
+  if (!read || !isUploading(meta)) return c.json({ error: "No upload in progress" }, 404);
 
   // Size known at create: every part was checked on PUT, so the upload has
   // exactly this many; a longer list can never complete.
@@ -501,8 +507,11 @@ api.post("/uploads/:id/complete", async (c) => {
     );
   }
 
-  const { pending_upload_id: _, ...finished } = meta;
-  await uploads.writeMeta(id, { ...finished, file_size: object.size });
+  // Conditional on the sidecar read above: a DELETE since then wins
+  // (see Uploads.finishUpload()).
+  if ((await uploads.finishUpload(id, meta, read.etag, object.size)) === "deleted") {
+    return c.json({ error: "No upload in progress: it was deleted" }, 404);
+  }
   if (partRecords.length > 0) await uploads.deleteKeys(partRecords);
   return c.json({ id, url: shareUrl(new URL(c.req.url).origin, id, meta.filename) });
 });
