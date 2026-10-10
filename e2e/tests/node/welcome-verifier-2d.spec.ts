@@ -93,7 +93,6 @@ test.describe("verifier 2D: the welcome page", () => {
     expect(res.status).toBe(200);
     const body = await res.text();
     expect(addressAttr(body)).toBe(origin);
-    expect(body).toContain(`<code>npx @waspeer/yeet login ${origin}</code>`);
     expect(body).not.toContain("evil.example");
   });
 
@@ -107,7 +106,7 @@ test.describe("verifier 2D: the welcome page", () => {
     expect(body).not.toContain("evil.example");
   });
 
-  test("an origin with HTML-special characters is escaped, in the field and the command", async () => {
+  test("an origin with HTML-special characters is escaped in the field, and the only place it appears", async () => {
     // The URL parser keeps these in a host; an unescaped `"` would end the
     // value and turn the rest into attributes of the field.
     const host = `a"autofocus"onfocus="alert(1)'&b.example`;
@@ -118,7 +117,12 @@ test.describe("verifier 2D: the welcome page", () => {
     const body = await res.text();
     const escaped = `https://a&quot;autofocus&quot;onfocus=&quot;alert(1)'&amp;b.example`;
     expect(addressAttr(body)).toBe(escaped);
-    expect(body).toContain(`<code>npx @waspeer/yeet login ${escaped}</code>`);
+    // No command-line line with the origin any more (until phase 3): the
+    // field is the only place it is written.
+    expect(body).not.toContain("<code");
+    expect(body.split("b.example").length - 1).toBe(1);
+    expect(body).not.toContain("npx");
+    expect(body).not.toContain("yeet login");
     expect(body).not.toContain('"onfocus=');
     // The copy script reads the field's value; the origin is never in it.
     const script = body.slice(body.indexOf('<script type="module">'));

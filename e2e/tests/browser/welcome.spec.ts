@@ -1,6 +1,7 @@
 // The welcome page on / (round 2D): what yeet is, this yeet's address (the
-// request's origin, to keep for later), one click to /upload, and a short
-// line about the command-line tool. Public: no login, nothing secret.
+// request's origin, to keep for later) and one click to /upload. Public:
+// no login, nothing secret. (No line about the command-line tool until
+// phase 3 adds `yeet setup`.)
 
 import { expect, expectPhoneLayout, server, test } from "../../lib/index.js";
 
@@ -18,8 +19,11 @@ test.describe("welcome page", () => {
     // The same as the page's own origin, as the browser sees it.
     expect(await address.inputValue()).toBe(await page.evaluate(() => location.origin));
     await expect(address).toHaveJSProperty("readOnly", true);
-    // The command-line tool, with this address.
-    await expect(page.locator(".cli code")).toHaveText(`npx @waspeer/yeet login ${origin()}`);
+    // No command-line tool line yet (phase 3).
+    const text = await page.locator("body").innerText();
+    expect(text).not.toContain("npx");
+    expect(text).not.toContain("yeet login");
+    await expect(page.locator("code")).toHaveCount(0);
     // Nothing that needs a login.
     await expect(page.locator('input[type="password"]')).toHaveCount(0);
     await expect(page.locator("form")).toHaveCount(0);

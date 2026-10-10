@@ -150,28 +150,21 @@ export function downloadPage(opts: {
   return layout(`yeet \u2014 ${escHtml(filename)}`, body);
 }
 
-/**
- * The command-line tool's first step, as the welcome page shows it with this
- * yeet's address. (CLI 0.3.0 has `login <url>`; there is no `setup` yet.)
- */
-export function cliCommand(origin: string): string {
-  return `npx @waspeer/yeet login ${origin}`;
-}
-
-// Only what the shared layout has no class for: the address field, its
-// note, and the line about the command-line tool.
+// Only what the shared layout has no class for: the address field and its
+// note.
 const WELCOME_CSS = `
 .address{margin-bottom:8px}
 .address input{margin-bottom:8px;font-family:Monaco,Menlo,monospace}
 .note{text-align:center;color:#444;min-height:1em;margin-bottom:12px}
-.cli{color:#444;font-size:11px;line-height:1.6;text-align:center;margin-top:20px}
-.cli code{font-family:Monaco,Menlo,monospace;overflow-wrap:anywhere;background:#eee;padding:0 2px}
 `.trim();
 
 /**
  * GET /: what yeet is, this yeet's address (`origin`, from the request) to
  * keep, and the way to /upload. Public and the same for everyone: no
  * secret, no session, nothing from the bucket.
+ *
+ * Planned for phase 3: a line with the command-line tool's first command,
+ * `yeet setup <address>`, once that command exists (docs/design/api.md).
  */
 export function landingPage(origin: string): string {
   const address = escHtml(origin);
@@ -189,7 +182,6 @@ export function landingPage(origin: string): string {
     </div>
     <div id="copy-note" class="note" role="status"></div>
     <div class="center"><a class="button primary" href="/upload">Upload files</a></div>
-    <div class="cli">On a Mac you can also upload from Terminal:<br><code>${escHtml(cliCommand(origin))}</code></div>
     <script type="module">
       const field = document.getElementById("address");
       const note = document.getElementById("copy-note");

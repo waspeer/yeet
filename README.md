@@ -87,7 +87,7 @@ photos and archives that are already compressed are stored as they are, the
 rest is compressed. A compressed zip that could come out larger than about
 7.8 GB (the most the server accepts without being told the size up front) is
 first written to a temporary file, which needs free disk space for about the
-size of the files plus 256 MB, and is always deleted afterwards; `--store` streams any size without one. Zips have
+size of the files plus 256 MiB, and is always deleted afterwards; `--store` streams any size without one. Zips have
 the same size limit as a single file. If anything goes wrong part-way (a file
 that cannot be read or changes while it is read, a network failure, Ctrl-C),
 the upload is deleted: a link never points to half a zip.
