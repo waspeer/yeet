@@ -262,7 +262,12 @@ test.describe("1K verifier: CLI Retry-After edges", () => {
 
   test("random bytes in Retry-After never crash the CLI", async () => {
     test.setTimeout(60_000);
-    for (const value of [" ", "0x10", "1_000", `${randomBytes(4).toString("hex")}`]) {
+    // Hex digits that are all decimal (about 2.3% of draws, e.g. "75143536")
+    // are a valid delay of years, which the CLI rightly does not wait for
+    // (exit 1, "Try again later"): drawn again, so the test cannot flake.
+    let hex = randomBytes(4).toString("hex");
+    while (/^\d+$/.test(hex)) hex = randomBytes(4).toString("hex");
+    for (const value of [" ", "0x10", "1_000", hex]) {
       const r = await listWith(value);
       expect(r.code, value).toBe(0);
     }

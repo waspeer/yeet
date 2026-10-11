@@ -3,7 +3,9 @@ import {
   isBearerAttempt,
   parseExpiry,
   parseListCursor,
+  partCount,
   rateLimitClient,
+  readTextUpTo,
 } from "../../../packages/worker/src/parse.js";
 import { expect, test } from "../../lib/index.js";
 
@@ -107,5 +109,50 @@ test.describe("strict parsing", () => {
     ] as const) {
       expect(parseListCursor(value, prefix), name).toBeNull();
     }
+  });
+
+  test("the part count of a size: an empty file is one part", () => {
+    const part = 50 * 1024 * 1024;
+    for (const [size, count] of [
+      [0, 1],
+      [1, 1],
+      [part - 1, 1],
+      [part, 1],
+      [part + 1, 2],
+      [3 * part, 3],
+      [10_000 * part, 10_000],
+    ] as const) {
+      expect(partCount(size, part), String(size)).toBe(count);
+    }
+  });
+
+  test("a body is read up to a byte limit, and no further", async () => {
+    const stream = (chunks: string[]) => {
+      let pulled = 0;
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          const next = chunks[pulled++];
+          if (next === undefined) controller.close();
+          else controller.enqueue(new TextEncoder().encode(next));
+        },
+      });
+      return { body, pulled: () => pulled };
+    };
+    expect(await readTextUpTo(null, 10)).toBe("");
+    expect(await readTextUpTo(stream(["ab", "cd"]).body, 4)).toBe("abcd");
+    // Multi-byte characters split across chunks decode whole.
+    const euro = new TextEncoder().encode("€");
+    const split = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(euro.slice(0, 1));
+        controller.enqueue(euro.slice(1));
+        controller.close();
+      },
+    });
+    expect(await readTextUpTo(split, 3)).toBe("€");
+    // Over the limit: null, and the rest is never pulled.
+    const long = stream(["ab", "cd", "e", "f", "g"]);
+    expect(await readTextUpTo(long.body, 4)).toBeNull();
+    expect(long.pulled()).toBeLessThanOrEqual(4);
   });
 });
