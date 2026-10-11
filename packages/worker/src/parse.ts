@@ -10,6 +10,46 @@ export function parseExpiry(value: string | undefined): number | null {
   return value && /^[1-9]\d{0,11}$/.test(value) ? Number(value) : null;
 }
 
+/**
+ * The number of parts of an upload of `size` bytes: every part but the last
+ * is `partSize` bytes, and an empty file is one empty part.
+ */
+export function partCount(size: number, partSize: number): number {
+  return Math.max(1, Math.ceil(size / partSize));
+}
+
+/**
+ * A request body as UTF-8 text, or null if it is longer than `maxBytes`.
+ * Stops reading as soon as it is (at most one chunk past `maxBytes`), so a
+ * body without a Content-Length, or with a wrong one, is bounded too.
+ */
+export async function readTextUpTo(
+  body: ReadableStream<Uint8Array> | null,
+  maxBytes: number,
+): Promise<string | null> {
+  if (!body) return "";
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    length += value.byteLength;
+    if (length > maxBytes) {
+      await reader.cancel().catch(() => {});
+      return null;
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
+}
+
 /** R2 keys are at most 1,024 bytes; so is the key a listing cursor holds. */
 const MAX_KEY_BYTES = 1024;
 
