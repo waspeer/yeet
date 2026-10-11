@@ -31,7 +31,9 @@ import {
   isBearerAttempt,
   parseExpiry,
   parseListCursor,
+  partCount,
   rateLimitClient,
+  readTextUpTo,
 } from "./parse.js";
 import { formatRange, parseRange } from "./range.js";
 import { withOptionalSentry } from "./sentry.js";
@@ -309,7 +311,7 @@ api.post("/uploads", async (c) => {
  * PART_SIZE; an empty file is one empty part.
  */
 function expectedPartLength(size: number, partNumber: number): number | null {
-  const count = Math.max(1, Math.ceil(size / PART_SIZE));
+  const count = partCount(size, PART_SIZE);
   if (partNumber > count) return null;
   return partNumber < count ? PART_SIZE : size - (count - 1) * PART_SIZE;
 }
@@ -371,14 +373,29 @@ api.put("/uploads/:id/parts/:number", async (c) => {
 const MAX_PARTS = 10_000;
 
 /**
- * The `parts` of a complete request, sorted, or an error message. Arrays
- * longer than R2 allows are refused before any entry is looked at.
+ * The most bytes a complete request's body may have: 96 per entry of a
+ * `parts` array of MAX_PARTS (`{"part_number":10000,"etag":"…"},` is 32
+ * bytes besides the etag, which leaves 64 characters for it, twice the 32
+ * of an MD5 in hex) and 1 KiB for the rest. 961,024 bytes; the 10,000
+ * entries of phase 2's measurement were 669 KB.
  */
-function parseParts(value: unknown): { partNumber: number; etag: string }[] | string {
+const MAX_COMPLETE_BODY = 1024 + MAX_PARTS * 96;
+
+/**
+ * The `parts` array of a complete request, or an error message. Only its
+ * length is checked: arrays longer than R2 allows are refused before any
+ * entry is looked at.
+ */
+function partList(value: unknown): unknown[] | string {
   if (!Array.isArray(value) || value.length === 0) return "Missing parts";
   if (value.length > MAX_PARTS) return `Invalid parts: at most ${MAX_PARTS}`;
+  return value as unknown[];
+}
+
+/** The entries of a `parts` array (see partList()), sorted, or an error message. */
+function parseParts(entries: unknown[]): { partNumber: number; etag: string }[] | string {
   const parts: { partNumber: number; etag: string }[] = [];
-  for (const part of value as unknown[]) {
+  for (const part of entries) {
     const { part_number: partNumber, etag } = (part ?? {}) as Record<string, unknown>;
     if (typeof partNumber !== "number" || !Number.isInteger(partNumber) || partNumber < 1) {
       return "Invalid parts: every part needs a part_number of 1 or more";
@@ -404,9 +421,22 @@ api.post("/uploads/:id/complete", async (c) => {
   const { id } = c.req.param();
   if (!isValidId(id)) return c.json({ error: "Invalid upload" }, 400);
 
-  const body = await c.req.json<{ parts?: unknown; size?: unknown }>().catch(() => null);
-  const parts = parseParts(body?.parts);
-  if (typeof parts === "string") return c.json({ error: parts }, 400);
+  // The body is bounded before it is parsed: by its Content-Length when it
+  // has one, and while it is read in any case.
+  const tooLarge = () =>
+    c.json({ error: `Request body too large: at most ${MAX_COMPLETE_BODY} bytes` }, 413);
+  const declared = c.req.header("Content-Length");
+  if (declared !== undefined && Number(declared) > MAX_COMPLETE_BODY) return tooLarge();
+  const text = await readTextUpTo(c.req.raw.body, MAX_COMPLETE_BODY);
+  if (text === null) return tooLarge();
+  let body: { parts?: unknown; size?: unknown } | null;
+  try {
+    body = JSON.parse(text) as { parts?: unknown; size?: unknown } | null;
+  } catch {
+    body = null;
+  }
+  const entries = partList(body?.parts);
+  if (typeof entries === "string") return c.json({ error: entries }, 400);
   if (body?.size !== undefined && !isSize(body.size)) {
     return c.json({ error: "Invalid size" }, 400);
   }
@@ -416,6 +446,7 @@ api.post("/uploads/:id/complete", async (c) => {
   const meta = read?.meta;
   // Already finished: a client sending complete again because the answer
   // to its first one was lost (the upload page retries) gets that answer.
+  // The entries are not used, so not looked at either.
   if (read && !meta?.pending_upload_id && typeof meta?.filename === "string") {
     return c.json({ id, url: shareUrl(new URL(c.req.url).origin, id, meta.filename) });
   }
@@ -423,20 +454,26 @@ api.post("/uploads/:id/complete", async (c) => {
   if (!read || !isUploading(meta)) return c.json({ error: "No upload in progress" }, 404);
 
   // Size known at create: every part was checked on PUT, so the upload has
-  // exactly this many; a longer list can never complete.
+  // exactly this many, and a list of any other length can never complete
+  // (a shorter one would make a shorter file). Checked before the entries
+  // are looked at: validating and sorting 10,000 of them cost p90 18 ms
+  // CPU on Workers Free (phase 2).
   if (meta.file_size !== undefined) {
-    const count = Math.max(1, Math.ceil(meta.file_size / PART_SIZE));
-    if (parts.length > count) {
+    const count = partCount(meta.file_size, PART_SIZE);
+    if (entries.length !== count) {
       return c.json(
         {
           error:
             `Invalid parts: an upload of ${meta.file_size} bytes has ${count} ` +
-            `part${count === 1 ? "" : "s"} (part_size ${PART_SIZE} bytes), not ${parts.length}`,
+            `part${count === 1 ? "" : "s"} (part_size ${PART_SIZE} bytes), not ${entries.length}`,
         },
         400,
       );
     }
   }
+
+  const parts = parseParts(entries);
+  if (typeof parts === "string") return c.json({ error: parts }, 400);
 
   // Size unknown at create: check the layout R2 requires from the recorded
   // part sizes, so the client gets a clear error instead of R2's.
