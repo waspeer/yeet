@@ -77,7 +77,7 @@ export interface PlanOptions {
 /** The server's part size, which the page plans with before it creates the upload. */
 export const PART_SIZE = 50 * 1024 * 1024;
 /** MAX_UNSIZED_PARTS in packages/worker/src/uploads.ts (an e2e test keeps them equal). */
-export const MAX_UNSIZED_PARTS = 150;
+export const MAX_UNSIZED_PARTS = 100;
 /** R2's own limit of parts per upload. */
 export const MAX_PARTS = 10_000;
 
@@ -304,7 +304,7 @@ function sizePlan(plan: ZipPlan, { partSize, maxUnsizedParts }: PlanOptions): Zi
   return { ...plan, size };
 }
 
-/** "7.8 GB", "52 MB", "300 KB": rounded down, in powers of 1000 (as macOS shows sizes). */
+/** "5.2 GB", "52 MB", "300 KB": rounded down, in powers of 1000 (as macOS shows sizes). */
 export function formatBytes(bytes: number): string {
   if (bytes >= 1e9) return `${Math.floor(bytes / 1e8) / 10} GB`;
   if (bytes >= 1e6) return `${Math.floor(bytes / 1e6)} MB`;

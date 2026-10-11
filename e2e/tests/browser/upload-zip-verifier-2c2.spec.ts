@@ -4,7 +4,8 @@
 //   the collision message and every line of the upload and done states.
 // - A stored zip of exactly one part (`part_size` bytes): no empty second
 //   part, no part cut a byte short.
-// - The page's test hook can only lower the 150-part limit, never raise it.
+// - The page's test hook can only lower the MAX_UNSIZED_PARTS limit (100
+//   parts since round 2F), never raise it.
 // - After a cancel, the DELETE is repeated while the server answers 202, at
 //   most 5 times.
 
@@ -26,6 +27,7 @@ import {
   sleep,
   test,
 } from "../../lib/index.js";
+import { formatBytes, MAX_UNSIZED_PARTS } from "../../../packages/worker/src/upload/selection.js";
 import { storedZipSize } from "../../../packages/worker/src/zip.js";
 import { parseZip } from "../../zip/parse.js";
 
@@ -147,10 +149,10 @@ test("verifier 2C+2: a stored zip of exactly part_size bytes is one part, whole"
   expect(a.size).toBe(PART_SIZE - overhead);
 });
 
-test("verifier 2C+2: the test hook cannot raise the 150-part limit", async ({ page }) => {
+test("verifier 2C+2: the test hook cannot raise the part limit", async ({ page }) => {
   // A raised limit would let a selection whose deflate worst case exceeds
-  // 150 parts (7.86 GB) be deflated with its size unknown. The file is a
-  // stand-in of 7.9 GB (only its size is read before the warning).
+  // MAX_UNSIZED_PARTS parts (5.24 GB) be deflated with its size unknown. The
+  // file is a stand-in of 7.9 GB (only its size is read before the warning).
   await page.addInitScript(() => {
     (window as unknown as { __yeetE2E: unknown }).__yeetE2E = { maxUnsizedParts: 100_000 };
   });
@@ -196,8 +198,9 @@ test("verifier 2C+2: the test hook cannot raise the 150-part limit", async ({ pa
     }
   });
   await expect(page.locator("#state-confirm")).toBeVisible();
-  // The limit shown is the server's (150 × 52,428,800 bytes), not the hook's.
-  await expect(page.locator("#confirm-message")).toContainText("more than about 7.8 GB");
+  // The limit shown is the server's (100 × 52,428,800 bytes), not the hook's.
+  expect(formatBytes(MAX_UNSIZED_PARTS * PART_SIZE)).toBe("5.2 GB");
+  await expect(page.locator("#confirm-message")).toContainText("more than about 5.2 GB");
   await page.getByRole("button", { name: "Choose again" }).click();
   await sleep(300);
   expect(creates).toEqual([]);

@@ -273,7 +273,7 @@ test.describe("upload page: the zip's size", () => {
     expect(plan.size).toBe((await zipBytes(plan)).length);
   });
 
-  test("compressible files: deflated, the size left for complete, the worst case within 150 parts", async () => {
+  test("compressible files: deflated, the size left for complete, the worst case within MAX_UNSIZED_PARTS", async () => {
     const plan = zip(
       planSelection(
         folder("Mix", { "a.wav": randomBytes(3 * MiB), "b.mp3": randomBytes(1000) }),
@@ -314,7 +314,9 @@ test.describe("upload page: the zip's size", () => {
   test("the deflate bound: 4 × zlib's 0.03 % plus 1 KiB, never below the input", () => {
     expect(deflateBound(0)).toBe(1024);
     expect(deflateBound(4096)).toBe(4096 + 5 + 1024);
-    expect(deflateBound(150 * PART_SIZE) / (150 * PART_SIZE)).toBeLessThan(1.0013);
+    expect(
+      deflateBound(MAX_UNSIZED_PARTS * PART_SIZE) / (MAX_UNSIZED_PARTS * PART_SIZE),
+    ).toBeLessThan(1.0013);
   });
 
   test("more than R2's 10,000 parts is refused before anything is uploaded", () => {
@@ -325,7 +327,7 @@ test.describe("upload page: the zip's size", () => {
     expect(() =>
       planSelection(
         { tops: [{ name: "F", isDir: true }], files: [big], dirs: [] },
-        { partSize: 1000, maxUnsizedParts: 150 },
+        { partSize: 1000, maxUnsizedParts: MAX_UNSIZED_PARTS },
       ),
     ).toThrow(/^This selection is too large to upload: /);
   });
