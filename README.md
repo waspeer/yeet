@@ -85,7 +85,7 @@ can unzip them (e.g. `:` becomes `_`); two files whose names would then clash
 are an error rather than one silently replacing the other. Audio, video,
 photos and archives that are already compressed are stored as they are, the
 rest is compressed. A compressed zip that could come out larger than about
-7.8 GB (the most the server accepts without being told the size up front) is
+5.2 GB (the most the server accepts without being told the size up front) is
 first written to a temporary file, which needs free disk space for about the
 size of the files plus 256 MiB, and is always deleted afterwards; `--store` streams any size without one. Zips have
 the same size limit as a single file. If anything goes wrong part-way (a file
@@ -167,9 +167,9 @@ there); the smaller bounds of round 1L are estimated from those
 measurements, not measured yet.
 
 A client of the API that does not tell the server a file's size up front
-can complete an upload of at most 150 parts (about 7.9 GB). The upload page
-and the CLI always send the size, except for a CLI zip that is certain to
-stay below that (a compressed zip's size is only known once it is written).
+can complete an upload of at most 100 parts (about 5.2 GB). The upload page
+and the CLI always send the size, except for a compressed zip that is
+certain to stay below that (its size is only known once it is written).
 
 ## Security notes
 

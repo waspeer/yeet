@@ -222,16 +222,18 @@ module", and [zip.md](zip.md), "Callers"):
   into 50 MiB parts sent as Blobs, two in flight, the same retries,
   backoff and progress ("File k of n" as the zip reaches each file). The
   worker is terminated after every upload.
-- **Size and the 150-part limit:** every file stored → the exact size
+- **Size and the part limit:** every file stored → the exact size
   (`storedZipSize()`) at create, no limit. Otherwise the size goes with
-  `complete`, which the server allows for 150 parts (7.86 GB), so the
+  `complete`, which the server allows for 100 parts (5.24 GB; 150 parts,
+  7.86 GB, until round 2F), so the
   page deflates only if an upper bound of the zip fits (each deflated
   file at its size + 4 × zlib's stored-block overhead + 1 KiB, in the
   stored layout, + 64 KiB: at most 0.13 % over the input). A larger
   selection is stored completely, so its size is known again and there
   is no limit; it can therefore never fail halfway on the limit. If some
   of its files would have compressed, the page first shows a warning
-  (more than about 7.8 GB, so uploaded uncompressed; for a smaller
+  (more than about 5.2 GB, derived from `MAX_UNSIZED_PARTS`, so uploaded
+  uncompressed; for a smaller
   download zip it first, on a Mac right-click → Compress) with **Upload
   anyway** and **Choose again**. Not when nothing would compress anyway.
 - **iOS suspension** (item 5 above, decided): a single file continues

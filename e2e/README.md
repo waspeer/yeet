@@ -257,7 +257,7 @@ All exported from `lib/index.ts`.
   `YEET_STUB_FREE_BYTES=<n>` makes `fs.statfs` report n free bytes, and
   `YEET_STUB_SLOW_READ_MS=<ms>` delays each read of a file named `slow*` (so zipping can be
   interrupted), and `YEET_STUB_ENOSPC_AFTER=<n>` makes writes to the temporary
-  `upload.zip` fail with `ENOSPC` after n bytes. The CLI's own test hooks: `YEET_TEST_MAX_UNSIZED_PARTS` lowers its 150-part
+  `upload.zip` fail with `ENOSPC` after n bytes. The CLI's own test hooks: `YEET_TEST_MAX_UNSIZED_PARTS` lowers its 100-part
   cap for zips of unknown size, `YEET_TEST_ZIP_SIZE_BOUND` lowers its worst-case zip size (never raises it).
 
 ### Stand-in server — `stand-in.ts`
@@ -393,7 +393,7 @@ logPath, stop() }`: another `wrangler dev` of the Worker, with its own ports,
   `setFolder()` adds its own listener first and does not wait for that call.
 - The page's test hook `window.__yeetE2E = { maxUnsizedParts: n }` (set with
   `page.addInitScript()` before `goto`) lowers its limit for zips of unknown size, so
-  `tests/browser/upload-zip.spec.ts` reaches the forced store with 51 MiB instead of 8 GB.
+  `tests/browser/upload-zip.spec.ts` reaches the forced store with 51 MiB instead of 5.2 GB.
 
 The upload runs in a Web Worker. In Playwright 1.63, `page.route()`,
 `page.waitForRequest/Response()` and `context.on("request")` all see that
