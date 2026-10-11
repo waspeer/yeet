@@ -132,11 +132,14 @@ export const JUMP_LIMIT = 50;
  * telling the client to start again with the size: CPU, not R2 calls, is
  * the binding limit. The complete of 4,000 records took 82 to 138 ms CPU on
  * Workers Free (phase 1J, n = 3), of 300 records p50 14, p90 17 ms (phase
- * 1K, n = 8), so 300 (round 1K) was lowered to 150 in round 1L. 150 parts
- * are up to about 7.9 GB at the 50 MiB part size. The CLI and the upload
- * page always send the size, so they never take this path.
+ * 1K, n = 8), so 300 (round 1K) was lowered to 150 in round 1L. Round 2E
+ * measured p90 8, 10, 10, 14 and 18 ms for 50, 75, 100, 120 and 150
+ * records (n = 28 each); against a bound of p90 10 ms it was lowered to 100
+ * in round 2F. 100 parts are up to about 5.24 GB at the 50 MiB part size.
+ * The CLI and the upload page send the size at create, or at complete for
+ * a zip that fits within this many parts.
  */
-export const MAX_UNSIZED_PARTS = 150;
+export const MAX_UNSIZED_PARTS = 100;
 
 /**
  * R2 calls `POST /api/uploads/:id/complete` of an upload of unknown size may
@@ -144,8 +147,8 @@ export const MAX_UNSIZED_PARTS = 150;
  * subrequests the Free plan was assumed to allow, minus its 4 other ones
  * (the Bearer rate-limit call, the sidecar read, the multipart complete and
  * the sidecar write). A second guard behind MAX_UNSIZED_PARTS: it only
- * refuses first if R2 returns fewer than 4 records per list call
- * (ceil(150 / 45) list calls and a delete).
+ * refuses first if R2 returns fewer than 3 records per list call
+ * (ceil(100 / 45) list calls and a delete).
  */
 export const PART_RECORDS_BUDGET = 50 - 4;
 

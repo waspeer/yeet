@@ -146,7 +146,7 @@ and the `"mirror"` variant break `ditto`, see below).
 `storedZipSize()` is the one addition to the interface proposed here. A stored entry's
 compressed size is its size, so when every file is stored and declares its size, every header,
 descriptor and offset is known before the first byte is written. The CLI uses it to send the
-size at create, which lifts the server's 150-part limit for uploads of unknown size
+size at create, which lifts the server's 100-part limit for uploads of unknown size
 ([api.md](api.md)) for `--store` and for selections of only already-compressed files.
 
 ### Why this shape
@@ -567,19 +567,20 @@ above typical uplinks, so the defaults are fine there.
   via `Duplex.toWeb` and `zlib.crc32` when present (`compress: false` with `--store`), opens
   each file only when the zip reaches it, and cuts the output into parts of exactly
   `part_size` (the last shorter), three in flight, the zip paused while they are. How the
-  size reaches the server (round 2B.1; until then a compressed zip stopped before part 151):
+  size reaches the server (round 2B.1; until then a compressed zip stopped before part 151,
+  past the 150-part cap of the time):
   - **Every file stored** (`--store`, or only already-compressed files): `storedZipSize()`
     knows the exact size, which is sent at create; streamed.
   - **Compressed, and its worst case fits:** of unknown size the server completes at most
-    150 parts ([api.md](api.md)). `zipSizeBound()` is the most the zip can take: the input,
+    100 parts ([api.md](api.md); 150 until round 2F). `zipSizeBound()` is the most the zip can take: the input,
     plus 1/1024 of each deflated file and 64 bytes, plus 256 bytes and twice the name per
     entry (the headers and extras need at most 166 and the name twice), plus 256 for the end
     records. zlib's own worst case for raw deflate at window 15 / memLevel 8 is about
     +0.031 % (`deflateBound()`), and level 1 reaches it on random data (measured, Node 24.16
     with zlib 1.3.1, 1 MiB writes: 64 MiB → +20,485 bytes, +0.0305 %, 4 bytes under the
-    bound); 1/1024 is +0.098 %, over three times that. If the bound is at most 149 parts
-    (a part to spare: 7.81 GB at 50 MiB), the zip is streamed and its size sent at
-    `complete`. The guard stays: a zip of unknown size that reaches part 151 anyway stops
+    bound); 1/1024 is +0.098 %, over three times that. If the bound is at most 99 parts
+    (a part to spare: 5.19 GB at 50 MiB), the zip is streamed and its size sent at
+    `complete`. The guard stays: a zip of unknown size that reaches part 101 anyway stops
     with an error that calls it a bug and suggests `--store`, and is deleted.
   - **Compressed, and it might not fit:** the CLI has created the upload (to learn
     `part_size`) and deletes it unused. It checks the free space in `os.tmpdir()`
@@ -632,9 +633,9 @@ or a folder become one zip (details in [browser-upload.md](browser-upload.md), "
   parts of exactly `part_size` sent as Blobs, two in flight, the zip paused while they are.
 - **Size:** at create when every entry is stored (`storedZipSize()`); otherwise at `complete`,
   and then only if an upper bound of the zip (each deflated file at `deflateBound()`, 4 ×
-  zlib's stored-block overhead plus 1 KiB, in the stored layout, plus 64 KiB) fits 150 parts.
+  zlib's stored-block overhead plus 1 KiB, in the stored layout, plus 64 KiB) fits 100 parts.
   A larger selection is stored completely, so its size is known again (after a warning when
-  some files would have compressed). So a browser zip never stops at part 151; the CLI's still
+  some files would have compressed). So a browser zip never stops at part 101; the CLI's still
   can (see Known limitations).
 - `zip.ts` itself is unchanged.
 
@@ -748,14 +749,15 @@ Also: "compression choice" (M28 inverted heuristic, M29 `--store` ignored) and "
   machine). The validator now checks for it and prints a `chmod +x` hint.
 - **Empty archives** are rejected or warned about by `unzip` and `ditto`; callers must
   refuse an empty selection. The CLI does.
-- **A compressed CLI zip that might exceed 150 parts goes through a temporary file**
-  (round 2B.1; until then it stopped before part 151, i.e. failed after uploading 7.86 GB).
-  Its size is only known at its end, and the server completes an upload of unknown size
-  from at most 150 parts ([api.md](api.md)). So it needs free disk space for the whole zip
+- **A compressed CLI zip that might exceed 99 parts (about 5.2 GB) goes through a temporary
+  file** (round 2B.1; until then it stopped before part 151, i.e. failed after uploading
+  7.86 GB, at the 150-part cap of the time). Its size is only known at its end, and the
+  server completes an upload of unknown size from at most 100 parts ([api.md](api.md); 150
+  until round 2F). So it needs free disk space for the whole zip
   (checked first), and the upload only starts once it is zipped. The temporary file is left
   behind only by SIGKILL or a crash. `--store` streams any size.
   The upload page has no such limit either: it decides before the first part, from an
-  upper bound of the deflated size, and stores everything when that could exceed 150 parts
+  upper bound of the deflated size, and stores everything when that could exceed 100 parts
   (round 2C+2, see Callers).
 - **`ditto` reads DOS times with the UTC offset in effect when it runs** (measured
   2026-10-10, in CEST, TZ=Europe/Amsterdam): entries from winter time came out 1 h early,

@@ -88,14 +88,35 @@ test.describe("1K verifier: complete of unknown size at the limit", () => {
     expect((await deleteUploadFully(id)).status).toBe(200);
   });
 
-  test("a parts array with a duplicate is refused for that, whatever its length", async () => {
+  test(`a parts array of at most ${MAX_UNSIZED_PARTS} with a duplicate is refused for that`, async () => {
     const id = await create({ filename: "dup.bin" });
-    const parts = [...madeUp(MAX_UNSIZED_PARTS + 5), { part_number: 3, etag: "again" }];
+    // MAX_UNSIZED_PARTS entries in all, part 3 twice.
+    const parts = [...madeUp(MAX_UNSIZED_PARTS - 1), { part_number: 3, etag: "again" }];
+    expect(parts).toHaveLength(MAX_UNSIZED_PARTS);
     const res = await complete(id, { parts });
     expect(res.status).toBe(400);
     expect(((await res.json()) as { error: string }).error).toBe(
       "Invalid parts: part 3 is listed twice",
     );
+    expect((await readUploadMeta(id))?.pending_upload_id).toBeTruthy();
+    expect((await api(`/api/uploads/${id}`, { method: "DELETE" })).status).toBe(200);
+  });
+
+  test(`more than ${MAX_UNSIZED_PARTS} entries: the cap's error before any entry is looked at`, async () => {
+    // Round 2F: the count comes first, so a duplicate or an invalid entry
+    // past the cap is not reported (until 2F the entries were checked first).
+    const id = await create({ filename: "over-cap.bin" });
+    for (const extra of [
+      { part_number: 3, etag: "again" },
+      { part_number: -1, etag: "bad" },
+      { etag: "no number" },
+    ]) {
+      const res = await complete(id, { parts: [...madeUp(MAX_UNSIZED_PARTS), extra] });
+      expect(res.status, JSON.stringify(extra)).toBe(400);
+      expect(await res.json(), JSON.stringify(extra)).toEqual({ error: TOO_MANY });
+    }
+    const res = await complete(id, { parts: [null, ...madeUp(MAX_UNSIZED_PARTS + 55)] });
+    expect(await res.json()).toEqual({ error: TOO_MANY });
     expect((await readUploadMeta(id))?.pending_upload_id).toBeTruthy();
     expect((await api(`/api/uploads/${id}`, { method: "DELETE" })).status).toBe(200);
   });

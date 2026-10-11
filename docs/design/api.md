@@ -25,7 +25,8 @@ recorded here first. Behaviour not mentioned stays as in
   shapes the design; the R2 call budgets that remain (45 for a cron run,
   46 for the part records of a `complete`) are a second guard behind the
   bounds on objects listed (and, for a `complete` of unknown size, on part
-  records: `MAX_UNSIZED_PARTS`).
+  records: `MAX_UNSIZED_PARTS`, 100 since round 2F, checked before the
+  `parts` entries are looked at).
 - **Request bodies:** at most 100 MB.
 - **The `UPLOAD_TOKEN` never reaches the browser.** It must not appear in HTML,
   in JS, in browser storage, in cookies (only values derived from it via HMAC
@@ -429,35 +430,47 @@ Numbers that are signed or used as keys must be spelled one way only:
       `400 {"error": "Part <n> is <s> bytes but is followed by more parts: …"}`.
   - **The records:** deleted once the upload completes, and with the upload
     otherwise (delete, cleanup).
-  - **Limit: at most 150 part records** (`MAX_UNSIZED_PARTS`; 300 in
-    round 1K, 150 since round 1L). CPU binds, not R2 calls: the `complete`
-    of an upload of unknown size with 4,000 part records took 82, 125 and
-    138 ms CPU on Workers Free (phase 1J, n = 3), and with 300 records p50
-    14, p90 17 ms (phase 1K, n = 8, all `200`), over 10 ms. So `complete`
+  - **Limit: at most 100 part records** (`MAX_UNSIZED_PARTS`; 300 in
+    round 1K, 150 in round 1L, 100 since round 2F). CPU binds, not R2
+    calls: the `complete` of an upload of unknown size with 4,000 part
+    records took 82, 125 and 138 ms CPU on Workers Free (phase 1J, n = 3),
+    with 300 records p50 14, p90 17 ms (phase 1K, n = 8, all `200`), and
+    in round 2E p90 10 at 100 records, 14 at 120 and 18 at 150 (n = 28
+    each; see "Measurements (round 2E)"). So `complete`
     answers `400` with this error before anything changes (no multipart
     complete, no write; the upload stays pending, its records stay):
 
     ```json
     {
-      "error": "Too many parts to complete an upload of unknown size (at most 150); start the upload again and send its size (\"size\" in POST /api/uploads)"
+      "error": "Too many parts to complete an upload of unknown size (at most 100); start the upload again and send its size (\"size\" in POST /api/uploads)"
     }
     ```
 
     when
-    - the request lists more than 150 parts (checked before any listing), or
-    - the bucket holds more than 150 part records for the upload (records
+    - the request lists more than 100 parts: checked right after the
+      sidecar read, **before any entry is validated or sorted** and before
+      any listing (round 2F; until then the entries were parsed first, so
+      an invalid or duplicate entry among up to 10,000 was reported
+      instead, at the cost of checking them all), or
+    - the bucket holds more than 100 part records for the upload (records
       of parts not in the request count too). The list calls carry a
-      `limit`, so at most 151 records are listed to find out (real R2
+      `limit`, so at most 101 records are listed to find out (real R2
       respects such a `limit`: 301 asked, 301 returned, phase 1K).
 
-    150 parts are up to about 7.9 GB at the 50 MiB part size. With the size
+    A request of at most 100 parts still has its entries checked first
+    (an invalid or duplicate entry is a `400` naming it). Tests:
+    `complete-count.spec.ts` (only the sidecar read for 101 or 10,000
+    entries, whatever they hold) and `verify-1k.spec.ts` (`wrangler dev`).
+
+    100 parts are up to about 5.24 GB at the 50 MiB part size (7.86 GB at
+    round 1L's 150). With the size
     known at create there is no such limit (R2's own 10,000 parts). The
     upload page for a single file, and the CLI for a single file, always
     send the size, 0 included, so they never take this path (asserted:
     `e2e/tests/node/unsized-complete.spec.ts` for the CLI,
     `tests/browser/upload.spec.ts` for the page). **The upload page's
     compressed zips do** (round 2C+2, see "Upload page module"), but only
-    when an upper bound of the zip's size fits these 150 parts; a larger
+    when an upper bound of the zip's size fits these 100 parts; a larger
     selection is stored completely and sent with its size, so the page
     never meets this refusal. **The CLI's compressed
     zip uploads may** (`yeet upload <file1> <file2> …` or `<folder>`): a
@@ -466,11 +479,13 @@ Numbers that are signed or used as keys must be spelled one way only:
     equal to the server's by `cli-zip.spec.ts`) and, since round 2B.1,
     never runs into it: it streams a compressed zip with its size sent at
     `complete` only when the zip's worst case (`zipSizeBound()` in
-    `upload-zip.ts`) is at most 149 parts (7.81 GB), a part to spare.
+    `upload-zip.ts`) is at most 99 parts (5.19 GB; 149 parts, 7.81 GB,
+    until round 2F), a part to spare.
     Otherwise it deletes that upload unused, writes the zip to a
     temporary file first, and uploads that with its exact size at create,
     so it has no such limit (docs/design/zip.md, "Callers"). Round 2B
-    instead stopped before part 151 and suggested `--store`; that is now
+    instead stopped before part 151 (the cap was 150) and suggested
+    `--store`; that is now
     only a guard against a wrong bound (it deletes the upload and never
     completes it; `cli-zip.spec.ts`). A zip whose size is known up front
     (every file stored: `--store`, or only already-compressed files;
@@ -496,8 +511,9 @@ Numbers that are signed or used as keys must be spelled one way only:
     afterwards, one call per 1,000. It stops listing as soon as these
     cannot fit in 46 R2 calls (`PART_RECORDS_BUDGET`, from the 50
     subrequests once assumed; the real limit is 1,000 R2 calls, phase 1H)
-    and answers the same 400. With 150 records that only happens if R2
-    returns fewer than 4 records per list call (`r2-budget.spec.ts`).
+    and answers the same 400. With 100 records that only happens if R2
+    returns fewer than 3 records per list call (`r2-budget.spec.ts`; 4 at
+    round 1L's 150).
     Before round 1K this budget was the limit: 4,100 parts at 100 records
     per call; at real R2's 415 per call at most about 13,280 by the call
     budget (32 list calls and 14 deletes), so in effect R2's own 10,000
@@ -506,7 +522,7 @@ Numbers that are signed or used as keys must be spelled one way only:
     (round 1H), 4,101 to 4,700 parts failed _after_ the multipart complete.
   - **Not covered:** a size given at `complete` that does not match the
     stored object makes the request delete the upload too (a listing and
-    deletes of all its keys, up to 150 records now); the cron deletes
+    deletes of all its keys, up to 100 records now); the cron deletes
     whatever a failed request leaves after 24 hours.
   - **Size known: exactly as many parts as the size has** (round 1L for
     more, round 2E for any other count). A `complete` whose `parts` has
@@ -709,7 +725,7 @@ request could list and delete about 10,000 objects.
 - **The upload page** deletes only uploads it created itself. Of a
   single file or a stored zip (size known) that is 1 or 2 objects, done
   in one request. A compressed zip (round 2C+2, size unknown) has a part
-  record per part, up to 150: its cancel, its failure and its replacement
+  record per part, up to 100: its cancel, its failure and its replacement
   after lost files ask again while the answer is `202`, up to 5 requests;
   the `pagehide` `keepalive` request is a single one, after which such an
   upload is gone for users and the cron deletes the rest. It never sends
@@ -1236,7 +1252,7 @@ cost about 3–4 ms more at p50.
 - **`MAX_UNSIZED_PARTS`: 100.** That is the largest measured count with
   a p90 of 10 ms (75 measured the same; the fit puts 10 ms at about 80, an
   estimate). The cap for an upload of unknown size is the parts times 50
-  MiB: today 150 parts, 7.86 GB; at 100, 5.24 GB (the CLI's bound of one
+  MiB: then 150 parts, 7.86 GB; at 100, 5.24 GB (the CLI's bound of one
   part fewer, 99 parts, 5.19 GB; at 80, 4.19 GB). Above it the upload page
   stores the selection and sends its size, and the CLI writes the zip to
   a temporary file first, so a lower value moves the zips between 5.24
@@ -1248,6 +1264,16 @@ cost about 3–4 ms more at p50.
   `CLEANUP_LIST_LIMIT`: _inferred, not measured,_ from the 3–4 ms a run
   above a plain one, halving the slice to 50 would save about 2 ms, at
   twice the runs per upload.
+
+**Decided (round 2F):** `MAX_UNSIZED_PARTS` 150 → 100, maintainer, from
+the round 2E measurement. The cap for an upload of unknown size is now
+100 × 50 MiB, about 5.24 GB; the CLI streams a compressed zip only when
+its bound fits 99 parts (5.19 GB, "about 5.2 GB" in its messages), and
+the upload page stores a selection whose deflate bound exceeds 100 parts
+("more than about 5.2 GB"). The count is checked before the `parts`
+entries (see "Upload API"). `CLEANUP_LIST_LIMIT` stays at 100, the
+maintainer's decision (see "Known limitations"). _Not yet re-measured at
+100 on a deploy_ (see "To measure next").
 
 ### Listing a page (GET /api/uploads)
 
@@ -1560,7 +1586,8 @@ their upload has been reached (`cronUntil()` in `e2e/lib/bucket.ts`).
 
 Phase 2 took the control measurement of the bounds of round 1L together
 with the routes phase 2 adds (see "Measurements (phase 2)"). The page with
-a jump, the `DELETE` of many records, the refusal of 151 records and the
+a jump, the `DELETE` of many records, the refusal of 151 records (round
+1L's cap of 150) and the
 phase 2 `complete` paths of a sized upload are within 10 ms at p90 (a
 racing `complete` of unknown size with 120 records is not: p90 11–12).
 What remains, on the
@@ -1568,21 +1595,23 @@ same kind of deploy and in the same way:
 
 - **`POST /api/uploads/:id/complete` of unknown size**: measured in round
   2E (see "Measurements (round 2E)"): p90 at or under 10 ms up to 100
-  part records, 14 at 120 and 18 at 150; the data supports
-  `MAX_UNSIZED_PARTS` 100 (a cap of 5.24 GB instead of 7.86 GB). Still
-  open: splitting the time between the listing, the multipart complete,
-  the sidecar write and the batch delete of the records (a probe doing
-  each alone), which would show where the tail at 120–150 comes from;
-  and, if the constant is lowered, the same series once more at the new
-  value.
+  part records, 14 at 120 and 18 at 150; `MAX_UNSIZED_PARTS` is 100
+  since round 2F (a cap of 5.24 GB instead of 7.86 GB). Still open:
+  **re-measure 100 records** (and the refusal of 101, now before the
+  entries) on a deploy of round 2F, in one session as in round 2E; and
+  splitting the time between the listing, the multipart complete, the
+  sidecar write and the batch delete of the records (a probe doing each
+  alone), which would show where the tail at 120–150 came from.
 - **The cron's run over an expired pending upload's part records**: p90
   10–11 in round 2E (two series) as in phase 2; the legacy records' run is
   within 10 ms (p90 7–8). If a margin is wanted, measure
   `CLEANUP_LIST_LIMIT` 50 against 100 in one session (about 2 ms saved,
   _inferred_).
-- **A sized `complete` with 10,000 `parts`** (p90 18): whether to lower
-  `MAX_PARTS` (about 4,500–5,000 entries for 10 ms, _estimate_) or check
-  the count against the declared size before parsing the entries.
+- **A sized `complete` with 10,000 `parts`** (p90 18 in phase 2): since
+  round 2E the count is checked against the declared size before the
+  entries are parsed; **re-measure the refusal of 10,000 entries against
+  a smaller size** on a deploy (in Node it now costs what the 10,001
+  refusal does).
 - **`GET /upload` and the first requests on a fresh isolate** (10–35 ms):
   whether that is isolate startup (the route's own work warm is 0–3 ms
   for `GET /` and the download page; `GET /upload` warm was not measured
@@ -1653,15 +1682,26 @@ would cost more than they do. The exception is the CLI's temporary zip
   6 s, on a cancel or a failure; leaving the page mid-upload terminates
   the worker at once, so there a part being stored can still leave its
   record.
-- **A CLI zip larger than about 7.8 GB is written to disk first.** Since
+- **A CLI zip larger than about 5.2 GB is written to disk first.** Since
   round 2B.1 a compressed zip whose worst case does not fit in
-  `MAX_UNSIZED_PARTS` goes through a temporary file (see above), so it
+  `MAX_UNSIZED_PARTS` - 1 parts (99 since round 2F, 5.19 GB; about 7.8 GB
+  before) goes through a temporary file (see above), so it
   needs free disk space for its worst case, about the input plus 256 MiB
   (`zipSizeBound()` + `FREE_SPACE_MARGIN`; checked; the CLI suggests `--store`
   when it is short), and the upload starts only once it is zipped. A
   SIGKILL or a crash leaves the file in the OS's temporary folder. The
   first, unused upload it creates and deletes to learn `part_size` costs
   one create and one `DELETE`.
+- **The cron over an upload with thousands of part records is at p90
+  10–11 ms.** An expired pending upload with 3,000 part records took p90
+  10–11 per run in round 2E (two series) as in phase 2 (11), no
+  `exceededCpu`. `CLEANUP_LIST_LIMIT` is kept at 100 by the maintainer's
+  decision (round 2F; halving it would save about 2 ms a run, _inferred_,
+  at twice the runs per upload). With `MAX_UNSIZED_PARTS` at 100 the CLI
+  and the upload page never create such an upload: their uploads of
+  unknown size have at most 100 parts, and they delete what they do not
+  complete. Only a non-conforming client (with the token) can leave
+  thousands of part records, by uploading parts and never completing.
 - **A hand-edited `expires_at` that is not a date never expires.**
   `parseUploadMeta()` only checks that it is a string, and `isExpired()`
   is false for an invalid date (`NaN <= now`), so the cron keeps it and
@@ -1838,7 +1878,8 @@ a normalized header. Following RFC 9110 §14:
     parts; the page deflates only if an upper bound of the zip fits them;
   - **a larger selection** is stored completely and sent with its size.
     If some of its files would have compressed, the page first says so
-    (more than about 7.8 GB, so uploaded uncompressed; for a smaller
+    (more than about 5.2 GB, from `MAX_UNSIZED_PARTS` × `PART_SIZE`, so
+    uploaded uncompressed; for a smaller
     download zip it yourself first, on a Mac with right-click →
     Compress) with **Upload anyway** and **Choose again**.
 
@@ -1846,7 +1887,8 @@ a normalized header. Following RFC 9110 §14:
   created: nothing in it but `.DS_Store` and empty folders, or two names
   that would be the same in the zip (with both names). **Test hook:**
   `window.__yeetE2E = { maxUnsizedParts: n }` before the page loads
-  lowers the page's limit (never above 150), so the e2e tests reach the
+  lowers the page's limit (never above `MAX_UNSIZED_PARTS`, 100), so the
+  e2e tests reach the
   forced store with 51 MiB.
 
 - **Lost file access** (iOS revokes access to a picked file when the

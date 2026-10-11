@@ -611,9 +611,10 @@ test.describe("R2 calls of completing an upload of unknown size", () => {
   test("fewer records per list call: the R2 call budget still refuses, before completing", async () => {
     // A second guard: the fewest records per call at which MAX_UNSIZED_PARTS
     // records take at most PART_RECORDS_BUDGET - 1 list calls and a delete
-    // (4 at 150, as api.md says; 7 at round 1K's 300). One fewer is refused.
+    // (3 at 100, as api.md says; 4 at round 1L's 150, 7 at round 1K's 300).
+    // One fewer is refused.
     const fewest = Math.ceil(MAX_UNSIZED_PARTS / (PART_RECORDS_BUDGET - 1));
-    expect(fewest).toBe(4);
+    expect(fewest).toBe(3);
     const short = new FakeBucket({ pageSize: fewest - 1 });
     seedUpload(short, idOf(0), { pendingSince: NOW, parts: MAX_UNSIZED_PARTS });
     const refused = await complete(short, idOf(0), MAX_UNSIZED_PARTS);

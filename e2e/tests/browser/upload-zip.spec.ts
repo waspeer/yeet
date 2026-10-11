@@ -10,9 +10,9 @@
 // objects (lib/browser.ts dropTree()); the folder picker reports no empty
 // folders, a drop does.
 //
-// The 150-part limit for uploads of unknown size (7.86 GB) is lowered with
+// The 100-part limit for uploads of unknown size (5.24 GB) is lowered with
 // the page's test hook (`window.__yeetE2E.maxUnsizedParts`), so the
-// forced-store path needs 51 MiB, not 8 GB.
+// forced-store path needs 51 MiB, not 5 GB.
 
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";

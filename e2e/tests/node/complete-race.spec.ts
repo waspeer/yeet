@@ -15,6 +15,7 @@
 import {
   DELETE_LIMIT,
   DELETED_UPLOAD_ID,
+  MAX_UNSIZED_PARTS,
   Uploads,
   summarize,
   type UploadMeta,
@@ -89,10 +90,13 @@ test.describe("complete racing a DELETE", () => {
   });
 
   test(`more than ${DELETE_LIMIT} objects: complete never overwrites the DELETE's marker`, async () => {
-    // Size unknown, 150 part records: the DELETE lists 100 keys, deletes
-    // them and marks the sidecar as a deletion under way (202).
+    // Size unknown, MAX_UNSIZED_PARTS part records (the most a complete
+    // accepts; with the sidecar and the file more than DELETE_LIMIT
+    // objects): the DELETE lists 100 keys, deletes them and marks the
+    // sidecar as a deletion under way (202).
+    expect(MAX_UNSIZED_PARTS + 2).toBeGreaterThan(DELETE_LIMIT);
     const b = new StrictBucket({ maxCalls: Infinity });
-    seedPending(b, "r2", 150);
+    seedPending(b, "r2", MAX_UNSIZED_PARTS);
     const uploads = new Uploads(b, P);
     const read = (await uploads.readMetaVersion("r2"))!;
     completeMultipart(b, "r2");
@@ -129,7 +133,7 @@ test.describe("complete racing a DELETE", () => {
   });
 
   test("a DELETE after the sidecar write deletes the finished upload as usual", async () => {
-    for (const parts of [0, 150]) {
+    for (const parts of [0, MAX_UNSIZED_PARTS]) {
       const b = new StrictBucket({ maxCalls: Infinity });
       seedPending(b, "r4", parts);
       const uploads = new Uploads(b, P);

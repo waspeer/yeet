@@ -6,8 +6,16 @@
 // fetch handler runs in Node here on the in-memory strict bucket, so the R2
 // calls are counted. The same refusals against `wrangler dev`:
 // upload-api.spec.ts and verify-1l.spec.ts.
+//
+// Round 2F: a `complete` of an upload whose size is unknown checks the
+// length of `parts` against MAX_UNSIZED_PARTS (lowered to 100) the same
+// way, before any entry is looked at and before the part records are read.
 
-import { summarize, type UploadMeta } from "../../../packages/worker/src/uploads.js";
+import {
+  MAX_UNSIZED_PARTS,
+  summarize,
+  type UploadMeta,
+} from "../../../packages/worker/src/uploads.js";
 import { expect, test } from "../../lib/index.js";
 import { StrictBucket } from "../../lib/strict-r2.js";
 import { WORKER_ORIGIN, WORKER_TOKEN, workerFetch } from "../../lib/worker-node.js";
@@ -190,6 +198,71 @@ test.describe("complete with the size known: the count is checked first", () => 
     expect((await complete(b, { parts: withInvalid(2), size: 3 })).json).toEqual({
       error: ENTRY_ERROR,
     });
+  });
+});
+
+const TOO_MANY =
+  `Too many parts to complete an upload of unknown size (at most ${MAX_UNSIZED_PARTS}); ` +
+  `start the upload again and send its size ("size" in POST /api/uploads)`;
+
+test.describe("complete with the size unknown: the cap is checked first (round 2F)", () => {
+  test("the cap is 100 parts", () => {
+    expect(MAX_UNSIZED_PARTS).toBe(100);
+  });
+
+  test(`${MAX_UNSIZED_PARTS + 1} entries, the first invalid: the cap's error, only the sidecar read`, async () => {
+    const b = bucketWith(undefined);
+    // The invalid entry is never reported: the count is refused first.
+    const res = await complete(b, { parts: withInvalid(MAX_UNSIZED_PARTS + 1) });
+    expect(res).toEqual({ status: 400, json: { error: TOO_MANY } });
+    // One sidecar read (to know the size is unknown); no part records listed.
+    expect(b.calls).toEqual({ get: 1 });
+  });
+
+  test("an entry past the cap that is invalid, or a duplicate, is not reported either", async () => {
+    for (const parts of [
+      [...entries(MAX_UNSIZED_PARTS), { part_number: 0, etag: "x" }],
+      [...entries(MAX_UNSIZED_PARTS), { part_number: 3, etag: "again" }],
+      [...entries(MAX_UNSIZED_PARTS), { part_number: MAX_UNSIZED_PARTS + 1 }],
+    ]) {
+      const b = bucketWith(undefined);
+      const res = await complete(b, { parts });
+      expect(res, JSON.stringify(parts.at(-1))).toEqual({ status: 400, json: { error: TOO_MANY } });
+      expect(b.calls).toEqual({ get: 1 });
+    }
+  });
+
+  test("10,000 entries, the first null: the cap's error, one R2 call", async () => {
+    const b = bucketWith(undefined);
+    const res = await complete(b, { parts: [null, ...entries(MAX_PARTS - 1)] });
+    expect(res).toEqual({ status: 400, json: { error: TOO_MANY } });
+    expect(b.calls).toEqual({ get: 1 });
+  });
+
+  test(`at the cap (${MAX_UNSIZED_PARTS} entries) the entries are still checked first`, async () => {
+    const invalid = bucketWith(undefined);
+    expect(await complete(invalid, { parts: withInvalid(MAX_UNSIZED_PARTS) })).toEqual({
+      status: 400,
+      json: { error: ENTRY_ERROR },
+    });
+    expect(invalid.calls).toEqual({ get: 1 });
+    // Valid entries without part records: the records are read, part 1 is missing.
+    const valid = bucketWith(undefined);
+    expect(await complete(valid, { parts: entries(MAX_UNSIZED_PARTS) })).toEqual({
+      status: 400,
+      json: { error: "Part 1 was not uploaded" },
+    });
+    expect(valid.calls["get"]).toBe(1);
+    expect(valid.calls["list"]).toBe(1);
+    expect(valid.completed).toEqual([]);
+  });
+
+  test("a sized upload is not refused by the unsized cap", async () => {
+    const size = (MAX_UNSIZED_PARTS + 1) * PART_SIZE;
+    const b = bucketWith(size);
+    const res = await complete(b, { parts: entries(MAX_UNSIZED_PARTS + 1) });
+    expect(res.status).toBe(200);
+    expect(b.completed).toHaveLength(1);
   });
 });
 

@@ -4,7 +4,7 @@
 // - zipSizeBound() is a true worst case (every byte the CLI's zip writes,
 //   for long names, many empty files, empty folders and random data), and
 //   is the documented formula (ceil, per entry, 64 per deflated file).
-// - The threshold is "at most 149 parts" (<=, not <).
+// - The threshold is "at most MAX_UNSIZED_PARTS - 1 parts" (<=, not <).
 // - The test hooks cannot raise the cap or be fed a malformed bound.
 // - A disk that fills up while the temporary zip is written (ENOSPC, stubbed)
 //   gives the message suggesting --store and leaves nothing behind.
@@ -86,7 +86,7 @@ async function cliTmpDir(tmp: string) {
 const contents = async (dir: string) =>
   (await readdir(dir, { recursive: true })).map(String).sort();
 
-/** A part size at which `bound` no longer fits in 149 parts. */
+/** A part size at which `bound` no longer fits in MAX_UNSIZED_PARTS - 1 parts. */
 const partSizeAbove = (bound: number) => Math.ceil(bound / (MAX_UNSIZED_PARTS - 1)) - 1;
 
 function expectNothingKept(s: StandIn, code: number | null, out: string, expected: number) {
@@ -139,17 +139,19 @@ test.describe("verifier 2B.1: zipSizeBound()", () => {
 });
 
 test.describe("verifier 2B.1: threshold and hooks (stand-in server)", () => {
-  test("a bound of exactly 149 parts is streamed (at most, not below)", async ({ tmp }) => {
+  const streamed = MAX_UNSIZED_PARTS - 1;
+  test(`a bound of exactly ${streamed} parts is streamed (at most, not below)`, async ({ tmp }) => {
     const root = await album(tmp);
-    // A stored file's size adds 1:1 to the bound: pad it to a multiple of 149.
+    // A stored file's size adds 1:1 to the bound: pad it to a multiple of
+    // `streamed`.
     const pad = join(root, "pad.jpg");
     await writeFile(pad, Buffer.alloc(1000, 7));
     const bound0 = zipSizeBound(await zipPlan([root]), false);
-    await writeFile(pad, Buffer.alloc(1000 + ((149 - (bound0 % 149)) % 149), 7));
+    await writeFile(pad, Buffer.alloc(1000 + ((streamed - (bound0 % streamed)) % streamed), 7));
     const bound = zipSizeBound(await zipPlan([root]), false);
-    expect(bound % 149).toBe(0);
+    expect(bound % streamed).toBe(0);
     const cliTmp = await cliTmpDir(tmp);
-    const s = await standIn(bound / 149);
+    const s = await standIn(bound / streamed);
     try {
       const r = await cli(["upload", root], { env: { ...s.env, TMPDIR: cliTmp } });
       expectExitCode(r, 0);
@@ -165,20 +167,23 @@ test.describe("verifier 2B.1: threshold and hooks (stand-in server)", () => {
   test("YEET_TEST_MAX_UNSIZED_PARTS only lowers the cap; malformed values are ignored", () => {
     const saved = process.env.YEET_TEST_MAX_UNSIZED_PARTS;
     try {
+      const max = MAX_UNSIZED_PARTS;
+      expect(max).toBe(100); // round 2F
       const cases: [string | undefined, number][] = [
-        [undefined, 150],
-        ["", 150],
-        ["150", 150],
-        ["151", 150],
-        ["1000", 150],
-        ["1e9", 150],
-        ["Infinity", 150],
-        ["0", 150],
-        ["-1", 150],
-        ["1.5", 150],
-        ["abc", 150],
+        [undefined, max],
+        ["", max],
+        [`${max}`, max],
+        [`${max + 1}`, max],
+        ["150", max], // the cap before round 2F
+        ["1000", max],
+        ["1e9", max],
+        ["Infinity", max],
+        ["0", max],
+        ["-1", max],
+        ["1.5", max],
+        ["abc", max],
         ["1", 1],
-        ["149", 149],
+        [`${max - 1}`, max - 1],
       ];
       for (const [value, expected] of cases) {
         if (value === undefined) delete process.env.YEET_TEST_MAX_UNSIZED_PARTS;
@@ -341,7 +346,8 @@ test.describe("verifier 2B.1: the temporary file (stand-in server)", () => {
 
 // Round 2D (leftovers of 2B.1): YEET_TEST_ZIP_SIZE_BOUND could raise the
 // bound as well as lower it, and the docs and --help said the temporary
-// file "needs that much free disk space", which reads as about 7.8 GB.
+// file "needs that much free disk space", which read as about 7.8 GB (the
+// 150-part cap of the time).
 test.describe("round 2D: the zip size hook and the free space wording", () => {
   test("YEET_TEST_ZIP_SIZE_BOUND only lowers the bound; malformed values are ignored", () => {
     const saved = process.env.YEET_TEST_ZIP_SIZE_BOUND;

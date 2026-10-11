@@ -37,8 +37,8 @@ function el<T extends HTMLElement = HTMLElement>(id: string): T {
 
 /**
  * Test hook (e2e only): a lower MAX_UNSIZED_PARTS, so the tests of what
- * happens near the server's limit for uploads of unknown size (150 parts,
- * 7.86 GB) need megabytes instead of gigabytes. A lower limit only makes the
+ * happens near the server's limit for uploads of unknown size (100 parts,
+ * 5.24 GB) need megabytes instead of gigabytes. A lower limit only makes the
  * page store sooner; it can never let it exceed the server's.
  */
 function maxUnsizedParts(): number {
@@ -362,7 +362,8 @@ function idleMessage(text: string): void {
 }
 
 /**
- * A selection over the limit for uploads of unknown size (about 7.8 GB)
+ * A selection over the limit for uploads of unknown size (about 5.2 GB,
+ * from MAX_UNSIZED_PARTS)
  * with files that would compress: stored instead, so its size is known.
  * Say so before anything is uploaded; the person may upload it anyway or
  * zip it first themselves.
