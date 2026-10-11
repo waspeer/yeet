@@ -285,7 +285,7 @@ test.describe("1L verifier: the deletion-under-way sidecar", () => {
   });
 
   test("race: a complete that lands after the marker does not bring the upload back", async () => {
-    // Size unknown, 150 part records: complete reads the sidecar (pending),
+    // 150 part records (more than DELETE_LIMIT objects): complete reads the sidecar (pending),
     // R2 completes, the DELETE then lists 100 keys and writes the marker, and
     // complete's sidecar write lands last. Until round 2C that write was
     // unconditional and the upload was listed again; it is now conditional

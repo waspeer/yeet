@@ -1252,7 +1252,7 @@ cost about 3–4 ms more at p50.
 - **`MAX_UNSIZED_PARTS`: 100.** That is the largest measured count with
   a p90 of 10 ms (75 measured the same; the fit puts 10 ms at about 80, an
   estimate). The cap for an upload of unknown size is the parts times 50
-  MiB: today 150 parts, 7.86 GB; at 100, 5.24 GB (the CLI's bound of one
+  MiB: then 150 parts, 7.86 GB; at 100, 5.24 GB (the CLI's bound of one
   part fewer, 99 parts, 5.19 GB; at 80, 4.19 GB). Above it the upload page
   stores the selection and sends its size, and the CLI writes the zip to
   a temporary file first, so a lower value moves the zips between 5.24
