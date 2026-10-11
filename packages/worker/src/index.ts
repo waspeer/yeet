@@ -472,6 +472,23 @@ api.post("/uploads/:id/complete", async (c) => {
     }
   }
 
+  // Size unknown at create: refused before anything is changed if there are
+  // more parts or part records than one request reads (MAX_UNSIZED_PARTS),
+  // or if the records cannot be listed and deleted within
+  // PART_RECORDS_BUDGET R2 calls. The count is checked before the entries
+  // are looked at (round 2F), like the sized count above: a longer list can
+  // never complete, whatever its entries.
+  const tooMany = () =>
+    c.json(
+      {
+        error:
+          `Too many parts to complete an upload of unknown size (at most ${MAX_UNSIZED_PARTS}); ` +
+          `start the upload again and send its size ("size" in POST /api/uploads)`,
+      },
+      400,
+    );
+  if (meta.file_size === undefined && entries.length > MAX_UNSIZED_PARTS) return tooMany();
+
   const parts = parseParts(entries);
   if (typeof parts === "string") return c.json({ error: parts }, 400);
 
@@ -479,19 +496,6 @@ api.post("/uploads/:id/complete", async (c) => {
   // part sizes, so the client gets a clear error instead of R2's.
   let partRecords: string[] = [];
   if (meta.file_size === undefined) {
-    // Refused before anything is changed if there are more parts or part
-    // records than one request reads (MAX_UNSIZED_PARTS), or if the records
-    // cannot be listed and deleted within PART_RECORDS_BUDGET R2 calls.
-    const tooMany = () =>
-      c.json(
-        {
-          error:
-            `Too many parts to complete an upload of unknown size (at most ${MAX_UNSIZED_PARTS}); ` +
-            `start the upload again and send its size ("size" in POST /api/uploads)`,
-        },
-        400,
-      );
-    if (parts.length > MAX_UNSIZED_PARTS) return tooMany();
     const records = await uploads.readPartSizes(id, PART_RECORDS_BUDGET, MAX_UNSIZED_PARTS);
     if (!records) return tooMany();
     const { sizes, keys } = records;
