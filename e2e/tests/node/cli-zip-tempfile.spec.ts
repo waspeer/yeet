@@ -258,7 +258,7 @@ test.describe("yeet upload: compressed zips of any size (stand-in server)", () =
       expect(r.stderr, describeRun(r)).toMatch(
         new RegExp(
           `Upload of album\\.zip failed: Not enough free disk space\\. A compressed zip that may ` +
-            `be larger than 15\\.0 KB is written to a temporary file before it is uploaded, ` +
+            `be larger than ${formatSize(MAX_UNSIZED_PARTS * 100).replace(".", "\\.")} is written to a temporary file before it is uploaded, ` +
             `which needs [\\d.]+ MB free in ${cliTmp} \\([\\d.]+ MB is free\\)\\. Use --store`,
         ),
       );
