@@ -69,8 +69,9 @@ your yeet and delete them, so treat it like a password.
    files**; you can pick several files there). Several files or a folder
    become one zip file: a folder is called `<folder name>.zip`, loose
    files `yeet-<date>-<time>.zip`. If the selection is more than about
-   5.2 GB, the page first says it will upload it without compressing it,
-   and you choose **Upload anyway** or **Choose again**.
+   5.2 GB and could be compressed, the page first says it will upload it
+   without compressing it, and you choose **Upload anyway** or **Choose
+   again**.
 5. Wait until the upload finishes. Keep the page open meanwhile; on a
    phone, keep the screen on. If the page says the browser lost access to
    the file (this happens on an iPhone when the screen locks or you

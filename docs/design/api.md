@@ -1699,8 +1699,9 @@ would cost more than they do. The exception is the CLI's temporary zip
   decision (round 2F; halving it would save about 2 ms a run, _inferred_,
   at twice the runs per upload). With `MAX_UNSIZED_PARTS` at 100 the CLI
   and the upload page never create such an upload: their uploads of
-  unknown size have at most 100 parts, and they delete what they do not
-  complete. Only a non-conforming client (with the token) can leave
+  unknown size have at most 100 parts, so they never leave more than 100
+  part records (what they leave behind, e.g. a page closed mid-upload, the
+  cron removes). Only a non-conforming client (with the token) can leave
   thousands of part records, by uploading parts and never completing.
 - **A hand-edited `expires_at` that is not a date never expires.**
   `parseUploadMeta()` only checks that it is a string, and `isExpired()`
