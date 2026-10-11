@@ -209,6 +209,15 @@ stays the same as today; the CLI and the tests depend on it.
     a short part and then a higher-numbered part gets a clear `400` at the
     latest at `complete`, never R2's opaque error.
 - **`POST /api/uploads/:id/complete`** `{ parts, size? }`.
+  - **Body:** at most 961,024 bytes (`MAX_COMPLETE_BODY`, round 2E: 96
+    bytes for each of R2's 10,000 parts and 1 KiB besides), checked against
+    `Content-Length` and while reading; over it is a `413` ("Request body
+    too large: at most 961024 bytes"), before anything is read from the
+    bucket.
+  - **Size known at create: exactly `max(1, ceil(size / part_size))`
+    parts** (an empty file is 1). Any other count is a `400` naming both
+    numbers, after the sidecar read and before any entry is looked at
+    (round 2E; see "Upload API" below).
   - **Validated before completing:** the parts array (shape, numbers 1..n,
     no duplicates, etags are strings).
   - **Stored size:** `file_size` comes from R2's `object.size` after the
@@ -499,18 +508,34 @@ Numbers that are signed or used as keys must be spelled one way only:
     stored object makes the request delete the upload too (a listing and
     deletes of all its keys, up to 150 records now); the cron deletes
     whatever a failed request leaves after 24 hours.
-  - **Size known: at most as many parts as the size has** (round 1L). A
-    `complete` listing more parts than `max(1, ceil(size / part_size))` is
-    a `400` ("Invalid parts: an upload of 104857601 bytes has 3 parts
-    (part_size 52428800 bytes), not 4") after the sidecar read, before R2
-    is asked; those parts were refused on `PUT` anyway. Any `parts` array
-    longer than R2's 10,000 is a `400` ("Invalid parts: at most 10000")
-    before its entries are parsed or sorted. So the array a request sorts
-    is bounded by 10,000 entries and by the request body. Measured in
-    phase 2: a sized `complete` with 10,000 entries (669 KB of JSON,
-    refused for the size) p50 9, p90 18, max 20 (n = 21, over two days);
-    with 10,001 (refused by the length) p50 3, p90 6 (n = 11). Over 10 ms
-    at p90; only an authenticated client can send it.
+  - **Size known: exactly as many parts as the size has** (round 1L for
+    more, round 2E for any other count). A `complete` whose `parts` has
+    another length than `max(1, ceil(size / part_size))` is a `400`
+    ("Invalid parts: an upload of 104857601 bytes has 3 parts (part_size
+    52428800 bytes), not 4"; "… has 1 part …, not 2" for an empty file)
+    after the sidecar read, **before any entry is validated, sorted or
+    looked up**, and before R2 is asked. More parts were refused on `PUT`
+    anyway; fewer would make a shorter file, which before round 2E reached
+    R2's complete and ended in the `422` size mismatch, deleting the
+    upload. Any `parts` array longer than R2's 10,000 is a `400` ("Invalid
+    parts: at most 10000") before the upload is looked up. The body is at
+    most 961,024 bytes (`MAX_COMPLETE_BODY`, a `413` over it). So the
+    entries a request checks and sorts are as many as its declared size
+    has parts, and `JSON.parse` sees at most 961,024 bytes. Measured in
+    phase 2, before round 2E: a sized `complete` with 10,000 entries (669
+    KB of JSON, refused for the size) p50 9, p90 18, max 20 (n = 21, over
+    two days); with 10,001 (refused by the length) p50 3, p90 6 (n = 11).
+    Round 2E refuses the first like the second, before the entries;
+    **not yet re-measured on a deploy** (a Node proxy: see "Measurements
+    (phase 2)"). A `complete` of a finished upload answers its link
+    without looking at the entries either (they are not used). The CLI
+    and the upload page always send exactly the parts they uploaded, one
+    per `part_size` of the declared size (`unsized-complete.spec.ts`
+    counts the CLI's; the CLI and upload page suites complete through
+    `wrangler dev`). Tests: `e2e/tests/node/complete-count.spec.ts` (the
+    real handler in Node on the strict in-memory bucket, R2 calls
+    counted: one sidecar read for each refused count), `upload-api.spec.ts`
+    and `verify-1l.spec.ts` (`wrangler dev`).
   - **Why not check per part:** with the size unknown, a short part is only
     wrong once a higher one exists. That would cost a bucket listing on every
     `PUT`.
@@ -533,8 +558,10 @@ Numbers that are signed or used as keys must be spelled one way only:
   requests at once on `wrangler dev`) and `verify-1l-units.spec.ts`.
 - **`complete` of a finished upload** (round 2C): `200` with the same
   `{ id, url }` as the first, without touching anything (no R2 call
-  beyond the sidecar read). The upload page retries a `complete` whose
-  answer was lost (a network error, a `5xx`); before, the retry got
+  beyond the sidecar read). Since round 2E its `parts` entries are not
+  looked at (only the body cap and the array's length, 1 to 10,000, are
+  checked, before the sidecar read); before, an invalid entry got a
+  `400`. The upload page retries a `complete` whose answer was lost (a network error, a `5xx`); before, the retry got
   `404 "No upload in progress"` for an upload that had worked. A deleted
   upload, or one being deleted, still gets the `404`.
 - **Errors R2 raises at `complete`** (e.g. a wrong etag): `400` with
@@ -569,8 +596,7 @@ upload in progress: it was deleted"}`, as when the `DELETE` lands after
   path above. **Two completes at once both succeed** and return the same
   object (5 of 5), so then neither request takes this path; the
   conditional sidecar write keeps it to one write, and both answer `200`.
-  A complete after an abort throws the same 10024; a wrong etag throws
-  10025. Tests: `e2e/tests/node/complete-route-race.spec.ts` ("complete
+  A complete after an abort throws the same 10024; a wrong etag throws 10025. Tests: `e2e/tests/node/complete-route-race.spec.ts` ("complete
   after R2 refused it"), on the in-memory bucket, with an R2 that refuses a
   second complete.
 
@@ -1081,17 +1107,18 @@ ms later; 12 races per kind and day, pooled):
 
 **The estimates of round 1L, against these:**
 
-| estimated                                                   | measured (phase 2)                           | verdict                     |
-| ----------------------------------------------------------- | -------------------------------------------- | --------------------------- |
-| a page with a jump (200 objects): p50 about 6, p90 about 10 | walk p50 5, p90 7; repeated p50 5, p90 6     | confirmed, better           |
-| cron, a run ending in a run of records: p50 8, p90 10       | p50 5–9, p90 8–12                            | refuted for expired uploads |
-| `complete`, 150 part records: p50 7–9                       | p50 15, p90 17                               | refuted: higher             |
-| `complete`, 151 refused: about 6                            | p50 7, p90 8                                 | confirmed                   |
-| a `DELETE` of 100 objects: about 1.5 ms above 4 / 7         | p50 4, p90 5 (85 requests)                   | confirmed, better           |
-| one cron run per about 100 keys                             | 20–31 runs for 2,000–3,001 keys              | confirmed                   |
-| a sized `complete` with 10,000 entries                      | p50 9, p90 18 (two days: 16 / 20 and 7 / 12) | over 10 ms at p90           |
+| estimated                                                   | measured (phase 2)                           | verdict                                          |
+| ----------------------------------------------------------- | -------------------------------------------- | ------------------------------------------------ |
+| a page with a jump (200 objects): p50 about 6, p90 about 10 | walk p50 5, p90 7; repeated p50 5, p90 6     | confirmed, better                                |
+| cron, a run ending in a run of records: p50 8, p90 10       | p50 5–9, p90 8–12                            | refuted for expired uploads                      |
+| `complete`, 150 part records: p50 7–9                       | p50 15, p90 17                               | refuted: higher                                  |
+| `complete`, 151 refused: about 6                            | p50 7, p90 8                                 | confirmed                                        |
+| a `DELETE` of 100 objects: about 1.5 ms above 4 / 7         | p50 4, p90 5 (85 requests)                   | confirmed, better                                |
+| one cron run per about 100 keys                             | 20–31 runs for 2,000–3,001 keys              | confirmed                                        |
+| a sized `complete` with 10,000 entries                      | p50 9, p90 18 (two days: 16 / 20 and 7 / 12) | over 10 ms at p90 (fixed in 2E, not re-measured) |
 
-**Over 10 ms at p90**, with the constant that bounds each (none changed;
+**Over 10 ms at p90**, with the constant that bounds each (none changed
+in phase 2, one fixed in round 2E;
 _estimates, not measured_):
 
 - **`complete` of unknown size with 150 records** (p90 17):
@@ -1115,7 +1142,26 @@ _estimates, not measured_):
   to 10,000 (p90 18) reaches 10 ms at about 4,500–5,000 entries (225–250
   GB at the 50 MiB part size); checking the
   count against the declared size before the entries are parsed would
-  avoid it without a constant.
+  avoid it without a constant. **Implemented in round 2E, not yet
+  re-measured on a deploy:** a sized `complete` whose `parts` length is
+  not the declared size's part count is refused after the sidecar read,
+  before any entry is looked at, so 10,000 entries against a smaller
+  size cost what the 10,001 refusal does (the body read and
+  `JSON.parse`), and the body is capped at 961,024 bytes
+  (`MAX_COMPLETE_BODY`, about 1.4 times the measured 669 KB). Only an
+  upload declared with 10,000 parts (488 GiB) still has 10,000 entries
+  checked. _Local proxy, not Workers CPU_ (the handler in Node 24 on an
+  Apple M5 Pro, the in-memory bucket, 628,905 bytes of JSON with 32-hex
+  etags in reverse order, n = 300 after 30 warm-up calls, ms p50 / p90):
+
+  | `parts` against a 3-byte upload | before, JIT | after, JIT  | before, `--jitless` | after, `--jitless` |
+  | ------------------------------- | ----------- | ----------- | ------------------- | ------------------ |
+  | 10,000 entries (count refused)  | 0.81 / 0.92 | 0.71 / 0.78 | 1.60 / 1.92         | 0.77 / 0.87        |
+  | 10,001 entries (`MAX_PARTS`)    | 0.71 / 0.78 | 0.71 / 0.76 | 0.77 / 0.94         | 0.75 / 0.83        |
+
+  In Node the 10,000 refusal now costs the same as the 10,001 one;
+  measure both on a deploy before relying on the Workers numbers.
+
 - **A correct password** (p90 13): `PBKDF2_ITERATIONS` (20,000), as
   decided in rounds 1H and 1K; the hash alone about 5–7 ms.
 - **First requests on fresh isolates** (`GET /`, the download page,
