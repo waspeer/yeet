@@ -159,6 +159,13 @@ stays the same as today; the CLI and the tests depend on it.
     ms slower throughout): a correct password p50 13, p90 20 ms (max 22,
     n = 60), a wrong one p50 12, p90 23 (max 26, n = 40); none refused.
     **Decision (round 1K): still 20,000 iterations.**
+  - **Measured in phase 2** (deploy `e2b4554`, 0.4 s apart): a correct
+    password p50 11, p90 13 ms (max 16, n = 36), a wrong one p50 6, p90 8
+    (max 10, n = 35); none refused. A correct one also signs the download
+    URL and counts the download (an open file's download alone: p50 3–4),
+    so the hash itself is about 5–7 ms (inferred). Still over 10 ms at p90
+    for a correct password; the iteration count (`PBKDF2_ITERATIONS`) is
+    unchanged.
   - **Trade-off:** a stolen bucket's hashes are 2.5× cheaper to brute-force.
     Online guessing stays capped at 5 wrong passwords per minute per IP per
     upload, parallel requests included: each attempt is counted before its
@@ -340,8 +347,9 @@ Evaluated on the Free plan:
   - An empty `Authorization` header never reaches the Worker: `wrangler
 dev` removes it (an empty header of another name arrives), and so does
     Cloudflare's edge (measured in phase 1H with a probe Worker that
-    reports the headers it gets). Such a request is therefore treated like
-    one without the header (session cookie, not counted). The Worker's own
+    reports the headers it gets, and again in phase 2: 3 of 3 without it,
+    while an empty `X-Empty-Test:` arrived). Such a request is therefore
+    treated like one without the header (session cookie, not counted). The Worker's own
     rule (an empty header present decides and counts) stays, in case a
     future edge passes it on; it is unit-tested in
     `e2e/tests/node/parsing.spec.ts`.
@@ -466,7 +474,11 @@ Numbers that are signed or used as keys must be spelled one way only:
     33 µs per record listed and deleted (the complete, over a sized
     `complete`'s p50 4 ms in the same session), so for 150 records about
     7–9 ms p50 for a `complete` and about 6 ms for the refusal (151
-    listed); the p90 may stay near 10.
+    listed); the p90 may stay near 10. **Measured in phase 2:** the
+    refusal of 151 records p50 7, p90 8 (n = 11), as estimated, but the
+    `complete` of 150 records p50 15, p90 17, max 17 (n = 10, all `200`),
+    no less than 300 records cost in phase 1K: still over 10 ms, and not
+    in proportion to the records (see "Measurements (phase 2)").
 
   - **Second guard, the R2 call budget:** `complete` makes 4 subrequests
     besides the records (the Bearer rate-limit call, the sidecar read, the
@@ -494,8 +506,11 @@ Numbers that are signed or used as keys must be spelled one way only:
     is asked; those parts were refused on `PUT` anyway. Any `parts` array
     longer than R2's 10,000 is a `400` ("Invalid parts: at most 10000")
     before its entries are parsed or sorted. So the array a request sorts
-    is bounded by 10,000 entries and by the request body; that work (one
-    pass and one sort) is not measured.
+    is bounded by 10,000 entries and by the request body. Measured in
+    phase 2: a sized `complete` with 10,000 entries (669 KB of JSON,
+    refused for the size) p50 9, p90 18, max 20 (n = 21, over two days);
+    with 10,001 (refused by the length) p50 3, p90 6 (n = 11). Over 10 ms
+    at p90; only an authenticated client can send it.
   - **Why not check per part:** with the size unknown, a short part is only
     wrong once a higher one exists. That would cost a bucket listing on every
     `PUT`.
@@ -546,11 +561,29 @@ upload in progress: it was deleted"}`, as when the `DELETE` lands after
     (the case above) and still gets `200`.
   - Otherwise the `400` above.
 
-  What real R2 does with a second `complete` of one multipart upload
-  (refuse it, or answer like the first) is **not measured**; both are
-  handled. Tests: `e2e/tests/node/complete-route-race.spec.ts` ("complete
+  What real R2 does (measured in phase 2, through a probe Worker): a
+  second `complete` of a multipart upload already completed **throws**
+  (10024, "The specified multipart upload does not exist"), also 1.5 s
+  later and from a resumed handle, and leaves the object as it was; so a
+  `complete` sent again after the first finished takes the "file exists"
+  path above. **Two completes at once both succeed** and return the same
+  object (5 of 5), so then neither request takes this path; the
+  conditional sidecar write keeps it to one write, and both answer `200`.
+  A complete after an abort throws the same 10024; a wrong etag throws
+  10025. Tests: `e2e/tests/node/complete-route-race.spec.ts` ("complete
   after R2 refused it"), on the in-memory bucket, with an R2 that refuses a
   second complete.
+
+  **Racing a `DELETE` on real R2** (phase 2, 48 races): the `DELETE` wins
+  every time (nothing left of a sized upload; the download page `404` for
+  one with more than `DELETE_LIMIT` objects). The `complete` answers `200`
+  when it finished first (then the `DELETE` deletes a finished upload),
+  `404` when the sidecar was already gone or marked, and in 20 of 48
+  races the `400` above with R2's 10024: the `DELETE` had aborted the
+  multipart upload but not yet deleted or marked the sidecar, which it
+  does last, so this check still found a pending sidecar and no file. The
+  client is told the upload failed rather than that it was deleted; the
+  outcome is the same.
 
 - **`422` body:**
   `{"error": "Size mismatch: expected X bytes, stored Y", "expected_size": X, "stored_size": Y}`.
@@ -667,9 +700,14 @@ per request, the sidecar marked and never missing until the end, 21
 requests to delete all; a single `DELETE` finished by the cron),
 `delete-bounded.spec.ts` (on `wrangler dev`, and `yeet delete` against a
 stand-in server) and `download-records.spec.ts` (2,100 legacy records:
-22 requests). _Estimate, not measured:_ phase 1K measured a `DELETE` of a
-small upload at p50 4, p90 7 ms (n = 11); 100 objects listed add about
-1.5 ms at the cron's 15 µs per object, plus a delete call.
+22 requests). Phase 1K measured a `DELETE` of a small upload at p50 4,
+p90 7 ms (n = 11), and estimated about 1.5 ms more for 100 objects.
+**Measured in phase 2:** `yeet delete` of an upload with 3,000 part
+records (3,001 keys) made 31 requests (30 `202`, then `200`; 99 keys
+each besides the sidecar, which is among the 100 listed), in 68 s; over
+85 such requests p50 4, p90 5, max 12 ms. A single `DELETE` left 2,902
+keys, which the cron deleted in 30 runs (p50 5, p90 8 ms). See
+"Measurements (phase 2)".
 
 Other deletions by a request use the same bounded `Uploads.delete()`: the
 download page and form of an expired upload (in `waitUntil()`), and a
@@ -855,7 +893,233 @@ request (`DELETE_LIMIT`). The other constants stay. _Estimates, not
 measured_ (see "To measure next"): a page with a jump about p50 6, p90 10;
 the cron run that replaces the `deleteUnder()` one about p50 8, p90 10;
 the `complete` of 150 records about p50 7–9; a `DELETE` of 100 objects
-about 1.5 ms above a small one's p50 4, p90 7.
+about 1.5 ms above a small one's p50 4, p90 7. Phase 2 measured these
+(below): the page and the `DELETE` confirmed, the cron run and the
+`complete` of 150 records refuted (higher).
+
+### Measurements (phase 2)
+
+The control measurement of the bounds of round 1L (`PAGE_LIMIT` 150,
+`JUMP_LIMIT` 50, `PAGE_READS` 5, `CLEANUP_LIST_LIMIT` 100,
+`CLEANUP_SUMMARIES` 3, `MAX_UNSIZED_PARTS` 150, `DELETE_LIMIT` 100),
+together with the routes phase 2 added, on a real Workers Free deploy of
+`e2b4554` (a test account, Sentry off). Two sessions on the same deploy,
+2026-10-10 and 2026-10-11 (the first was cut off; the second finished it
+without redeploying). Measured as in phases 1J and 1K: CPU time per
+invocation from `wrangler tail --format json` (`cpuTime`), the cron's
+`runCleanup()` called through a probe Worker on the same bucket, every
+request tagged so its tail event can be joined with the driver's log.
+Figures are p50 / p90 / max in ms over n events.
+
+- **n is what the tail captured.** In fast series (requests 0.3–0.4 s
+  apart) the tail of 2026-10-11 dropped a third to half of the events
+  (no warning; e.g. 36 of 60 correct passwords), and in the first
+  session it lost its connection a few times. So some cases were sent
+  more often than their n.
+- **No `exceededCpu`** and no `503` in either session: about 2,700
+  Worker events (Durable Object calls included) and 400 probe events, all `ok` except 2 `canceled` (a `yeet delete` cut
+  off with the first session).
+- **Session noise:** a correct password took p50 11, p90 13 (n = 36) in
+  the second session, as in phase 1K (10 and 14 early, 8 and 12 late).
+
+**The route mix** (`measure.sh`, 20 rounds right after a deploy, on
+2026-10-10; then the same with `EXTRA=1`, which adds the download pass and
+a session cookie):
+
+| route                                      | mix                            | mix, `EXTRA=1`                  |
+| ------------------------------------------ | ------------------------------ | ------------------------------- |
+| `GET /health`                              | 0 / 1 / 5 (19)                 | 0 / 1 / 1 (20)                  |
+| `GET /`                                    | 2 / 25 / 27 (20)               | 1 / 2 / 13 (20)                 |
+| `GET /api/me` (Bearer or session; 401)     | 1 / 4 / 6 (20); 1 / 3 / 7 (20) | 1 / 5 / 7 (38); 1 / 7 / 11 (19) |
+| `GET /upload` (session)                    | –                              | 2 / 19 / 21 (20)                |
+| `GET /api/uploads` (a small bucket)        | 3 / 12 / 14 (20)               | 3 / 9 / 9 (20)                  |
+| `GET /:id/:filename` (open and protected)  | 1 / 18 / 28 (40)               | 1 / 15 / 35 (59)                |
+| `POST /:id/download`, open (303)           | 4 / 7 / 8 (20)                 | 3 / 6 / 6 (20)                  |
+| `POST /:id/download`, correct password     | 12 / 14 / 14 (10)              | 12 / 27 / 28 (19)               |
+| `POST /:id/download`, download pass        | –                              | 4 / 13 / 13 (9)                 |
+| `POST /:id/download`, wrong password (401) | 13 / 26 / 26 (10)              | 7 / 35 / 35 (10)                |
+| `POST /:id/download`, rate-limited (429)   | 3 / 5 / 12 (20)                | 2 / 11 / 21 (40)                |
+| `GET /_dl/:id` (the presigned redirect)    | 3 / 5 / 11 (20)                | 2 / 6 / 7 (19)                  |
+| `POST /api/uploads`                        | 4 / 9 / 21 (21)                | 3 / 6 / 15 (22)                 |
+| `PUT /api/uploads/:id/parts/:n`            | 3 / 7 / 12 (21)                | 3 / 7 / 9 (22)                  |
+| `POST /api/uploads/:id/complete` (sized)   | 5 / 9 / 15 (22)                | 5 / 8 / 14 (22)                 |
+| `DELETE /api/uploads/:id` (small)          | 5 / 7 / 10 (22)                | 4 / 6 / 9 (22)                  |
+
+(The mix's wrong password counts as a failure, so after five a minute the
+protected file's correct passwords were answered `429` too: only 10 of 20
+are a password check.) The p90s over 10 ms are single requests of 10–35
+ms among ones of 0–2: in time order, mostly in the first rounds after the
+deploy and then scattered, as when a request lands on a fresh isolate.
+_Inference, not measured separately:_ that is isolate startup, not the
+route's own work. The same pages warm, 1.5 s apart and without a
+redeploy (2026-10-11): `GET /` 0 / 1 / 1 (n = 17), the download page 1 /
+2 / 3 (n = 13). Against phase 1K: a small `DELETE` 5 / 7 / 10 and 4 / 6
+/ 9 here, 4 / 7 / 9 there; a sized `complete` 5 / 9 / 15 here right after
+the deploy and 2 / 3 / 4 (n = 12) spaced out, 4 / 9 there. `GET /upload`
+(the upload page, new in phase 2) stays bimodal: 7 of 20 over 10 ms.
+
+**The password check** (PBKDF2 at 20,000 iterations, `POST /:id/download`,
+0.4 s apart, 2026-10-11): a correct password p50 11, p90 13, max 16 (n =
+36, 22 over 10 ms); a wrong one, at most 5 per upload so none is
+rate-limited, p50 6, p90 8, max 10 (n = 35); a `429` p50 2 (n = 10). A
+correct password also signs the download URL, sets the pass and counts
+the download, which an open file's download costs alone (p50 3–4, p90
+6–7); _inferred from the difference:_ the hash is about 5–7 ms of it.
+
+**`GET /api/uploads`** (a bucket of 1,000 finished uploads, 7 of them with
+300 legacy `.downloads/` records so that a page ends in their run and
+jumps; 2026-10-10 unless stated):
+
+- a page with a jump (at most 200 objects) **during a walk**, pages 1 s
+  apart: p50 5, p90 7, max 10 (n = 21); a plain page (150 objects) during
+  the walk: p50 4, p90 6, max 10 (n = 24);
+- the **same pages repeated**: with a jump p50 5, p90 6, max 6 (n = 20),
+  plain p50 4, p90 5, max 7 (n = 14), pooled from both days (the cron had
+  deleted part of the legacy records overnight; they were seeded again);
+- the last page of the bucket ending in a pending upload's 300 `.parts/`
+  records, so the **jump is empty**: p50 5, p90 7, max 13 (n = 12; 10
+  uploads, `cursor: null`); with a **short jump** (12 objects after the
+  run): p50 5, p90 6, max 8 (n = 12; 16 uploads, `cursor: null`).
+
+**The cron** (`runCleanup()` through the probe, from a cursor right before
+the upload, until the upload is gone or only its own keys are left;
+2026-10-10 unless stated):
+
+| case                                                | runs | CPU p50 / p90 / max (n) | over 10 ms |
+| --------------------------------------------------- | ---- | ----------------------- | ---------- |
+| a current upload with 2,000 legacy records          | 20   | 6 / 10 / 15 (20)        | 1          |
+| an expired upload with 2,000 legacy records         | 21   | 9 / 12 / 14 (21)        | 8          |
+| an expired pending upload with 3,000 part records   | 31   | 9 / 11 / 20 (31)        | 4          |
+| a deletion marker with 2,902 keys left (2026-10-11) | 30   | 5 / 8 / 8 (30)          | 0          |
+| plain runs over the walk bucket                     | –    | 5 / 9 / 9 (10)          | 0          |
+
+Each run of the first four ends inside the upload's run of records and
+deletes what its slice saw: about 100 keys a run, as expected (one run
+per about 100 keys). The real hourly trigger fired 3 times while the tail
+ran: 7, 8 and 7 ms. The two runs of the same kind (an expired upload's
+records) differ by 3–4 ms between the days; the first day's are over
+10 ms at p90.
+
+**`POST /api/uploads/:id/complete`** (2026-10-10 unless stated):
+
+| case                                                       | n   | p50 / p90 / max | over 10 ms | answer               |
+| ---------------------------------------------------------- | --- | --------------- | ---------- | -------------------- |
+| unknown size, 150 part records                             | 10  | 15 / 17 / 17    | 8          | all `200`            |
+| unknown size, 151 part records (refused)                   | 11  | 7 / 8 / 9       | 0          | all `400`            |
+| sized, 10,000 entries in `parts` (refused for the size)    | 21  | 9 / 18 / 20     | 8          | all `400`            |
+| sized, 10,001 entries (refused before parsing)             | 11  | 3 / 6 / 7       | 0          | all `400`            |
+| sized, normal (the conditional sidecar write)              | 12  | 2 / 3 / 4       | 0          | all `200`            |
+| the same uploads completed again (idempotent)              | 10  | 1 / 2 / 2       | 0          | all `200`, same link |
+| R2 refuses (a wrong etag: 1 `head`, 1 sidecar read)        | 12  | 3 / 3 / 4       | 0          | all `400`            |
+| a CLI zip of a folder (unknown size, 1 record, 2026-10-11) | 8   | 5 / 6 / 6       | 0          | all `200`            |
+
+The 10,000-entry body is 669 KB of JSON; the two days gave p50 16, p90 20
+(n = 10) and p50 7, p90 12 (n = 11). The 10,001-entry one is refused by
+its length (`Invalid parts: at most 10000`), after `JSON.parse` but before
+the entries are checked or sorted.
+
+**`complete` racing a `DELETE`** (both sent at once, the `DELETE` 0–300
+ms later; 12 races per kind and day, pooled):
+
+- **sized** (24 races): `complete` `200` 13 times (p50 3, p90 3), `404`
+  6 times (p50 3), `400` 5 times (p50 2, p90 4); the `DELETE` always
+  `200` (p50 4, p90 5, max 7); **nothing left** of the upload after any
+  race (keys counted after 1.5 s).
+- **unknown size, 120 part records** (24 races, more than `DELETE_LIMIT`
+  objects): `complete` `200` 9 times (p50 8, p90 12, max 12) and `400` 15
+  times (p50 8, p90 11, max 13); the `DELETE` always `202` (p50 6, p90 8,
+  max 11). Left after each of the second day's 18: the marker and either
+  the file (after a `200`) or 21 part records (after a `400`), and the
+  download page answered `404` in all 8 races where it was checked: the upload is gone for users
+  either way, and a second `DELETE` removed the rest (`200`).
+- A `complete` `200` followed by a `DELETE` that wins is the order
+  "complete, then delete": its link worked until the `DELETE`.
+- **The `400`**: "Could not complete the upload; … (completeMultipartUpload:
+  The specified multipart upload does not exist. (10024))". The `DELETE`
+  had aborted the multipart upload but not yet deleted the sidecar or
+  written its marker (it does that last), so `complete`'s check found a
+  pending sidecar and no file. The `404` comes only once the sidecar is
+  gone or marked. See "Errors R2 raises at `complete`".
+
+**`DELETE /api/uploads/:id` of an upload with thousands of part records**
+(2026-10-11; an upload of unknown size with 3,000 records, 3,001 keys):
+
+- **`yeet delete`** (the built CLI) made **31 requests** for 3,001 keys
+  (30 `202`, then `200`), in 68 s; for two uploads the first session left
+  half-deleted (2,407 and 2,902 keys), 25 and 29. Each request deletes 99
+  keys besides the sidecar: the 100 listed include it. CPU over all 85
+  requests: p50 4, p90 5, max 12 (2 over 10 ms); wall time p50 about 1–2 s
+  a request.
+- **One `DELETE`** of such an upload: `202`, 11 ms (n = 1), 2,902 keys
+  left; **the cron finished it in 30 runs** (p50 5, p90 8, max 8; see the
+  table above). The first session's `yeet delete`, cut off after 5
+  captured requests, had p50 8, p90 10, max 10.
+
+**R2** (through the probe):
+
+- `put()` with a non-matching `onlyIf: { etagMatches }` returns `null`
+  (no exception): for a stale etag, an etag that never existed, a key
+  that does not exist, and in the shape the Worker writes a sidecar
+  (`httpMetadata`, `customMetadata` and `onlyIf`); a matching one writes
+  (3 runs each). As phase 1H found.
+- **A second `multipart.complete()`** of an upload already completed
+  **throws** "completeMultipartUpload: The specified multipart upload does
+  not exist. (10024)", with the same handle and with a resumed one, also
+  1.5 s later; the object stays as the first made it. A complete after an
+  abort throws the same. A wrong etag throws 10025 ("One or more of the
+  specified parts could not be found"). **Two concurrent completes** of
+  one upload **both succeed** and return the same object (same etag and
+  `uploaded` time; 5 of 5 runs).
+- **An empty `Authorization:` header does not reach the Worker**: the
+  probe got no `authorization` header (3 of 3), while an empty header of
+  another name (`X-Empty-Test:`) arrived. As phase 1H found.
+- **A list call with `include: ["customMetadata"]`** returned 695–716
+  objects per call under `uploads/` (mostly part records, little
+  metadata) and 412–510 under the walk bucket's sidecars with summaries;
+  without metadata 728–861; the same with `limit: 1000`; never 1,000.
+  Phase 1H saw about 415 and 848.
+
+**The estimates of round 1L, against these:**
+
+| estimated                                                   | measured (phase 2)                           | verdict                     |
+| ----------------------------------------------------------- | -------------------------------------------- | --------------------------- |
+| a page with a jump (200 objects): p50 about 6, p90 about 10 | walk p50 5, p90 7; repeated p50 5, p90 6     | confirmed, better           |
+| cron, a run ending in a run of records: p50 8, p90 10       | p50 5–9, p90 8–12                            | refuted for expired uploads |
+| `complete`, 150 part records: p50 7–9                       | p50 15, p90 17                               | refuted: higher             |
+| `complete`, 151 refused: about 6                            | p50 7, p90 8                                 | confirmed                   |
+| a `DELETE` of 100 objects: about 1.5 ms above 4 / 7         | p50 4, p90 5 (85 requests)                   | confirmed, better           |
+| one cron run per about 100 keys                             | 20–31 runs for 2,000–3,001 keys              | confirmed                   |
+| a sized `complete` with 10,000 entries                      | p50 9, p90 18 (two days: 16 / 20 and 7 / 12) | over 10 ms at p90           |
+
+**Over 10 ms at p90**, with the constant that bounds each (none changed;
+_estimates, not measured_):
+
+- **`complete` of unknown size with 150 records** (p90 17):
+  `MAX_UNSIZED_PARTS`. The refusal, which lists 151 records, costs p50 7,
+  and a sized `complete` p50 2, so about 6–8 ms are the records' batch
+  delete and the rest. A straight line from a sized `complete` (p90 3)
+  to 150 records (p90 17) reaches 10 ms at about 75 records, but 300
+  records cost no more (p50 14, p90 17, phase 1K) and the racing ones of
+  120 p90 12: the cost does not follow the record count closely, so a
+  lower limit is not shown to help. Measure 50, 75 and 100 in one session
+  before changing it.
+- **The cron's run over an expired upload's records** (p90 11–12 on
+  2026-10-10, 8 on 2026-10-11): `CLEANUP_LIST_LIMIT` (and `JUMP_LIMIT`).
+  At the 1J slope of 15 µs per object listed, halving the slice to 50
+  saves under 1 ms of listing a run, and doubles the runs per upload and
+  the hours per bucket (ceil(N / 24)); within the session noise.
+- **A sized `complete` with 10,000 `parts`** (p90 18): `MAX_PARTS` in
+  `index.ts` (R2's own 10,000). The 10,001 refusal shows the body's
+  `JSON.parse` at p50 3, p90 6; the rest is checking and sorting the
+  entries. A straight line from a sized `complete` of one entry (p90 3)
+  to 10,000 (p90 18) reaches 10 ms at about 4,500–5,000 entries (225–250
+  GB at the 50 MiB part size); checking the
+  count against the declared size before the entries are parsed would
+  avoid it without a constant.
+- **A correct password** (p90 13): `PBKDF2_ITERATIONS` (20,000), as
+  decided in rounds 1H and 1K; the hash alone about 5–7 ms.
+- **First requests on fresh isolates** (`GET /`, the download page,
+  `GET /upload`, up to 35 ms): no constant.
 
 ### Listing a page (GET /api/uploads)
 
@@ -914,8 +1178,10 @@ asserted in `e2e/tests/node/r2-work-bounds.spec.ts` on a bucket returning
   1L; until then the page's 150) only has to reach the upload's sidecar
   and file after the run; a short jump is handled like any short page.
   At most 200 objects then. Phase 1K measured a jump page of 300 objects
-  at p50 8, p90 13, max 18 ms (n = 51); _estimate, not measured:_ about
-  p50 6, p90 10 at 200, from the slope between that and a full page.
+  at p50 8, p90 13, max 18 ms (n = 51), and estimated about p50 6, p90
+  10 at 200; measured in phase 2 at p50 5, p90 7, max 10 during a walk
+  (n = 21) and p50 5, p90 6 repeated (n = 20); an empty jump p50 5, p90
+  7, a short one p50 5, p90 6 (n = 12 each).
 - **At most 5 reads** of sidecars without a summary (`PAGE_READS`, 10
   until round 1K; a jump takes the place of one): **at most 6 R2 calls**
   per page, plus the Bearer rate-limit call.
@@ -1093,11 +1359,13 @@ page's 150 because a run also writes summaries and deletes. Measured at
 the bounds of round 1K in phase 1K: a plain run p50 5, p90 9 ms; one with
 deletes p50 4, p90 7; one with 3 summaries p50 6, p90 7; one with a
 `deleteUnder()` round (300 objects) p50 10, p90 12, max 13 (see
-"Measurements (phase 1K)"). _Estimate, not measured:_ the run that now
-replaces the last (a slice of 100, a jump of 50, the deletes of what it
-saw) is a run with a jump and deletes: with the 1J slope of about 15 µs
-per object, about 2 ms below the `deleteUnder()` run, so about p50 8, p90
-10 ms.
+"Measurements (phase 1K)"). The run that now replaces the last (a slice
+of 100, a jump of 50, the deletes of what it saw) was estimated at about
+p50 8, p90 10 ms; phase 2 measured it at p50 6, p90 10 for a current
+upload's legacy records, p50 9, p90 12 and p50 9, p90 11 for an expired
+upload's legacy and part records (2026-10-10), and p50 5, p90 8 for a
+deletion marker's part records (2026-10-11): over 10 ms at p90 on the
+first day (see "Measurements (phase 2)"). The real hourly run: 7–8 ms.
 
 **The sidecar goes last** because it is what makes the listing see an
 upload: when a run (or a `DELETE /api/uploads/:id`) stops half-way, what is
@@ -1162,29 +1430,37 @@ their upload has been reached (`cronUntil()` in `e2e/lib/bucket.ts`).
 
 ### To measure next (on a real deploy)
 
-Phase 1K measured the bounds of round 1K (see "Measurements (phase 1K)").
-What remains is a **control measurement of the bounds of round 1L**, on the
-same kind of deploy and in the same way, against the estimates above
-(none of them measured yet):
+Phase 2 took the control measurement of the bounds of round 1L together
+with the routes phase 2 adds (see "Measurements (phase 2)"). The page with
+a jump, the `DELETE` of many records, the refusal of 151 records and the
+phase 2 `complete` paths of a sized upload are within 10 ms at p90 (a
+racing `complete` of unknown size with 120 records is not: p90 11–12).
+What remains, on the
+same kind of deploy and in the same way:
 
-- `GET /api/uploads`: a page with a jump of at most 50 objects (200 in
-  all; estimated p50 about 6, p90 about 10 ms), during a walk and
-  repeated, with an empty and a short jump among them.
-- The cron: a run that ends inside an upload's run of legacy records or
-  part records and deletes the keys it saw (a slice of 100, a jump of 50,
-  a batch delete; estimated p50 about 8, p90 about 10), for a current
-  upload with legacy records and for a stale one; and how many runs a
-  stale upload with a few thousand part records takes on real R2 (one per
-  about 100 keys expected).
-- `POST /api/uploads/:id/complete` of an upload of unknown size with 150
-  part records (estimated p50 about 7–9) and with 151 (refused, about 6);
-  and a sized `complete` with a long `parts` array (up to 10,000 entries,
-  refused for the declared size), not measured at all.
-- `DELETE /api/uploads/:id` of an upload with a few thousand part records:
-  each request (100 objects listed, one delete, the sidecar's rewrite;
-  estimated about 1.5 ms above a small `DELETE`'s p50 4, p90 7), the
-  number of requests `yeet delete` makes, and the cron finishing an
-  upload left after one request.
+- **`POST /api/uploads/:id/complete` of unknown size** at 50, 75 and 100
+  part records, in one session with 150 again: 150 records cost p50 15,
+  p90 17, no less than 300 did in phase 1K, so the cost does not follow
+  the record count closely. Only then decide whether to lower
+  `MAX_UNSIZED_PARTS` (a straight line from a sized `complete` suggests
+  about 75 for a p90 of 10 ms; _estimate, not measured_). Splitting the
+  time between the listing, the multipart complete, the sidecar write and
+  the batch delete of the records (a probe doing each alone) would show
+  where it goes.
+- **The cron's run over an expired upload's records** in one session with
+  a deletion marker's: p90 11–12 on 2026-10-10, 8 on 2026-10-11 for the
+  same kind of run. If it stays over 10 ms, the constant is
+  `CLEANUP_LIST_LIMIT` (or `JUMP_LIMIT`).
+- **A sized `complete` with 10,000 `parts`** (p90 18): whether to lower
+  `MAX_PARTS` (about 4,500–5,000 entries for 10 ms, _estimate_) or check
+  the count against the declared size before parsing the entries.
+- **`GET /upload` and the first requests on a fresh isolate** (10–35 ms):
+  whether that is isolate startup (the route's own work warm is 0–3 ms
+  for `GET /` and the download page; `GET /upload` warm was not measured
+  apart).
+- **`GET /api/uploads` with 5 sidecar reads** and **the cron with 3
+  summaries** were not repeated in phase 2 (phase 1K: p50 6, p90 9 and
+  p50 6, p90 7); the code did not change.
 - If a page, a run or a request is still over 10 ms, lower the constant
   (`PAGE_LIMIT`, `JUMP_LIMIT`, `CLEANUP_LIST_LIMIT`, `PAGE_READS`,
   `CLEANUP_SUMMARIES`, `MAX_UNSIZED_PARTS`, `DELETE_LIMIT`). That is a
@@ -1192,9 +1468,9 @@ same kind of deploy and in the same way, against the estimates above
   compute what they expect from the constants, and `verify-1i.spec.ts` and
   `r2-capacity.spec.ts` check that this file states their values and the
   numbers derived from them.
-
-The maintainer decided to take this measurement together with the routes
-phase 2 adds, not as a separate run.
+- `wrangler tail` dropped a third to half of the events of fast series in
+  phase 2: space requests about 1.5 s apart, or join by a request header,
+  and report how many were captured.
 
 ### Known limitations (accepted)
 
@@ -1220,6 +1496,14 @@ would cost more than they do. The exception is the CLI's temporary zip
   the file could, if `complete`'s write lands before the `DELETE`'s
   sidecar delete, leave the file without a sidecar. Not seen; it needs a
   failed read and two requests in a window of a few milliseconds.
+  Measured on real R2 in phase 2 (48 races, sized and of unknown size):
+  the `DELETE` won every time and nothing was left without a sidecar.
+  Also seen there: in 20 of the 48 the `complete` answered the `400`
+  "Could not complete the upload" (R2's 10024) instead of the `404`, when
+  the `DELETE` had aborted the multipart upload but not yet deleted or
+  marked the sidecar (see "Errors R2 raises at `complete`"). Not changed
+  by the measurement: the upload is gone either way, and only a client
+  that deletes and completes the same upload at once sees it.
   The upload page also never sends its cleanup `DELETE` once it has sent
   `complete` (see "Upload page module"), and the CLI's zip upload sends
   `complete` only when every part succeeded and `DELETE` only instead of
