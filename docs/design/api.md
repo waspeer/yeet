@@ -1121,6 +1121,88 @@ _estimates, not measured_):
 - **First requests on fresh isolates** (`GET /`, the download page,
   `GET /upload`, up to 35 ms): no constant.
 
+### Measurements (round 2E)
+
+The two open questions of phase 2 (the cost per part record of an unsized
+`complete`, and the cron over an expired upload's records), in one
+session on a fresh Workers Free deploy of `f3aac84` (the test account,
+Sentry off; the measured paths are unchanged since `e2b4554`), on
+2026-10-11, 11:01 to 11:30 UTC. Measured as in phase 2: `cpuTime` per
+event from `wrangler tail --format json`, every request tagged and joined
+with the driver's log, the cron's `runCleanup()` called through the probe
+Worker. Figures are p50 / p90 / max in ms over n events (quantile: the
+sorted value at index floor(p·n)).
+
+- **Warm-up:** 10 throwaway requests after the deploy (`GET /health`,
+  `GET /api/uploads`). No measured request was excluded: leaving out
+  each size's first event changes no p90.
+- **Captured:** every request, except 1 of 24 refusals (requests at least
+  1.5 s apart). No `exceededCpu`: 906 Worker and 560 probe events, all
+  `ok`. The real hourly trigger did not fire during the session.
+
+**`POST /api/uploads/:id/complete` of unknown size** (a fresh upload per
+request: 1 real part plus seeded `.parts/` records up to the count; two
+series of 14 rounds, each round the five counts in a random order, so
+warm-up and time of day fall on all counts alike; the 151 refusal in 12
+rounds of each series, on one upload, as it changes nothing):
+
+| part records  | n   | p50 / p90 / max | over 10 ms | series 1 / series 2 (p50 / p90) | answer    |
+| ------------- | --- | --------------- | ---------- | ------------------------------- | --------- |
+| 50            | 28  | 5 / 8 / 11      | 1          | 5 / 7; 5 / 10                   | all `200` |
+| 75            | 28  | 5 / 10 / 12     | 1          | 5 / 9; 6 / 10                   | all `200` |
+| 100           | 28  | 6 / 10 / 12     | 2          | 6 / 9; 7 / 10                   | all `200` |
+| 120           | 28  | 8 / 14 / 16     | 7          | 7 / 12; 9 / 15                  | all `200` |
+| 150           | 28  | 7 / 18 / 30     | 7          | 7 / 19; 9 / 14                  | all `200` |
+| 151 (refused) | 23  | 4 / 7 / 9       | 0          | 4 / 7; 4 / 5                    | all `400` |
+
+Each `200` left 2 keys (the sidecar and the file): the records were
+deleted. The p50 hardly moves with the count; the tail does. A
+least-squares line through the per-count p90s: about 2.3 ms + 98 µs per
+record (R² 0.90), so 10 ms at about **80 records** (_estimate from the
+fit_); through the p50s 3.5 ms + 28 µs per record; through all 140 events
+2.9 ms + 42 µs per record, with much scatter (R² 0.16). **Measured, the
+largest count whose p90 stays at or under 10 ms is 100** (p90 10, 2 of
+28 over); 120 and 150 are over (p90 14 and 18). Against phase 2: 150
+records p50 15 there, 7 here, with the same p90 (17 and 18), and a refusal
+p50 7 there, 4 here: this session ran faster at the median; the tail
+did not.
+
+**The cron** (`runCleanup()` through the probe, from a cursor right
+before the upload, until it is gone; two series per case, the second
+after the second `complete` series):
+
+| case                                              | runs per series | p50 / p90 / max (n) | over 10 ms | per series (p50 / p90) |
+| ------------------------------------------------- | --------------- | ------------------- | ---------- | ---------------------- |
+| an expired upload with 2,000 legacy records       | 21, 21          | 5 / 8 / 13 (42)     | 1          | 5 / 7; 4 / 8           |
+| an expired pending upload with 3,000 part records | 31, 31          | 8 / 11 / 17 (62)    | 7          | 8 / 11; 8 / 10         |
+| plain runs over the bucket (reference)            | –               | 4 / 6 / 10 (12)     | 0          | –                      |
+
+Each run deleted about 100 keys, as in phase 2 (21 and 31 runs). The
+legacy records' runs are within 10 ms at p90 (7 and 8; phase 2: 12 on
+2026-10-10, 8 on 2026-10-11 for the comparable run): the 12 of the
+first day was that session. The part records' runs are not: p90 10–11
+in both series, as in phase 2 (11), so three series on two days; they
+make one more subrequest a run than the legacy ones (5 against 4) and
+cost about 3–4 ms more at p50.
+
+**What this supports** (no constant was changed; the maintainer decides):
+
+- **`MAX_UNSIZED_PARTS`: 100.** That is the largest measured count with
+  a p90 of 10 ms (75 measured the same; the fit puts 10 ms at about 80, an
+  estimate). The cap for an upload of unknown size is the parts times 50
+  MiB: today 150 parts, 7.86 GB; at 100, 5.24 GB (the CLI's bound of one
+  part fewer, 99 parts, 5.19 GB; at 80, 4.19 GB). Above it the upload page
+  stores the selection and sends its size, and the CLI writes the zip to
+  a temporary file first, so a lower value moves the zips between 5.24
+  and 7.86 GB to those paths (a stored zip, or a temporary file on disk).
+- **`CLEANUP_LIST_LIMIT` / `JUMP_LIMIT` for legacy records: no change**
+  needed (p90 7–8 in this session).
+- **The cron over part records** stays at p90 10–11, with no
+  `exceededCpu`. If that is to get a margin, the constant is
+  `CLEANUP_LIST_LIMIT`: _inferred, not measured,_ from the 3–4 ms a run
+  above a plain one, halving the slice to 50 would save about 2 ms, at
+  twice the runs per upload.
+
 ### Listing a page (GET /api/uploads)
 
 `GET /api/uploads` answers **one page per request**:
@@ -1438,19 +1520,20 @@ racing `complete` of unknown size with 120 records is not: p90 11–12).
 What remains, on the
 same kind of deploy and in the same way:
 
-- **`POST /api/uploads/:id/complete` of unknown size** at 50, 75 and 100
-  part records, in one session with 150 again: 150 records cost p50 15,
-  p90 17, no less than 300 did in phase 1K, so the cost does not follow
-  the record count closely. Only then decide whether to lower
-  `MAX_UNSIZED_PARTS` (a straight line from a sized `complete` suggests
-  about 75 for a p90 of 10 ms; _estimate, not measured_). Splitting the
-  time between the listing, the multipart complete, the sidecar write and
-  the batch delete of the records (a probe doing each alone) would show
-  where it goes.
-- **The cron's run over an expired upload's records** in one session with
-  a deletion marker's: p90 11–12 on 2026-10-10, 8 on 2026-10-11 for the
-  same kind of run. If it stays over 10 ms, the constant is
-  `CLEANUP_LIST_LIMIT` (or `JUMP_LIMIT`).
+- **`POST /api/uploads/:id/complete` of unknown size**: measured in round
+  2E (see "Measurements (round 2E)"): p90 at or under 10 ms up to 100
+  part records, 14 at 120 and 18 at 150; the data supports
+  `MAX_UNSIZED_PARTS` 100 (a cap of 5.24 GB instead of 7.86 GB). Still
+  open: splitting the time between the listing, the multipart complete,
+  the sidecar write and the batch delete of the records (a probe doing
+  each alone), which would show where the tail at 120–150 comes from;
+  and, if the constant is lowered, the same series once more at the new
+  value.
+- **The cron's run over an expired pending upload's part records**: p90
+  10–11 in round 2E (two series) as in phase 2; the legacy records' run is
+  within 10 ms (p90 7–8). If a margin is wanted, measure
+  `CLEANUP_LIST_LIMIT` 50 against 100 in one session (about 2 ms saved,
+  _inferred_).
 - **A sized `complete` with 10,000 `parts`** (p90 18): whether to lower
   `MAX_PARTS` (about 4,500–5,000 entries for 10 ms, _estimate_) or check
   the count against the declared size before parsing the entries.
