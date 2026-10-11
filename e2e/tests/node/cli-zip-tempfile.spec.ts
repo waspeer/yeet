@@ -1,11 +1,12 @@
 // No cap on compressed zip uploads (round 2B.1, packages/cli/src/upload-zip.ts):
 // a compressed zip whose worst-case size (zipSizeBound()) fits in the
-// server's 150 parts of unknown size, a part to spare, is streamed; a larger
+// server's MAX_UNSIZED_PARTS parts of unknown size (100 since round 2F), a
+// part to spare, is streamed; a larger
 // one is zipped to a temporary file first and uploaded with its exact size
 // at create.
 //
 // Against the stand-in server, whose part size the test picks, so a few KB
-// stand in for 7.86 GB: the threshold from both sides (byte-identical zips,
+// stand in for 5.24 GB: the threshold from both sides (byte-identical zips,
 // check.py), the temporary file (mode 600 in a mode-700 folder, in TMPDIR)
 // and its removal on every way out (success, a server error, a file that
 // changes size, Ctrl-C, SIGTERM, SIGHUP, a second Ctrl-C), the free-space
@@ -16,6 +17,7 @@
 import { spawn } from "node:child_process";
 import { appendFile, mkdir, readdir, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { MAX_UNSIZED_PARTS } from "../../../packages/cli/src/limits.js";
 import { planUpload } from "../../../packages/cli/src/selection.js";
 import { formatSize } from "../../../packages/cli/src/transfer.js";
 import { FREE_SPACE_MARGIN, zipSizeBound } from "../../../packages/cli/src/upload-zip.js";
@@ -147,11 +149,12 @@ test.describe("yeet upload: compressed zips of any size (stand-in server)", () =
   }) => {
     const { root, zipFiles } = await album(tmp);
     const bound = await boundOf([root]);
-    // Streamed iff bound <= 149 parts (150, a part to spare).
-    const below = Math.ceil(bound / 149);
+    // Streamed iff bound <= MAX_UNSIZED_PARTS - 1 parts (a part to spare).
+    const streamedParts = MAX_UNSIZED_PARTS - 1;
+    const below = Math.ceil(bound / streamedParts);
     const above = below - 1;
-    expect(bound).toBeLessThanOrEqual(149 * below);
-    expect(bound).toBeGreaterThan(149 * above);
+    expect(bound).toBeLessThanOrEqual(streamedParts * below);
+    expect(bound).toBeGreaterThan(streamedParts * above);
     const cliTmp = await cliTmpDir(tmp);
 
     // Below: one upload of unknown size, its size at complete, no temporary file.
@@ -186,7 +189,7 @@ test.describe("yeet upload: compressed zips of any size (stand-in server)", () =
       expectExitCode(r, 0);
       expect(r.stdout).toBe("http://127.0.0.1/up2/stand-in.zip\n");
       expect(r.stderr).toContain(
-        `The zip may be larger than ${formatSize(150 * above)}, the most yeet streams without ` +
+        `The zip may be larger than ${formatSize(MAX_UNSIZED_PARTS * above)}, the most yeet streams without ` +
           `knowing its size up front: zipping it to a temporary file in ${cliTmp} first.`,
       );
       const [first, second] = viaFile.creates();
@@ -227,7 +230,7 @@ test.describe("yeet upload: compressed zips of any size (stand-in server)", () =
       ]);
       expect(s.creates()[1]!.json).toMatchObject({ size: zip.length });
       // More parts than an upload of unknown size may have: no cap.
-      expect(s.puts().length).toBeGreaterThan(150);
+      expect(s.puts().length).toBeGreaterThan(MAX_UNSIZED_PARTS);
       expect(await contents(cliTmp)).toEqual([]);
     } finally {
       await s.close();

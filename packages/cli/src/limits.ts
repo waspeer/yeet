@@ -22,19 +22,20 @@ export const MAX_DELETE_ROUNDS = 200;
 /**
  * The most parts a server completes for an upload whose size it was not told
  * at create (`MAX_UNSIZED_PARTS` in packages/worker/src/uploads.ts, round
- * 1L; an e2e test keeps the two equal): at the 50 MiB part size, 150 parts
- * are 7.86 GB. A compressed zip's size is only known once it is written, so
- * the CLI streams one only when it cannot be larger than that, a part to
- * spare (zipSizeBound() in upload-zip.ts); a larger one is zipped to a
+ * 2F, 150 before; an e2e test keeps the two equal): at the 50 MiB part
+ * size, 100 parts are 5.24 GB. A compressed zip's size is only known once
+ * it is written, so the CLI streams one only when it cannot be larger than
+ * that, a part to spare (99 parts, 5.19 GB; zipSizeBound() in
+ * upload-zip.ts); a larger one is zipped to a
  * temporary file first and sent with its size, which has no such limit.
  * So does a zip whose size is known up front (every file stored: `--store`,
  * or only already-compressed files).
  */
-export const MAX_UNSIZED_PARTS = 150;
+export const MAX_UNSIZED_PARTS = 100;
 
 /**
  * MAX_UNSIZED_PARTS, or less for the e2e tests: YEET_TEST_MAX_UNSIZED_PARTS
- * (1 to 149) lowers it, so a small zip takes the temporary-file path against
+ * (1 to 99) lowers it, so a small zip takes the temporary-file path against
  * a server with 50 MiB parts. Higher values are ignored.
  */
 export function maxUnsizedParts(): number {

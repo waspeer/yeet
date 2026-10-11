@@ -30,12 +30,17 @@ printed one link per file.
   links to nothing and link loops are skipped with a note, and names are made
   safe for Windows (`:` becomes `_`, with a note). Two names that would clash
   in the zip (ignoring case) are an error naming both.
-- No size cap: a compressed zip that could come out larger than about 7.8 GB
+- No size cap: a compressed zip that could come out larger than about 5.2 GB
   (the most the server accepts without knowing the size up front) is written
   to a temporary file in `$TMPDIR` first, then uploaded. It needs free disk
   space for about the size of the files plus 256 MiB (checked first; the message suggests `--store` when it is
   short), and the file is always deleted: on success, on an error, on Ctrl-C,
   SIGTERM or SIGHUP. `--store` never needs a temporary file.
+- The temporary-file threshold follows the server's limit for uploads of
+  unknown size, lowered from 150 to 100 parts (about 5.2 GB instead of
+  7.8 GB). A pre-release 0.3.0 build that streams up to 7.8 GB gets its zip
+  refused at `complete` by a current server when it ends up over 100 parts
+  (the upload is then deleted); update the CLI.
 - If anything goes wrong part-way (a file that cannot be read or changes while
   it is read, a network failure, Ctrl-C), the upload is deleted and never
   completed: a link never points to half a zip.

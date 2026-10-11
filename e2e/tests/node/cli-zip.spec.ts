@@ -6,7 +6,7 @@
 //    tiny part sizes so small files take many parts: exact part sizes, the
 //    size at complete, and every failure path (unreadable file, a file that
 //    changes while it is read, a part that keeps failing, Ctrl-C, the guard
-//    on the 150-part limit of uploads of unknown size): DELETE, never
+//    on the MAX_UNSIZED_PARTS limit of uploads of unknown size): DELETE, never
 //    complete (the temporary-file path for larger zips is in
 //    cli-zip-tempfile.spec.ts);
 // 3. the real Worker (wrangler dev): zips of several files and of a folder
@@ -260,8 +260,9 @@ test.describe("yeet upload: what gets zipped", () => {
     expect(p.warnings.join("\n")).toMatch(/is \d{3} characters long; Windows Explorer/);
   });
 
-  test("the CLI's 150-part limit for zips of unknown size is the server's", () => {
+  test("the CLI's part limit for zips of unknown size is the server's", () => {
     expect(CLI_MAX_UNSIZED_PARTS).toBe(MAX_UNSIZED_PARTS);
+    expect(MAX_UNSIZED_PARTS).toBe(100); // round 2F (150 before)
   });
 });
 
@@ -325,7 +326,7 @@ test.describe("yeet upload <folder>: the upload (stand-in server)", () => {
     tmp,
   }) => {
     const { root, zipFiles } = await album(tmp);
-    // 100-byte parts: the ~50 KB zip takes far more than 150 parts.
+    // 100-byte parts: the ~50 KB zip takes far more than MAX_UNSIZED_PARTS.
     const s = await standIn(100);
     try {
       const r = await cli(["upload", root, "--store"], { env: s.env, timeoutMs: 120_000 });
@@ -447,12 +448,13 @@ test.describe("yeet upload <folder>: the upload (stand-in server)", () => {
     }
   });
 
-  test("the guard: a zip of unknown size that outgrows its estimate stops before part 151", async ({
+  test(`the guard: a zip of unknown size that outgrows its estimate stops before part ${CLI_MAX_UNSIZED_PARTS + 1}`, async ({
     tmp,
   }) => {
     // The bound (zipSizeBound()) is a worst case, so this cannot happen in
     // normal use; YEET_TEST_ZIP_SIZE_BOUND=0 makes the CLI stream a zip of
-    // about 200 parts of 100 bytes (20 KB of noise) as if it fitted in 150.
+    // about 200 parts of 100 bytes (20 KB of noise) as if it fitted in
+    // CLI_MAX_UNSIZED_PARTS (100: 10.0 KB).
     const root = join(tmp, "big");
     await mkdir(root);
     await randomFile(root, 20 * KiB, "noise.bin");
@@ -465,7 +467,10 @@ test.describe("yeet upload <folder>: the upload (stand-in server)", () => {
       expectAborted(
         s,
         r,
-        /The zip grew past 15\.0 KB \(150 parts of 100 B\).*a bug in yeet.*--store/,
+        new RegExp(
+          `The zip grew past ${(CLI_MAX_UNSIZED_PARTS / 10).toFixed(1)} KB ` +
+            `\\(${CLI_MAX_UNSIZED_PARTS} parts of 100 B\\).*a bug in yeet.*--store`,
+        ),
       );
       expect(s.creates()).toHaveLength(1);
       expect(s.create()!.json).not.toHaveProperty("size");
