@@ -18,6 +18,7 @@ copied verbatim into `packages/cli` (Node) and `packages/worker` (Worker + brows
 | CLI zip upload tests              | `e2e/tests/node/cli-zip.spec.ts`, `cli-zip-tempfile.spec.ts`, `cli-zip-verifier.spec.ts`           |
 | Oracle and helpers                | `e2e/zip/check.py` (verbatim), `parse.ts`, `validate.ts`, `module.ts`, `fixtures.ts`               |
 | Opt-in tools                      | `e2e/zip/mutate.mjs`, `readers.ts`, `archive-utility.ts`, `bench/`                                 |
+| Windows check (GitHub Actions)    | `.github/workflows/windows.yml`, `e2e/zip/windows/` (see [Windows](#windows-github-actions))       |
 
 **Changes from the prototype** (none contradicts this document; the first two are what it
 already asked for):
@@ -445,6 +446,69 @@ character path).
   kill the app, and no failures occurred.
 - Node 20.15 / 22.2 exactly (the `zlib.crc32` boundaries), Node < 18.
 
+## Windows (GitHub Actions)
+
+`.github/workflows/windows.yml` runs on `windows-latest` (a Windows Server image) on every push
+to `main` and `claude/**`, and by hand. The scripts are in `e2e/zip/windows/` (see
+`e2e/README.md`). It has two jobs:
+
+- **readers.** `make-archives.ts` makes test zips with the built CLI's `zip.ts` and its zlib
+  options. Each archive has a manifest of path, size, SHA-256 and mtime per entry. The archives:
+  - (a) non-ASCII names: accents, CJK, Hangul, Greek, Cyrillic, Hebrew/Arabic, emoji (with a
+    ZWJ sequence), en and em dashes, brackets and other punctuation, `FILENAMES` from
+    `e2e/lib/fixtures.ts`, and one name given in NFD that must come out NFC;
+  - (b) a folder tree with empty folders, deflated and stored;
+  - (c) names that `sanitizeForWindows` must fix (`CON.txt`, `nul`, `a:b`, `?`, `|`, `*`, a
+    backslash, a tab, trailing dots and spaces). The script checks each name against a fixed
+    table of what the function must make of it;
+  - (d) a stored archive of 4.3 GB: a zero-filled entry of 4 GiB + 262,141 bytes, then entries
+    past the 4 GiB offset, one of unknown size;
+  - (e) a deflated entry of 4 GiB + 1 MiB (19 MB compressed);
+  - (f) sizes unknown (ZIP64 local headers, 24-byte descriptors).
+
+  `run-readers.mjs` extracts each archive with four readers:
+  - Explorer's own zip handler (`zipfldr.dll`), through `Shell.Application` `CopyHere`, polled
+    until the files are complete (`shell-extract.ps1`). This is the closest automatable
+    stand-in for opening the zip in Explorer and copying everything out. The job fails
+    with a clear message if the image has no shell zip handler.
+  - `Expand-Archive` in PowerShell 7 (.NET `System.IO.Compression`).
+  - `Expand-Archive` in Windows PowerShell 5.1 (.NET Framework).
+  - `tar.exe` (bsdtar).
+
+  Per reader and archive, it compares the exact set of names as NTFS returns them (NFC,
+  emoji, CJK, the sanitized names) and the empty folders, and each file's size, SHA-256 and
+  mtime (within 2 s). `check.py` checks each archive's structure.
+
+- **cli** (Node 20, the oldest supported, and Node 24). Builds the CLI, which also
+  type-checks it; the CLI has no unit tests of its own. Then it runs `check-zip-copies.mjs`
+  and `cli-upload.ts`. That script runs the built CLI against `e2e/lib/stand-in.ts` (no
+  wrangler), with paths that have a drive letter, backslashes, forward slashes, a trailing
+  separator, a space and non-ASCII:
+  - `yeet upload <folder>`, streamed;
+  - `yeet upload <file> <folder>` through the temporary file, whose folder must be empty
+    afterwards;
+  - `yeet upload --store <folder>`, sized at create.
+
+  The uploaded zips are reassembled from their parts and go through the same readers and
+  `check.py`.
+
+A reader that extracts any archive wrongly fails the workflow, unless the failure is listed
+with a reason in `e2e/zip/windows/expected-failures.json` (by reader, archive and kind of
+problem). A listed failure that stops happening also fails the run. Results are in the job
+summary and in the `windows-*-results` artifacts. The small zips are kept as the
+`windows-test-zips` artifact, ready for the checks below.
+
+What this does not cover, and still needs a person:
+
+- A real double-click in Explorer on **Windows 10 and 11 desktop**: opening the zip as a
+  folder, "Extract all", and dragging files out. The workflow drives the same shell handler
+  on a Server image, but not the UI, its dialogs, or a desktop build's own `zipfldr.dll`.
+  Use the `windows-test-zips` artifact, plus a >4 GiB zip from `make-archives.ts`.
+- Windows 7 (the "ZIP64 extra first" rule), if anyone still cares.
+- DOS-time zones. The runner runs in UTC, so a reader that uses the DOS time instead of the
+  UT extra cannot be told apart there.
+- Third-party tools (7-Zip, WinRAR) and paths of 260+ characters.
+
 ## Measured numbers
 
 Environment for all numbers:
@@ -772,7 +836,10 @@ Also: "compression choice" (M28 inverted heuristic, M29 `--store` ignored) and "
 
 1. **Windows Explorer is untested.** That is the biggest compatibility unknown. Mitigation:
    the ZIP64-only-when-needed policy and spec-exact extras. Test on a real Windows machine
-   before release, especially with a >4 GiB zip and with non-ASCII names.
+   before release, especially with a >4 GiB zip and with non-ASCII names. The Windows
+   workflow now drives Explorer's zip handler on a Windows Server runner, including both
+   cases (see [Windows (GitHub Actions)](#windows-github-actions)). A double-click on a
+   desktop Windows is still open.
 2. **`Duplex.toWeb` is experimental in Node docs.** If it changes, wrap `zlib` in a small
    hand-written `TransformStream` instead. The interface is unaffected.
 3. **Files that change while zipping.**

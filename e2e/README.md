@@ -278,6 +278,30 @@ another copy), `fixtures.ts`. Opt-in tools there: `mutate.mjs`, `readers.ts`,
 `archive-utility.ts`, `bench/`; see "Reproduce" in `docs/design/zip.md`. The zip specs also run
 outside `npm run verify` (`npx playwright test --project=node tests/node/zip-format.spec.ts`).
 
+`zip/windows/` is the Windows check, run by the GitHub Actions workflow
+`.github/workflows/windows.yml` (on pushes to `main` and `claude/**`, and by hand) and not by
+`npm run verify`. It needs neither wrangler nor Playwright. What it checks, and what still
+needs a person, is in "Windows (GitHub Actions)" in `docs/design/zip.md`. The scripts:
+
+- `make-archives.ts`: the test zips, made with the built CLI's `dist/zip.js` and its zlib
+  options, each with a manifest in `check.py`'s format.
+- `run-readers.mjs`: extracts every archive with every reader, compares the result with the
+  manifest, runs `check.py`, and writes `summary.md` and `results.json`.
+- `shell-extract.ps1`: the Explorer reader (`Shell.Application` `CopyHere`).
+- `cli-upload.ts`: the built CLI against `lib/stand-in.ts`, with Windows paths.
+- `expected-failures.json`: known reader failures, each `{reader, archive, kind, reason}`
+  (`*` matches anything). A listed failure that stops happening fails the run too.
+
+They also run on macOS and Linux, with `tar` (bsdtar) and `unzip` as the readers, to try
+the scripts themselves. macOS bsdtar fails `names` there because it writes names in NFD:
+
+```sh
+(cd packages/cli && npm run build)
+node e2e/zip/windows/make-archives.ts --out /tmp/yz --no-big
+node e2e/zip/windows/run-readers.mjs --archives /tmp/yz --results /tmp/yz-results --readers unzip
+node e2e/zip/windows/cli-upload.ts --work /tmp/yc-work --out /tmp/yc
+```
+
 ### HTTP — `api.ts`
 
 - `api(path, init?)` → `Response`: fetch with `Authorization: Bearer <token>`;
