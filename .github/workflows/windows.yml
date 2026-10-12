@@ -1,0 +1,178 @@
+# yeet's zips and CLI on Windows (docs/design/zip.md, "Windows (GitHub Actions)").
+#
+# - cli: build the CLI on the oldest supported Node and a current LTS, check
+#   the zip.ts copies, upload a folder and two paths with the built CLI against
+#   a stand-in server (no wrangler), and extract the uploaded zips.
+# - readers: make test zips with zip.ts (non-ASCII names, empty folders,
+#   sanitized names, sizes unknown, >4 GiB stored and deflated) and extract
+#   each with Explorer's zip handler, Expand-Archive (PowerShell 7 and 5.1)
+#   and tar.exe, comparing names, sizes, SHA-256 and mtimes with a manifest;
+#   check.py checks each archive's structure.
+#
+# A wrong extraction fails the job unless it is listed, with a reason, in
+# e2e/zip/windows/expected-failures.json. No secrets are used.
+
+name: Windows
+
+on:
+  push:
+    branches: [main, "claude/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  cli:
+    name: CLI on Windows, Node ${{ matrix.node }}
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # 20: the oldest the CLI supports (engines.node >=20); 24: current LTS.
+        node: ["20", "24"]
+    steps:
+      - name: Keep line endings as committed
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # The .ts helpers (they import e2e/lib/*.ts) need Node >= 22.18. Keep
+      # this Node's path, then put the matrix Node on PATH for the CLI.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Remember the helper Node
+        run: |
+          "HELPER_NODE=$((Get-Command node).Source)" >> $env:GITHUB_ENV
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: packages/cli/package-lock.json
+
+      - name: Versions
+        run: |
+          "CLI Node:    $(node --version) ($((Get-Command node).Source))"
+          "Helper Node: $(& $env:HELPER_NODE --version) ($env:HELPER_NODE)"
+          "Python:      $(python --version)"
+          "Windows:     $((Get-CimInstance Win32_OperatingSystem).Caption) $([Environment]::OSVersion.Version)"
+
+      - name: Install and build the CLI (tsc, which also type-checks it)
+        working-directory: packages/cli
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          npm ci
+          npm run build
+
+      - name: The two copies of zip.ts are identical
+        run: node scripts/check-zip-copies.mjs
+
+      - name: CLI smoke test
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          node packages/cli/dist/index.js --version
+          node packages/cli/dist/index.js --help | Out-Null
+
+      - name: CLI uploads against a stand-in server
+        run: |
+          & $env:HELPER_NODE e2e/zip/windows/cli-upload.ts --work "$env:RUNNER_TEMP\yeet cli" --out "$env:RUNNER_TEMP\cli-zips" --cli-node (Get-Command node).Source
+
+      - name: Extract the CLI's zips with every reader
+        run: |
+          node e2e/zip/windows/run-readers.mjs --archives "$env:RUNNER_TEMP\cli-zips" --results "$env:RUNNER_TEMP\results" --work "$env:RUNNER_TEMP\readers" --label "Readers on the CLI's zips (Node ${{ matrix.node }})"
+
+      - name: Upload the results and the CLI's zips
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-cli-node${{ matrix.node }}
+          path: |
+            ${{ runner.temp }}/results
+            ${{ runner.temp }}/cli-zips
+          if-no-files-found: warn
+          retention-days: 14
+
+  readers:
+    name: Zip readers on Windows
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Keep line endings as committed
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: packages/cli/package-lock.json
+
+      - name: Install and build the CLI (the zips are made with its dist/zip.js)
+        working-directory: packages/cli
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          npm ci
+          npm run build
+
+      # One >4 GiB archive (~4.3 GB) and one extraction (~4.3 GB) at a time.
+      - name: Disk space
+        run: |
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name, Root, @{ n = 'Free GB'; e = { [math]::Round($_.Free / 1GB, 1) } }, @{ n = 'Used GB'; e = { [math]::Round($_.Used / 1GB, 1) } }
+          $drive = Get-PSDrive -Name (Split-Path -Qualifier $env:RUNNER_TEMP).TrimEnd(':')
+          "RUNNER_TEMP: $env:RUNNER_TEMP"
+          if ($drive.Free -lt 12GB) {
+            throw "Need 12 GB free on $($drive.Root) for the >4 GiB archives, have $([math]::Round($drive.Free / 1GB, 1)) GB"
+          }
+
+      - name: Make the test zips
+        run: |
+          node e2e/zip/windows/make-archives.ts --out "$env:RUNNER_TEMP\zips"
+
+      - name: Extract every zip with every reader
+        run: |
+          node e2e/zip/windows/run-readers.mjs --archives "$env:RUNNER_TEMP\zips" --results "$env:RUNNER_TEMP\results" --work "$env:RUNNER_TEMP\readers" --label "Readers on Windows: zips made with zip.ts"
+
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-readers-results
+          path: ${{ runner.temp }}/results
+          if-no-files-found: warn
+          retention-days: 14
+
+      # The small zips, for a person to try by double-clicking on a desktop
+      # Windows. Not the >4 GiB ones (make those with make-archives.ts).
+      - name: Upload the small test zips
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-test-zips
+          path: |
+            ${{ runner.temp }}/zips
+            !${{ runner.temp }}/zips/big-*
+          if-no-files-found: warn
+          retention-days: 14
